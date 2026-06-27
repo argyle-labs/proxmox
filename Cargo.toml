@@ -1,0 +1,93 @@
+[package]
+name = "proxmox"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[lib]
+name = "proxmox"
+path = "src/lib.rs"
+# `cdylib` is the orca plugin artifact orca's `plugin-loader` `dlopen`s;
+# `rlib` retains the in-crate `#[cfg(test)]` harness + lets the workspace use it
+# as a normal Rust lib.
+crate-type = ["cdylib", "rlib"]
+
+# Proxmox VE plugin. Typed client codegenned by progenitor from the vendored
+# upstream spec (`specs/proxmox.openapi.json`, derived from a cluster node's
+# `apidoc.js`). `build.rs` runs `plugin_toolkit_build::openapi::generate_all`
+# over the whole spec. Refresh by overwriting `specs/apidoc.js` +
+# `specs/proxmox.openapi.json`.
+#
+# Beyond its tool surface, this plugin contributes two domain backends across
+# the cdylib ABI (see `src/abi_export.rs::backends`): a `cluster_roster`
+# provider and a `topology` collector. orca's loader registers both into the
+# matching `contract` registries, so a loaded proxmox plugin restores fleet
+# cluster grouping + parent-host topology with no static link into orca.
+
+[dependencies]
+# The SOLE orca dependency. All macro-emitted paths (`#[orca_tool]`,
+# `endpoint_resource!`, dispatch's `register_op!`) resolve through
+# `::plugin_toolkit::*`, and every orca primitive the plugin source touches
+# (schemars / clap / anyhow / inventory / db / rusqlite / async-trait /
+# dispatch / contract / derive / macro-runtime / runtime / containers /
+# api_client / http / urlencoding / futures_util / reqwest / tokio) is
+# re-exported by the toolkit + its prelude.
+#
+# The committed `[patch]` in `.cargo/config.toml` overrides this to the local
+# in-tree toolkit for development; the git branch is what an external checkout
+# without the orca repo resolves against.
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+
+# Genuinely-external, non-orca runtime deps emitted by progenitor's generated
+# client. progenitor + thiserror v2 + serde derives hard-code bare `::serde` /
+# `::serde_json` / `::thiserror` / `::reqwest` / `::chrono` / `::uuid` crate-root
+# paths that no `crate = ...` attribute can redirect — they are the plugin's own
+# transitive deps, exactly as a third-party progenitor plugin would carry. Cargo
+# unifies these with the toolkit's same-version copies into a single crate
+# instance, so types cross the api boundary cleanly.
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+thiserror   = "2"
+
+# The `#[export_root_module]` macro (re-exported by the toolkit) expands to bare
+# `::abi_stable` paths in this crate's root, so abi_stable must be a direct dep.
+# Pinned to the orca workspace version (0.11) so the layout hash baked into the
+# cdylib matches what orca's plugin-loader checks at load time.
+abi_stable = "0.11"
+
+progenitor-client = "0.14"
+futures-core = "0.3"
+bytes       = "1"
+regress     = "0.10"
+# Must match the orca workspace pin (0.13) so progenitor's generated client and
+# the toolkit's http layer share one reqwest version. `multipart` + `cookies`:
+# the full PVE spec generates upload + session endpoints that need them.
+reqwest     = { version = "0.13", default-features = false, features = ["json", "stream", "rustls-no-provider", "multipart", "cookies"] }
+# progenitor emits `::chrono` / `::uuid` paths for date-time + uuid formats.
+chrono      = { version = "0.4", features = ["serde"] }
+uuid        = { version = "1", features = ["serde", "v4"] }
+
+# This plugin's hand-written source (carried over from the in-tree crate) names
+# these crates fully-qualified — `schemars::JsonSchema` derives, `anyhow::Result`
+# signatures, `tracing::warn!`, `tokio::` — rather than routing every reference
+# through the toolkit prelude. They are pinned to the orca workspace major so
+# cargo unifies each with the toolkit's same-version copy into a single crate
+# instance (the `schemars::Schema` in `ToolDef` stays one type across the seam).
+schemars    = { version = "1", features = ["derive"] }
+anyhow      = "1"
+tracing     = "0.1"
+tokio       = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"
+rustls   = "0.23"
+
+[build-dependencies]
+plugin-toolkit-build = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+
+# Match orca's workspace lint floor: discarding a Result/Option via
+# `let _ = ...` was a load-bearing past incident, so keep it a hard error here
+# too — the plugin must stay portable back into the orca workspace.
+[lints.clippy]
+let_underscore_must_use = "deny"
