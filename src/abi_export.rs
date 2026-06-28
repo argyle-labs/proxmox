@@ -145,6 +145,7 @@ extern "C" fn backends() -> RString {
             endpoint: String::new(),
             capabilities: Vec::new(),
             invoke_prefix: "proxmox".to_string(),
+            ..Default::default()
         },
         BackendDef {
             domain: "topology".to_string(),
@@ -153,9 +154,17 @@ extern "C" fn backends() -> RString {
             endpoint: String::new(),
             capabilities: Vec::new(),
             invoke_prefix: "proxmox".to_string(),
+            ..Default::default()
         },
     ];
     RString::from(sj::to_string(&defs).unwrap_or_else(|_| "[]".to_string()))
+}
+
+/// Declared SQL tables: none yet (this plugin owns no plugin-scoped tables).
+/// Empty declaration matches what orca synthesizes for a plugin predating the
+/// field; a stateful plugin would return a real SchemaDecl here.
+extern "C" fn schemas() -> RString {
+    RString::from(r#"{"namespace":"","tables":[]}"#)
 }
 
 #[export_root_module]
@@ -168,6 +177,7 @@ fn export() -> PluginModRef {
         manifest,
         invoke,
         backends,
+        schemas,
     }
     .leak_into_prefix()
 }
