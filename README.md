@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon-256.png" width="120" alt="proxmox" />
+</p>
+
 # proxmox
 
 A standalone [orca](https://github.com/argyle-labs/orca) plugin for
