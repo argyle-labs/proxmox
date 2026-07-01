@@ -2,7 +2,11 @@
 name = "proxmox"
 version = "0.1.0"
 edition = "2021"
+description = "Proxmox VE plugin for orca — cluster nodes/guests with cluster_roster + topology ABI backends"
 build = "build.rs"
+
+[package.metadata.orca]
+category = "infra"
 
 [lib]
 name = "proxmox"
