@@ -146,7 +146,9 @@ fn kind_from_str(s: &str) -> Result<GuestKind> {
     match s {
         KIND_VM | "qemu" => Ok(GuestKind::Qemu),
         KIND_LXC | "container" => Ok(GuestKind::Lxc),
-        other => Err(anyhow!("unknown proxmox kind '{other}' (expected vm | lxc)")),
+        other => Err(anyhow!(
+            "unknown proxmox kind '{other}' (expected vm | lxc)"
+        )),
     }
 }
 
@@ -186,7 +188,9 @@ async fn guests_for_endpoint(
             node,
             kind: kind_str(kind).to_string(),
             vmid,
-            name: r.name.unwrap_or_else(|| format!("{}-{}", kind_str(kind), vmid)),
+            name: r
+                .name
+                .unwrap_or_else(|| format!("{}-{}", kind_str(kind), vmid)),
             status: r.status,
             cpu: r.cpu,
             mem: r.mem,
@@ -336,7 +340,10 @@ impl ProxmoxUnitProvider {
                 manager: manager_for(&p.endpoint),
                 kind: kind_str(kind).to_string(),
                 id: vmid.to_string(),
-                name: p.name.clone().unwrap_or_else(|| format!("{}-{vmid}", kind_str(kind))),
+                name: p
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}-{vmid}", kind_str(kind))),
             },
             payload: serde_json::to_string(&resp).unwrap_or_default(),
         }))
@@ -617,7 +624,13 @@ mod tests {
         assert_eq!(decls.len(), 2);
         for d in &decls {
             let verbs: Vec<_> = d.verbs.iter().map(|v| v.verb).collect();
-            for want in [Verb::List, Verb::Detail, Verb::Update, Verb::Create, Verb::Delete] {
+            for want in [
+                Verb::List,
+                Verb::Detail,
+                Verb::Update,
+                Verb::Create,
+                Verb::Delete,
+            ] {
                 assert!(verbs.contains(&want), "{} missing {want:?}", d.kind);
             }
         }
@@ -628,7 +641,11 @@ mod tests {
         let decls = ProxmoxUnitProvider::new().declarations();
         let vm = decls.iter().find(|d| d.kind == KIND_VM).unwrap();
         let create = vm.verbs.iter().find(|v| v.verb == Verb::Create).unwrap();
-        let provision = create.actions.iter().find(|a| a.action == "provision").unwrap();
+        let provision = create
+            .actions
+            .iter()
+            .find(|a| a.action == "provision")
+            .unwrap();
         assert!(provision.payload_schema.is_some());
         assert!(provision.response_schema.is_some());
         let schema = serde_json::to_string(provision.payload_schema.as_ref().unwrap()).unwrap();
