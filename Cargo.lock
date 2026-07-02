@@ -2749,6 +2749,8 @@ dependencies = [
  "bytes",
  "chrono",
  "futures-core",
+ "indexmap",
+ "openapiv3",
  "plugin-toolkit",
  "plugin-toolkit-build",
  "progenitor-client",
