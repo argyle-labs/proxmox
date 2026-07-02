@@ -3454,6 +3454,7 @@ name = "service"
 version = "0.0.8-rc.9"
 dependencies = [
  "anyhow",
+ "contract",
  "deploy-target",
  "schemars 1.2.1",
  "serde",
