@@ -11,8 +11,8 @@ use plugin_toolkit::async_trait::async_trait;
 use plugin_toolkit::contract::{ClusterEntry, ClusterNode, ClusterRoster};
 use plugin_toolkit::prelude::*;
 
-use crate::tools::endpoint_db;
 use crate::Config;
+use crate::tools::endpoint_db;
 
 pub struct ProxmoxClusterRoster;
 

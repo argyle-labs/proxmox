@@ -22,7 +22,7 @@ use plugin_toolkit::containers::{
 use std::time::Duration;
 
 use crate::generated::{self, types as gtypes};
-use crate::{fetch_guest_config, GuestKind, ProxmoxAction};
+use crate::{GuestKind, ProxmoxAction, fetch_guest_config};
 
 /// Budget for the liveness probe. Tight on purpose — the reconciler
 /// can call this every tick on every running LXC, so a hung probe
