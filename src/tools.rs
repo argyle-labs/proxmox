@@ -59,7 +59,7 @@ impl From<crate::ProxmoxActionResult> for ProxmoxActionResult {
 
 // ── HTTP client helper ─────────────────────────────────────────────────────
 
-fn make_client(name: &str) -> Result<generated::Client> {
+pub(crate) fn make_client(name: &str) -> Result<generated::Client> {
     let conn = runtime::open_db()?;
     let row = endpoint_db::get(&conn, name)?
         .with_context(|| format!("proxmox endpoint '{name}' not registered"))?;
