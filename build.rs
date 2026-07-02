@@ -1,7 +1,8 @@
 //! Generate the typed Proxmox VE client from the vendored OpenAPI spec.
 //!
-//! Refresh: `make proxmox-spec-refresh` (re-runs `openapi::from_pve` over
-//! a fresh `apidoc.js` pulled from a cluster node).
+//! Refresh the vendored spec from a fresh `apidoc.js` pulled from a cluster
+//! node (Proxmox ships `apidoc.js`, not OpenAPI):
+//!   cargo run --example pve_to_openapi -- apidoc.js > specs/proxmox.openapi.json
 
 fn main() {
     let specs_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("specs");

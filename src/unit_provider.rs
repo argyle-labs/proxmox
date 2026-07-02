@@ -17,15 +17,15 @@
 //! `endpoint_db` the tool surface owns, so registering a host once lights up
 //! both the tool surface and the unit surface.
 
-use plugin_toolkit::anyhow::{anyhow, Result};
+use plugin_toolkit::anyhow::{Result, anyhow};
+use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::contract::unit::{
     ActionDecl, ActionOutcome, CreateArgs, DeleteArgs, DetailArgs, ItemOutcome, ItemsOutcome,
     KindDeclaration, ListArgs, UnitDescriptor, UnitId, UnitProvider, UpdateArgs, Verb, VerbArgs,
     VerbDecl, VerbOutcome,
 };
-use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::db::pool::with_pooled_or_open;
-use plugin_toolkit::schemars::{schema_for, JsonSchema};
+use plugin_toolkit::schemars::{JsonSchema, schema_for};
 use plugin_toolkit::serde::{Deserialize, Serialize};
 use plugin_toolkit::serde_json::{self, json};
 
@@ -424,7 +424,7 @@ async fn lifecycle(
         (_, other) => {
             return Err(anyhow!(
                 "unknown lifecycle action '{other}' (expected start | stop | shutdown | reboot)"
-            ))
+            ));
         }
     };
     res.map_err(|e| anyhow!("{action} {} {vmid}: {e}", kind_str(kind)))

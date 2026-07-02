@@ -18,7 +18,7 @@
 //! between the cluster-list and the config fetch).
 
 use crate::generated::{self, types as gtypes};
-use crate::{fetch_guest_config, Config, GuestKind};
+use crate::{Config, GuestKind, fetch_guest_config};
 use plugin_toolkit::contract::TopologyClaim;
 use plugin_toolkit::db::pool::with_pooled_or_open;
 

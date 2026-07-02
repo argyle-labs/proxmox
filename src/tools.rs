@@ -15,8 +15,8 @@
 
 use plugin_toolkit::prelude::*;
 
-use crate::generated;
 use crate::Config;
+use crate::generated;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // proxmox.{list,detail,create,update,delete} — endpoint registry CRUD.
