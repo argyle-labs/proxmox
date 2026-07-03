@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Pre-push gate — must mirror .github/workflows/ci.yml EXACTLY so lints are
+# caught locally, not in CI (dev/CI strictness parity). If CI changes, change
+# this to match.
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+echo "==> rustfmt (cargo fmt --all -- --check)"
+cargo fmt --all -- --check
+
+echo "==> clippy (cargo clippy --all-targets -- -D warnings)"
+cargo clippy --all-targets -- -D warnings
+
+echo "==> cargo test"
+cargo test
+
+echo "All checks passed."
