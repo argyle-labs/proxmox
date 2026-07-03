@@ -58,6 +58,11 @@ impl Default for ProxmoxUnitProvider {
 pub struct GuestSummary {
     /// Registered endpoint name this guest was enumerated from.
     pub endpoint: String,
+    /// Cluster name this endpoint belongs to, when clustered. Drives the
+    /// canonical id so the same guest seen from every member node collapses to
+    /// one unit. `None` for a standalone host (falls back to the endpoint name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<String>,
     /// Proxmox node the guest currently runs on.
     pub node: String,
     /// `vm` (qemu) or `lxc`.
@@ -185,6 +190,7 @@ async fn guests_for_endpoint(
         let vmid = vmid as u64;
         out.push(GuestSummary {
             endpoint: endpoint.to_string(),
+            cluster: None,
             node,
             kind: kind_str(kind).to_string(),
             vmid,
@@ -219,7 +225,23 @@ async fn all_guests() -> Result<Vec<GuestSummary>> {
             }
         };
         match guests_for_endpoint(&client, &ep.name).await {
-            Ok(mut v) => out.append(&mut v),
+            Ok(mut v) => {
+                // One cluster-status probe per endpoint stamps the cluster name
+                // onto every guest, so the canonical id collapses the same guest
+                // seen from all member nodes. A standalone host (or a probe
+                // failure) leaves it None → canonical falls back to the endpoint.
+                let cluster = match crate::cluster::fetch_cluster_status(&client).await {
+                    Ok(s) => s.name,
+                    Err(e) => {
+                        tracing::debug!(endpoint = %ep.name, error = %e, "proxmox units: cluster_status probe failed; canonical falls back to endpoint");
+                        None
+                    }
+                };
+                for g in &mut v {
+                    g.cluster = cluster.clone();
+                }
+                out.append(&mut v);
+            }
             Err(e) => {
                 tracing::warn!(endpoint = %ep.name, error = %e, "proxmox units: enumeration failed");
             }
@@ -248,6 +270,17 @@ impl ProxmoxUnitProvider {
         }
     }
 
+    /// Stable cross-endpoint identity: `cluster:<name>/<kind>/<vmid>` when the
+    /// endpoint is clustered (so every member node's sighting of the guest
+    /// collapses to one unit), else `endpoint:<name>/<kind>/<vmid>` for a
+    /// standalone host. Consumed by core's `merge_by_canonical`.
+    fn canonical(g: &GuestSummary) -> String {
+        match &g.cluster {
+            Some(c) => format!("cluster:{c}/{}/{}", g.kind, g.vmid),
+            None => format!("endpoint:{}/{}/{}", g.endpoint, g.kind, g.vmid),
+        }
+    }
+
     async fn do_list(&self, args: ListArgs) -> Result<VerbOutcome> {
         let mut guests = all_guests().await?;
         // Kind filter: query.kind == "vm" | "lxc" narrows the fan-out.
@@ -261,9 +294,12 @@ impl ProxmoxUnitProvider {
         }
         let items = guests
             .iter()
-            .map(|g| ItemOutcome {
-                id: Self::unit_id(g),
-                payload: serde_json::to_string(g).unwrap_or_default(),
+            .map(|g| {
+                ItemOutcome::new(
+                    Self::unit_id(g),
+                    serde_json::to_string(g).unwrap_or_default(),
+                )
+                .with_canonical(Self::canonical(g))
             })
             .collect::<Vec<_>>();
         let total = items.len() as u64;
@@ -282,15 +318,23 @@ impl ProxmoxUnitProvider {
             .parse()
             .map_err(|_| anyhow!("vmid '{}' is not a u64", args.id.id))?;
         let client = crate::tools::make_client(&endpoint)?;
-        let guest = guests_for_endpoint(&client, &endpoint)
+        let mut guest = guests_for_endpoint(&client, &endpoint)
             .await?
             .into_iter()
             .find(|g| g.vmid == vmid && g.kind == kind_str(kind))
             .ok_or_else(|| anyhow!("{} vmid {vmid} not found on {endpoint}", kind_str(kind)))?;
-        Ok(VerbOutcome::Item(ItemOutcome {
-            id: Self::unit_id(&guest),
-            payload: serde_json::to_string(&guest).unwrap_or_default(),
-        }))
+        // Match the canonical id List produces (cluster-scoped when clustered).
+        guest.cluster = crate::cluster::fetch_cluster_status(&client)
+            .await
+            .ok()
+            .and_then(|s| s.name);
+        Ok(VerbOutcome::Item(
+            ItemOutcome::new(
+                Self::unit_id(&guest),
+                serde_json::to_string(&guest).unwrap_or_default(),
+            )
+            .with_canonical(Self::canonical(&guest)),
+        ))
     }
 
     async fn do_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
@@ -339,8 +383,8 @@ impl ProxmoxUnitProvider {
             vmid,
             upid,
         };
-        Ok(VerbOutcome::Item(ItemOutcome {
-            id: UnitId {
+        Ok(VerbOutcome::Item(ItemOutcome::new(
+            UnitId {
                 manager: manager_for(&p.endpoint),
                 kind: kind_str(kind).to_string(),
                 id: vmid.to_string(),
@@ -349,8 +393,8 @@ impl ProxmoxUnitProvider {
                     .clone()
                     .unwrap_or_else(|| format!("{}-{vmid}", kind_str(kind))),
             },
-            payload: serde_json::to_string(&resp).unwrap_or_default(),
-        }))
+            serde_json::to_string(&resp).unwrap_or_default(),
+        )))
     }
 
     async fn do_delete(&self, args: DeleteArgs) -> Result<VerbOutcome> {
@@ -590,6 +634,37 @@ impl UnitProvider for ProxmoxUnitProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn guest(endpoint: &str, cluster: Option<&str>, kind: &str, vmid: u64) -> GuestSummary {
+        GuestSummary {
+            endpoint: endpoint.into(),
+            cluster: cluster.map(Into::into),
+            node: "n1".into(),
+            kind: kind.into(),
+            vmid,
+            name: "g".into(),
+            status: None,
+            cpu: None,
+            mem: None,
+            maxmem: None,
+        }
+    }
+
+    #[test]
+    fn canonical_is_cluster_scoped_when_clustered() {
+        // Same guest seen from three member-node endpoints → identical canonical
+        // id, so core's merge collapses them to one unit.
+        let a = ProxmoxUnitProvider::canonical(&guest("thor", Some("yggdrasil"), "lxc", 100));
+        let b = ProxmoxUnitProvider::canonical(&guest("loki", Some("yggdrasil"), "lxc", 100));
+        assert_eq!(a, "cluster:yggdrasil/lxc/100");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn canonical_falls_back_to_endpoint_for_standalone() {
+        let c = ProxmoxUnitProvider::canonical(&guest("pve1", None, "vm", 200));
+        assert_eq!(c, "endpoint:pve1/vm/200");
+    }
 
     #[test]
     fn manager_roundtrips_endpoint() {
