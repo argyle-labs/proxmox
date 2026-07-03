@@ -317,7 +317,7 @@ impl ProxmoxUnitProvider {
             .id
             .parse()
             .map_err(|_| anyhow!("vmid '{}' is not a u64", args.id.id))?;
-        let client = crate::tools::make_client(&endpoint)?;
+        let client = crate::tools::make_client(&endpoint).await?;
         let mut guest = guests_for_endpoint(&client, &endpoint)
             .await?
             .into_iter()
