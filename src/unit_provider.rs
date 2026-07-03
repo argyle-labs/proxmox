@@ -29,8 +29,8 @@ use plugin_toolkit::schemars::{JsonSchema, schema_for};
 use plugin_toolkit::serde::{Deserialize, Serialize};
 use plugin_toolkit::serde_json::{self, json};
 
+use crate::GuestKind;
 use crate::generated::{self, types as gtypes};
-use crate::{Config, GuestKind};
 
 const KIND_VM: &str = "vm";
 const KIND_LXC: &str = "lxc";
@@ -206,8 +206,12 @@ async fn all_guests() -> Result<Vec<GuestSummary>> {
     let endpoints = with_pooled_or_open(crate::tools::endpoint_db::list)?;
     let mut out = Vec::new();
     for ep in endpoints.into_iter().filter(|e| e.enabled) {
-        let cfg = Config::new(ep.base_url, ep.token_id, ep.token_secret).insecure(ep.insecure);
-        let client = match cfg.build_generated_client() {
+        // Route through `make_client` so the token secret is resolved
+        // secure-first from the abstract secrets domain
+        // (`proxmox.<endpoint>.token_secret`). Building `Config` straight off
+        // the row would use the now-empty plaintext column post-bootstrap and
+        // silently authenticate with no token ([[runtime-least-privilege-not-root]]).
+        let client = match crate::tools::make_client(&ep.name) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(endpoint = %ep.name, error = %e, "proxmox units: client build failed");
