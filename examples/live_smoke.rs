@@ -28,7 +28,10 @@ fn env(key: &str) -> anyhow::Result<String> {
 async fn main() -> anyhow::Result<()> {
     // The plugin's reqwest build uses `rustls-no-provider`; orca installs a
     // crypto provider at startup, so a standalone example must do the same.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    // Ignore the result: an already-installed provider is fine for an example.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .ok();
 
     let mut base = env("PROXMOX_URL")?;
     let base_trimmed = base.trim_end_matches('/');
@@ -79,10 +82,7 @@ async fn main() -> anyhow::Result<()> {
     guests.sort_by_key(|(_, _, vmid, _, _)| *vmid);
 
     println!("\n{} guests:", guests.len());
-    println!(
-        "  {:<4}  {:>6}  {:<20}  {:<10}  {}",
-        "KIND", "VMID", "NAME", "STATUS", "NODE"
-    );
+    println!("  KIND    VMID  NAME                  STATUS      NODE");
     for (kind, node, vmid, name, status) in &guests {
         println!("  {kind:<4}  {vmid:>6}  {name:<20}  {status:<10}  {node}");
     }

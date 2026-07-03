@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Repo-local copy of the machine-global AI-attribution guard. Setting a repo
+# `core.hooksPath` (to run the pre-push/pre-commit above) shadows the global
+# `~/.config/git/hooks/commit-msg`, so we carry the same guard here — an AI /
+# assistant co-author trailer must NEVER appear in any commit.
+set -euo pipefail
+
+msg_file="$1"
+
+if grep -qiE 'co[-_ ]?authored?[-_ ]?by:[[:space:]]*(claude|anthropic|[^[:space:]]*noreply@anthropic)' "$msg_file"; then
+  echo "BLOCKED (commit-msg hook): commit message contains a forbidden AI" >&2
+  echo "attribution trailer. Remove that trailer line and commit again." >&2
+  exit 1
+fi
+
+exit 0

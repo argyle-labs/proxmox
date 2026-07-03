@@ -24,7 +24,10 @@ fn env(key: &str) -> anyhow::Result<String> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    // Ignore the result: an already-installed provider is fine for an example.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .ok();
 
     let mut base = env("PROXMOX_URL")?;
     let base_trimmed = base.trim_end_matches('/');

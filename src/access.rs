@@ -209,8 +209,11 @@ pub async fn bootstrap_orca_identity(client: &generated::Client) -> Result<Provi
     ensure_user(client, ORCA_USER).await?;
     grant_acl(client, "/", ORCA_ROLE, Some(ORCA_USER), None).await?;
 
-    // Regenerate cleanly: drop any stale token so the secret is fresh.
-    let _ = delete_token(client, ORCA_USER, ORCA_TOKEN).await;
+    // Regenerate cleanly: drop any stale token so the secret is fresh. A
+    // missing token (first bootstrap) is the expected non-error case.
+    if let Err(e) = delete_token(client, ORCA_USER, ORCA_TOKEN).await {
+        tracing::debug!(error = %e, "no existing orca token to drop before regeneration");
+    }
     let (token_id, secret) =
         generate_token(client, ORCA_USER, ORCA_TOKEN, true, Some("orca runtime")).await?;
 
