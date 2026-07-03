@@ -18,57 +18,19 @@
 //! between the cluster-list and the config fetch).
 
 use crate::generated::{self, types as gtypes};
+use crate::tools::for_each_enabled_endpoint;
 use crate::{GuestKind, fetch_guest_config};
 use plugin_toolkit::contract::TopologyClaim;
-use plugin_toolkit::db::pool::with_pooled_or_open;
 
 /// Walk every registered + enabled Proxmox endpoint and return the union
 /// of TopologyClaims. Endpoints that fail are logged and skipped.
 pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {
-    let endpoints = with_pooled_or_open(crate::tools::endpoint_db::list)?;
-
-    let mut all = Vec::new();
-    for ep in endpoints.into_iter().filter(|e| e.enabled) {
-        let provider_instance = ep.name.clone();
-        // Resolve the reachable address + secure-first token secret in one
-        // place (`resolve_config`); building `Config` off the row directly
-        // would use the now-removed `base_url` and the empty post-bootstrap
-        // plaintext token.
-        let cfg = match crate::tools::resolve_config(&provider_instance).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(
-                    endpoint = %provider_instance,
-                    error = %e,
-                    "proxmox topology: config resolve failed",
-                );
-                continue;
-            }
-        };
-        let http = match cfg.build_reqwest_client() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(
-                    endpoint = %provider_instance,
-                    error = %e,
-                    "proxmox topology: reqwest build failed",
-                );
-                continue;
-            }
-        };
+    Ok(for_each_enabled_endpoint("topology", |cfg, ep| async move {
+        let http = cfg.build_reqwest_client()?;
         let client = generated::Client::new_with_client(&cfg.base_url, http.clone());
-        match collect_for_endpoint(&client, &http, &cfg.base_url, &provider_instance).await {
-            Ok(mut v) => all.append(&mut v),
-            Err(e) => {
-                tracing::warn!(
-                    endpoint = %provider_instance,
-                    error = %e,
-                    "proxmox topology: endpoint collector failed",
-                );
-            }
-        }
-    }
-    Ok(all)
+        collect_for_endpoint(&client, &http, &cfg.base_url, &ep.name).await
+    })
+    .await)
 }
 
 async fn collect_for_endpoint(

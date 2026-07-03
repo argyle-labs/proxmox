@@ -24,7 +24,6 @@ use plugin_toolkit::contract::unit::{
     KindDeclaration, ListArgs, UnitDescriptor, UnitId, UnitProvider, UpdateArgs, Verb, VerbArgs,
     VerbDecl, VerbOutcome,
 };
-use plugin_toolkit::db::pool::with_pooled_or_open;
 use plugin_toolkit::schemars::{JsonSchema, schema_for};
 use plugin_toolkit::serde::{Deserialize, Serialize};
 use plugin_toolkit::serde_json::{self, json};
@@ -209,45 +208,28 @@ async fn guests_for_endpoint(
 /// All guests across every enabled endpoint. A failing endpoint is logged and
 /// skipped so one bad host doesn't blank the whole fleet's units.
 async fn all_guests() -> Result<Vec<GuestSummary>> {
-    let endpoints = with_pooled_or_open(crate::tools::endpoint_db::list)?;
-    let mut out = Vec::new();
-    for ep in endpoints.into_iter().filter(|e| e.enabled) {
-        // Route through `make_client` so the token secret is resolved
-        // secure-first from the abstract secrets domain
-        // (`proxmox.<endpoint>.token_secret`). Building `Config` straight off
-        // the row would use the now-empty plaintext column post-bootstrap and
-        // silently authenticate with no token ([[runtime-least-privilege-not-root]]).
-        let client = match crate::tools::make_client(&ep.name).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(endpoint = %ep.name, error = %e, "proxmox units: client build failed");
-                continue;
-            }
-        };
-        match guests_for_endpoint(&client, &ep.name).await {
-            Ok(mut v) => {
-                // One cluster-status probe per endpoint stamps the cluster name
-                // onto every guest, so the canonical id collapses the same guest
-                // seen from all member nodes. A standalone host (or a probe
-                // failure) leaves it None → canonical falls back to the endpoint.
-                let cluster = match crate::cluster::fetch_cluster_status(&client).await {
-                    Ok(s) => s.name,
-                    Err(e) => {
-                        tracing::debug!(endpoint = %ep.name, error = %e, "proxmox units: cluster_status probe failed; canonical falls back to endpoint");
-                        None
-                    }
-                };
-                for g in &mut v {
-                    g.cluster = cluster.clone();
+    Ok(
+        crate::tools::for_each_enabled_endpoint("units", |cfg, ep| async move {
+            let client = cfg.build_generated_client()?;
+            let mut v = guests_for_endpoint(&client, &ep.name).await?;
+            // One cluster-status probe per endpoint stamps the cluster name onto
+            // every guest, so the canonical id collapses the same guest seen from
+            // all member nodes. A standalone host (or a probe failure) leaves it
+            // None → canonical falls back to the endpoint.
+            let cluster = match crate::cluster::fetch_cluster_status(&client).await {
+                Ok(s) => s.name,
+                Err(e) => {
+                    tracing::debug!(endpoint = %ep.name, error = %e, "proxmox units: cluster_status probe failed; canonical falls back to endpoint");
+                    None
                 }
-                out.append(&mut v);
+            };
+            for g in &mut v {
+                g.cluster = cluster.clone();
             }
-            Err(e) => {
-                tracing::warn!(endpoint = %ep.name, error = %e, "proxmox units: enumeration failed");
-            }
-        }
-    }
-    Ok(out)
+            Ok(v)
+        })
+        .await,
+    )
 }
 
 /// Resolve the node a `(kind, vmid)` currently runs on for one endpoint.
