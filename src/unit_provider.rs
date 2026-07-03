@@ -135,15 +135,16 @@ pub struct ProvisionResponse {
 // ── helpers ────────────────────────────────────────────────────────────────
 
 fn manager_for(endpoint: &str) -> String {
-    format!("proxmox@{endpoint}")
+    UnitId::scoped_manager("proxmox", endpoint)
 }
 
-/// Extract the endpoint name from a `proxmox@<endpoint>` manager string.
+/// Extract the endpoint name from a `proxmox@<endpoint>` manager string, using
+/// the core `<base>@<scope>` convention so the split lives in one place.
 fn endpoint_of(id: &UnitId) -> Result<String> {
-    id.manager
-        .strip_prefix("proxmox@")
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("not a proxmox unit manager: {}", id.manager))
+    match id.manager_scope() {
+        ("proxmox", Some(endpoint)) => Ok(endpoint.to_string()),
+        _ => Err(anyhow!("not a proxmox unit manager: {}", id.manager)),
+    }
 }
 
 fn kind_from_str(s: &str) -> Result<GuestKind> {

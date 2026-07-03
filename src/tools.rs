@@ -138,14 +138,11 @@ pub(crate) fn token_secret_name(endpoint: &str) -> String {
 }
 
 fn resolve_token_secret(name: &str, row: &ProxmoxEndpoint) -> Result<String> {
-    if let Some(v) = plugin_toolkit::secrets::get(&token_secret_name(name))? {
-        return Ok(v);
-    }
-    if !row.token_secret.is_empty() {
-        return Ok(row.token_secret.clone());
-    }
-    bail!(
-        "proxmox endpoint '{name}' has no token secret (neither in the secrets domain nor inline)"
+    plugin_toolkit::secrets::resolve_scoped(
+        "proxmox",
+        name,
+        "token_secret",
+        (!row.token_secret.is_empty()).then_some(row.token_secret.as_str()),
     )
 }
 
