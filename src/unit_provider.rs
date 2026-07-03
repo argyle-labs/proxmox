@@ -281,6 +281,21 @@ impl ProxmoxUnitProvider {
         }
     }
 
+    /// Build the list/detail item for a guest: canonical id (for dedup) plus the
+    /// discovered datacenter (the PVE cluster name) when clustered, so
+    /// `unit.list` consumers can group guests by datacenter.
+    fn list_item(g: &GuestSummary) -> ItemOutcome {
+        let item = ItemOutcome::new(
+            Self::unit_id(g),
+            serde_json::to_string(g).unwrap_or_default(),
+        )
+        .with_canonical(Self::canonical(g));
+        match &g.cluster {
+            Some(dc) => item.with_datacenter(dc.clone()),
+            None => item,
+        }
+    }
+
     async fn do_list(&self, args: ListArgs) -> Result<VerbOutcome> {
         let mut guests = all_guests().await?;
         // Kind filter: query.kind == "vm" | "lxc" narrows the fan-out.
@@ -292,16 +307,7 @@ impl ProxmoxUnitProvider {
             let q = q.to_ascii_lowercase();
             guests.retain(|g| g.name.to_ascii_lowercase().contains(&q));
         }
-        let items = guests
-            .iter()
-            .map(|g| {
-                ItemOutcome::new(
-                    Self::unit_id(g),
-                    serde_json::to_string(g).unwrap_or_default(),
-                )
-                .with_canonical(Self::canonical(g))
-            })
-            .collect::<Vec<_>>();
+        let items = guests.iter().map(Self::list_item).collect::<Vec<_>>();
         let total = items.len() as u64;
         Ok(VerbOutcome::Items(ItemsOutcome {
             items,
@@ -328,13 +334,7 @@ impl ProxmoxUnitProvider {
             .await
             .ok()
             .and_then(|s| s.name);
-        Ok(VerbOutcome::Item(
-            ItemOutcome::new(
-                Self::unit_id(&guest),
-                serde_json::to_string(&guest).unwrap_or_default(),
-            )
-            .with_canonical(Self::canonical(&guest)),
-        ))
+        Ok(VerbOutcome::Item(Self::list_item(&guest)))
     }
 
     async fn do_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
@@ -664,6 +664,16 @@ mod tests {
     fn canonical_falls_back_to_endpoint_for_standalone() {
         let c = ProxmoxUnitProvider::canonical(&guest("pve1", None, "vm", 200));
         assert_eq!(c, "endpoint:pve1/vm/200");
+    }
+
+    #[test]
+    fn list_item_sets_datacenter_from_cluster() {
+        let clustered =
+            ProxmoxUnitProvider::list_item(&guest("thor", Some("yggdrasil"), "lxc", 100));
+        assert_eq!(clustered.datacenter.as_deref(), Some("yggdrasil"));
+        // Standalone host → no datacenter grouping.
+        let standalone = ProxmoxUnitProvider::list_item(&guest("pve1", None, "vm", 200));
+        assert_eq!(standalone.datacenter, None);
     }
 
     #[test]
