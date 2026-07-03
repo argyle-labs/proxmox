@@ -84,6 +84,50 @@ pub(crate) async fn make_client(name: &str) -> Result<generated::Client> {
     Ok(resolve_config(name).await?.build_generated_client()?)
 }
 
+/// Fan an async operation out across every **enabled** endpoint, resolving each
+/// endpoint's [`Config`] through [`resolve_config`] (reachable address +
+/// secure-first token) and flattening the per-endpoint results. A failing
+/// endpoint — whether the resolve or `work` itself errors — is logged with
+/// `warn!` and skipped: one flaky host must never blank the fleet-wide view.
+/// This is the single home for that resilient fan-out; `cluster_list`, the
+/// cluster-roster + topology backends, and the unit provider all route through
+/// it instead of re-copying the list/enabled/resolve/warn loop.
+///
+/// `work` receives a ready `Config` (call `build_generated_client()` for the
+/// typed client, or `build_reqwest_client()` for the raw path) plus the
+/// endpoint row. `op` is a short label for the log lines.
+pub(crate) async fn for_each_enabled_endpoint<T, F, Fut>(op: &str, work: F) -> Vec<T>
+where
+    F: Fn(Config, ProxmoxEndpoint) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<T>>>,
+{
+    let endpoints = match plugin_toolkit::db::pool::with_pooled_or_open(endpoint_db::list) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(op, error = %e, "proxmox fan-out: endpoint list failed");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for ep in endpoints.into_iter().filter(|e| e.enabled) {
+        let name = ep.name.clone();
+        let cfg = match resolve_config(&name).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(op, endpoint = %name, error = %e, "proxmox fan-out: endpoint resolve failed");
+                continue;
+            }
+        };
+        match work(cfg, ep).await {
+            Ok(items) => out.extend(items),
+            Err(e) => {
+                tracing::warn!(op, endpoint = %name, error = %e, "proxmox fan-out: op failed")
+            }
+        }
+    }
+    out
+}
+
 /// Resolve an endpoint's token secret secure-first: prefer the abstract secrets
 /// domain (`proxmox.<endpoint>.token_secret`), falling back to a legacy
 /// plaintext column value only if the domain has none. Once
@@ -454,42 +498,17 @@ async fn proxmox_cluster_list(
     _args: ProxmoxClusterListArgs,
     _ctx: &ToolCtx,
 ) -> Result<Vec<ProxmoxClusterListEntry>> {
-    let conn = runtime::open_db()?;
-    let endpoints = endpoint_db::list(&conn)?;
-    drop(conn);
-
-    let mut out = Vec::new();
-    for ep in endpoints.into_iter().filter(|e| e.enabled) {
-        let name = ep.name.clone();
-        // Route through `make_client` so both the reachable address
-        // (`resolve_reachable` over the endpoint's fallback list) and the
-        // secure-first token secret are resolved in one place.
-        let client = match make_client(&name).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(
-                    endpoint = %name,
-                    error = %e,
-                    "proxmox.cluster_list: client build failed",
-                );
-                continue;
-            }
-        };
-        match crate::cluster::fetch_cluster_status(&client).await {
-            Ok(s) => out.push(ProxmoxClusterListEntry {
-                endpoint: name,
-                status: s.into(),
-            }),
-            Err(e) => {
-                tracing::warn!(
-                    endpoint = %name,
-                    error = %e,
-                    "proxmox.cluster_list: cluster_status fetch failed",
-                );
-            }
-        }
-    }
-    Ok(out)
+    Ok(
+        for_each_enabled_endpoint("cluster_list", |cfg, ep| async move {
+            let client = cfg.build_generated_client()?;
+            let status = crate::cluster::fetch_cluster_status(&client).await?;
+            Ok(vec![ProxmoxClusterListEntry {
+                endpoint: ep.name,
+                status: status.into(),
+            }])
+        })
+        .await,
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
