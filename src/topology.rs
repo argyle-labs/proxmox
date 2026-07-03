@@ -18,7 +18,7 @@
 //! between the cluster-list and the config fetch).
 
 use crate::generated::{self, types as gtypes};
-use crate::{Config, GuestKind, fetch_guest_config};
+use crate::{GuestKind, fetch_guest_config};
 use plugin_toolkit::contract::TopologyClaim;
 use plugin_toolkit::db::pool::with_pooled_or_open;
 
@@ -30,7 +30,21 @@ pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {
     let mut all = Vec::new();
     for ep in endpoints.into_iter().filter(|e| e.enabled) {
         let provider_instance = ep.name.clone();
-        let cfg = Config::new(ep.base_url, ep.token_id, ep.token_secret).insecure(ep.insecure);
+        // Resolve the reachable address + secure-first token secret in one
+        // place (`resolve_config`); building `Config` off the row directly
+        // would use the now-removed `base_url` and the empty post-bootstrap
+        // plaintext token.
+        let cfg = match crate::tools::resolve_config(&provider_instance).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    endpoint = %provider_instance,
+                    error = %e,
+                    "proxmox topology: config resolve failed",
+                );
+                continue;
+            }
+        };
         let http = match cfg.build_reqwest_client() {
             Ok(c) => c,
             Err(e) => {

@@ -65,5 +65,5 @@ Same idea on an existing PVE host: enable nested virtualization on the parent, c
 ## Next steps
 
 1. Generate an API token — [tokens.md](tokens.md).
-2. Register the endpoint: `proxmox.create` with `base_url = https://<node>:8006`, the token id/secret, and `insecure = true` for the self-signed cert.
+2. Register the endpoint: `proxmox.create` with at least one `--address kind=url` (e.g. `--address lan=https://<node>:8006`; add `--address fqdn=…` / `--address tailscale=…` for fallback paths), the token id/secret, and `insecure = true` for the self-signed cert.
 3. Verify: `proxmox.nodes` (list cluster members) and `unit.list` (enumerate guests).

@@ -30,11 +30,13 @@ Proxmox listens on `:8006` (self-signed cert by default). Nothing else is deploy
 
 | command | what it does |
 | --- | --- |
-| `proxmox.create` | register an endpoint (`base_url`, `token_id`, `token_secret`, `insecure`, `enabled`) |
+| `proxmox.create` | register an endpoint (one or more `--address kind=url`, `token_id`, `token_secret`, `insecure`, `enabled`) |
 | `proxmox.list` | list registered endpoints (secret excluded) |
 | `proxmox.detail` | show one endpoint (secret excluded) |
 | `proxmox.update` | edit an endpoint's address / token / flags |
 | `proxmox.delete` | unregister an endpoint |
+
+Each endpoint carries an ordered **address fallback list** rather than a single URL. Register one or more paths — `--address fqdn=https://pve.example.com --address lan=http://<ip>:8006 --address tailscale=https://<ts-name>:8006` — and orca tries each enabled entry in order, caching the last-known-good path and falling through on a connect error. The free-form `kind` label doubles as the locality class the fewest-hop router uses to prefer the cheapest reachable path.
 
 ### 2. Manage guests — the generic unit surface
 
