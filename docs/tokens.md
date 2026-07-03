@@ -66,10 +66,20 @@ curl -sk https://<node>:8006/api2/json/version \
 keeps, create a dedicated user + role with only the privileges the plugin needs and
 leave privilege separation on (`--privsep 1`, the default):
 
+This is the **exact identity `proxmox.access_bootstrap` mints** (role name,
+privilege set, privsep, and ACL) — do it by hand when you'd rather not hand the
+plugin a root token first. The `OrcaOps` privilege set below is verbatim from
+`ORCA_OPS_PRIVS` in `src/access.rs`; keep the two in sync.
+
 ```sh
-# a role that can see and power-manage guests, and read cluster/node status
+# OrcaOps: full guest lifecycle (audit, power, console, config, allocate/clone/
+# backup, datastore space) but NO User.Modify / Permissions.Modify / Realm.* —
+# a leaked runtime token cannot create users or escalate.
 pveum role add OrcaOps -privs "VM.Audit VM.PowerMgmt VM.Console \
-  Datastore.Audit Sys.Audit Sys.Console"
+  VM.Config.Disk VM.Config.CPU VM.Config.Memory VM.Config.Network \
+  VM.Config.Options VM.Config.Cloudinit VM.Allocate VM.Clone VM.Backup \
+  Datastore.Audit Datastore.AllocateSpace Datastore.AllocateTemplate \
+  Sys.Audit Sys.Console Pool.Audit"
 
 # a token-only user in the PVE realm
 pveum user add orca@pve
@@ -78,15 +88,46 @@ pveum user add orca@pve
 pveum acl modify / --users orca@pve --roles OrcaOps
 
 # the token, privilege-separated: its ACL is intersected with the user's
-pveum user token add orca@pve orca --privsep 1 --output-format json
+pveum user token add orca@pve orca --privsep 1 --comment 'orca runtime' --output-format json
 
 # privsep tokens start with NO privileges of their own — grant the role to the token id too
 pveum acl modify / --tokens 'orca@pve!orca' --roles OrcaOps
 ```
 
-Then feed orca `token_id = orca@pve!orca` and its `value`. Add `VM.Allocate` /
-`Datastore.AllocateSpace` only if you want orca to **create** or **destroy** guests
-(the five-verb `Create` / `Delete` verbs); omit them for a read/power-only token.
+On a **cluster**, users / roles / ACLs / tokens live in the shared config
+(`/etc/pve`), so run this once on any member node and it applies fleet-wide.
+`role add` / `acl modify` are idempotent; re-running only rotates the token.
+
+### Store the secret in 1Password
+
+The one-time `value` is the durable credential — put it in 1Password (or your
+secrets manager) as the source of truth, then hand it to orca. The token secret
+never needs to be typed again; rotation re-mints it.
+
+```sh
+# personal 1Password, "orca" vault (any vault name works — orca is the convention)
+op item create --vault orca --category "API Credential" \
+  --title "orca@pve — <cluster> PVE runtime token" \
+  "credential=<value>" "token id[text]=orca@pve!orca" "cluster[text]=<name>"
+```
+
+### Register the cluster in orca
+
+A PVE cluster answers the same API on every member node, so register it as **one
+endpoint with one `--address` per node** — orca tries them in registered order and
+falls through on a dead node. The secret lands in orca's secrets domain, never a
+plaintext column.
+
+```sh
+proxmox.create --name <cluster> \
+  --address lan=https://<node-a>:8006 \
+  --address lan=https://<node-b>:8006 \
+  --address lan=https://<node-c>:8006 \
+  --token-id 'orca@pve!orca' --token-secret <value> --insecure true
+
+proxmox.nodes --endpoint <cluster>   # verify: lists every cluster member online
+unit.list --kind lxc                  # verify: enumerates the cluster's guests
+```
 
 ### Managing tokens
 
