@@ -67,11 +67,8 @@ impl From<crate::ProxmoxActionResult> for ProxmoxActionResult {
 /// plus the secure-first token secret. Single place both the generated client
 /// and the topology/roster reqwest paths flow through.
 pub(crate) async fn resolve_config(name: &str) -> Result<Config> {
-    let row = {
-        let conn = runtime::open_db()?;
-        endpoint_db::get(&conn, name)?
-            .with_context(|| format!("proxmox endpoint '{name}' not registered"))?
-    };
+    let row = endpoint_db::get(name)?
+        .with_context(|| format!("proxmox endpoint '{name}' not registered"))?;
     if !row.enabled {
         bail!("proxmox endpoint '{name}' is disabled");
     }
@@ -101,7 +98,7 @@ where
     F: Fn(Config, ProxmoxEndpoint) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<T>>>,
 {
-    let endpoints = match plugin_toolkit::db::pool::with_pooled_or_open(endpoint_db::list) {
+    let endpoints = match endpoint_db::list() {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(op, error = %e, "proxmox fan-out: endpoint list failed");
