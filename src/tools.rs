@@ -87,7 +87,9 @@ fn resolve_token_secret(name: &str, row: &ProxmoxEndpoint) -> Result<String> {
     if !row.token_secret.is_empty() {
         return Ok(row.token_secret.clone());
     }
-    bail!("proxmox endpoint '{name}' has no token secret (neither in the secrets domain nor inline)")
+    bail!(
+        "proxmox endpoint '{name}' has no token secret (neither in the secrets domain nor inline)"
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

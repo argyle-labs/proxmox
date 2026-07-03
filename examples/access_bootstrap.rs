@@ -53,6 +53,9 @@ async fn main() -> anyhow::Result<()> {
         id.secret.as_deref().unwrap_or("(none returned)")
     );
     println!("\nNext (runtime flow): store `secret` in the secrets domain, repoint the");
-    println!("endpoint's token_id at `{}`, then rotate the root token away.", id.token_id);
+    println!(
+        "endpoint's token_id at `{}`, then rotate the root token away.",
+        id.token_id
+    );
     Ok(())
 }

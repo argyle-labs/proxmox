@@ -72,17 +72,17 @@ async fn main() -> anyhow::Result<()> {
         if node.is_empty() || vmid <= 0 {
             continue;
         }
-        let name = r
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("{kind}-{vmid}"));
+        let name = r.name.clone().unwrap_or_else(|| format!("{kind}-{vmid}"));
         let status = r.status.clone().unwrap_or_else(|| "-".into());
         guests.push((kind, node, vmid, name, status));
     }
     guests.sort_by_key(|(_, _, vmid, _, _)| *vmid);
 
     println!("\n{} guests:", guests.len());
-    println!("  {:<4}  {:>6}  {:<20}  {:<10}  {}", "KIND", "VMID", "NAME", "STATUS", "NODE");
+    println!(
+        "  {:<4}  {:>6}  {:<20}  {:<10}  {}",
+        "KIND", "VMID", "NAME", "STATUS", "NODE"
+    );
     for (kind, node, vmid, name, status) in &guests {
         println!("  {kind:<4}  {vmid:>6}  {name:<20}  {status:<10}  {node}");
     }

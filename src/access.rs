@@ -279,7 +279,10 @@ async fn proxmox_access_bootstrap(
     plugin_toolkit::secrets::set(
         &secret_ref,
         &secret,
-        Some(&format!("proxmox runtime token for endpoint '{}'", args.endpoint)),
+        Some(&format!(
+            "proxmox runtime token for endpoint '{}'",
+            args.endpoint
+        )),
     )?;
 
     let mut repointed = false;
