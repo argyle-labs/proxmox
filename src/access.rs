@@ -290,15 +290,14 @@ async fn proxmox_access_bootstrap(
 
     let mut repointed = false;
     if args.repoint {
-        let conn = runtime::open_db()?;
-        let row = endpoint_db::get(&conn, &args.endpoint)?
+        let row = endpoint_db::get(&args.endpoint)?
             .with_context(|| format!("proxmox endpoint '{}' not registered", args.endpoint))?;
         let updated = ProxmoxEndpoint {
             token_id: id.token_id.clone(),
             token_secret: String::new(), // secret now lives in the secrets domain
             ..row
         };
-        endpoint_db::update(&conn, &updated)?;
+        endpoint_db::update(&updated)?;
         repointed = true;
     }
 
