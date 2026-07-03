@@ -217,7 +217,7 @@ async fn all_guests() -> Result<Vec<GuestSummary>> {
         // (`proxmox.<endpoint>.token_secret`). Building `Config` straight off
         // the row would use the now-empty plaintext column post-bootstrap and
         // silently authenticate with no token ([[runtime-least-privilege-not-root]]).
-        let client = match crate::tools::make_client(&ep.name) {
+        let client = match crate::tools::make_client(&ep.name).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(endpoint = %ep.name, error = %e, "proxmox units: client build failed");
@@ -323,7 +323,7 @@ impl ProxmoxUnitProvider {
             .id
             .parse()
             .map_err(|_| anyhow!("vmid '{}' is not a u64", args.id.id))?;
-        let client = crate::tools::make_client(&endpoint)?;
+        let client = crate::tools::make_client(&endpoint).await?;
         let mut guest = guests_for_endpoint(&client, &endpoint)
             .await?
             .into_iter()
@@ -345,7 +345,7 @@ impl ProxmoxUnitProvider {
             .id
             .parse()
             .map_err(|_| anyhow!("vmid '{}' is not a u64", args.id.id))?;
-        let client = crate::tools::make_client(&endpoint)?;
+        let client = crate::tools::make_client(&endpoint).await?;
         let node = resolve_node(&client, kind, vmid).await?;
         lifecycle(&client, &node, vmid, kind, &args.action).await?;
         Ok(VerbOutcome::Action(ActionOutcome {
@@ -364,7 +364,7 @@ impl ProxmoxUnitProvider {
         let p: ProvisionPayload =
             serde_json::from_str(&raw).map_err(|e| anyhow!("provision payload: {e}"))?;
         let kind = kind_from_str(&p.kind)?;
-        let client = crate::tools::make_client(&p.endpoint)?;
+        let client = crate::tools::make_client(&p.endpoint).await?;
 
         let vmid = match p.vmid {
             Some(v) => v,
@@ -405,7 +405,7 @@ impl ProxmoxUnitProvider {
             .id
             .parse()
             .map_err(|_| anyhow!("vmid '{}' is not a u64", args.id.id))?;
-        let client = crate::tools::make_client(&endpoint)?;
+        let client = crate::tools::make_client(&endpoint).await?;
         let node = resolve_node(&client, kind, vmid).await?;
         let v = vmid as i64;
         let res = match kind {

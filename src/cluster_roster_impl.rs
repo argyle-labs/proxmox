@@ -11,7 +11,6 @@ use plugin_toolkit::async_trait::async_trait;
 use plugin_toolkit::contract::{ClusterEntry, ClusterNode, ClusterRoster};
 use plugin_toolkit::prelude::*;
 
-use crate::Config;
 use crate::tools::endpoint_db;
 
 pub struct ProxmoxClusterRoster;
@@ -30,8 +29,10 @@ impl ClusterRoster for ProxmoxClusterRoster {
         let mut out = Vec::new();
         for ep in endpoints.into_iter().filter(|e| e.enabled) {
             let name = ep.name.clone();
-            let cfg = Config::new(ep.base_url, ep.token_id, ep.token_secret).insecure(ep.insecure);
-            let client = match cfg.build_generated_client() {
+            // `make_client` resolves the reachable address + secure-first token
+            // secret; building `Config` off the row directly would use the
+            // now-removed `base_url` and the empty post-bootstrap plaintext token.
+            let client = match crate::tools::make_client(&name).await {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(

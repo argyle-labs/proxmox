@@ -269,7 +269,7 @@ async fn proxmox_access_bootstrap(
     args: AccessBootstrapArgs,
     _ctx: &ToolCtx,
 ) -> Result<AccessBootstrapReport> {
-    let client = make_client(&args.endpoint)?;
+    let client = make_client(&args.endpoint).await?;
     let id = bootstrap_orca_identity(&client).await?;
     let secret = id
         .secret
