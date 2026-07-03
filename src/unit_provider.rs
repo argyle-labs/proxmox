@@ -532,34 +532,18 @@ async fn provision(
 fn guest_verbs() -> Vec<VerbDecl> {
     let lifecycle_actions = ["start", "stop", "shutdown", "reboot"]
         .into_iter()
-        .map(|a| ActionDecl {
-            action: a.to_string(),
-            payload_schema: None,
-            response_schema: None,
-        })
+        .map(ActionDecl::new)
         .collect();
     vec![
         VerbDecl::list(),
         VerbDecl::detail(),
-        VerbDecl {
-            verb: Verb::Update,
-            query_schema: None,
-            actions: lifecycle_actions,
-        },
-        VerbDecl {
-            verb: Verb::Create,
-            query_schema: None,
-            actions: vec![ActionDecl {
-                action: "provision".into(),
-                payload_schema: Some(schema_for!(ProvisionPayload)),
-                response_schema: Some(schema_for!(ProvisionResponse)),
-            }],
-        },
-        VerbDecl {
-            verb: Verb::Delete,
-            query_schema: None,
-            actions: vec![],
-        },
+        VerbDecl::update(lifecycle_actions),
+        VerbDecl::create(vec![ActionDecl::with_schemas(
+            "provision",
+            Some(schema_for!(ProvisionPayload)),
+            Some(schema_for!(ProvisionResponse)),
+        )]),
+        VerbDecl::delete(),
     ]
 }
 
