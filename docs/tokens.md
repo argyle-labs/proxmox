@@ -5,15 +5,16 @@ Every call authenticates with an **API token** — an `USER@REALM!TOKENID` id pa
 with a secret UUID. Tokens are preferred over a password login: they can be scoped,
 revoked independently, and never expire a session.
 
-There are two ways to get one, matching orca's [network-first, then on-system](https://github.com/argyle-labs/orca)
-model:
+There are two ways to get one:
 
-- **Remote / network-first** — you generate the token by hand on the node (or via
-  root SSH) and hand orca the id + secret. Use this to drive a Proxmox node from
-  another machine across the mesh.
-- **On-system self-provisioning** — when orca runs *on* the Proxmox node, the plugin
-  generates and rotates its **own** token via `pveum` and stores it through orca's
-  secrets domain. Nothing to paste by hand.
+- **Manual** — you generate the token by hand on the node (console or root SSH) and
+  hand orca the id + secret. Use this to bootstrap, or when you want to mint the
+  credential yourself.
+- **Self-provisioned (`proxmox.access_bootstrap`)** — give the plugin a root/admin
+  token once, and it mints a dedicated least-privilege `orca@pve!orca` token for
+  itself over the PVE **REST `/access` API** and stores it through orca's secrets
+  domain. This is network-first: it runs from your laptop against a live node — no
+  SSH or on-node shell required.
 
 Either way the secret is held in orca's encrypted store (SQLCipher-backed) and marked
 `#[secret]` on the endpoint — it is never written to disk in plaintext and never logged.
@@ -44,10 +45,12 @@ Give orca:
 
 | field          | value                                            |
 | -------------- | ------------------------------------------------ |
-| `base_url`     | `https://<node>:8006` (e.g. `https://10.10.10.8:8006`) |
+| `name`         | a label for this endpoint in the registry (e.g. `pve-node1`) |
+| `base_url`     | `https://<node>:8006` (e.g. `https://192.0.2.10:8006`) |
 | `token_id`     | the `full-tokenid`, e.g. `root@pam!orca`         |
-| `token_secret` | the `value` UUID (secret)                        |
+| `token_secret` | the `value` UUID (secret — stored in the secrets domain) |
 | `insecure`     | `true` for the default self-signed certificate   |
+| `enabled`      | `true` to use the endpoint; `false` to soft-disable without deleting |
 
 Verify the token directly:
 
@@ -94,23 +97,28 @@ pveum user token remove root@pam orca                  # revoke
 
 ---
 
-## 2. On-system self-provisioning (orca on the node)
+## 2. Self-provisioning via `proxmox.access_bootstrap`
 
-When orca is installed **on** the Proxmox node, the plugin does the above for you.
-Token creation via `pveum` is a host-local, API-less operation, so it belongs in the
-on-system half of the plugin rather than requiring a human to paste a secret:
+Instead of crafting the least-privilege identity above by hand, register an endpoint
+with a **root/admin** token once and call `proxmox.access_bootstrap`. The plugin then
+builds the whole least-privilege identity for itself over the PVE **REST `/access`
+API** — no `pveum` shell, no SSH, works from your laptop against a live node:
 
-1. On first configure with no token, the plugin shells `pveum user token add` for a
-   dedicated `orca@pve!orca` token (privsep + `OrcaOps` role as above), reading the
-   one-time `value` from the command output.
-2. It stores the secret through orca's **secrets domain** — the plugin never learns
-   which backend (1Password / native / …) holds it; it only asks the domain to keep
-   and return the secret by handle.
-3. Rotation re-runs `token add` with a new id, updates the stored secret, then
-   `token remove`s the old id — so a leaked token has a bounded lifetime.
+1. **Ensure the role** — creates/updates an `OrcaOps` role with the audit +
+   power-management privileges the plugin needs (`ensure_role`).
+2. **Ensure the user** — creates the token-only `orca@pve` user (`ensure_user`).
+3. **Grant the ACL** — binds the role to the user (and the token id) at `/`
+   (`grant_acl`).
+4. **Generate the token** — mints a privilege-separated `orca@pve!orca` token and
+   returns the one-time secret (`generate_token`).
+5. **Store + repoint** — the secret is saved through orca's **secrets domain** (the
+   plugin never learns which backend — 1Password / native / … — holds it), and the
+   endpoint is repointed from the bootstrap root token to `orca@pve!orca`.
 
-The plugin owns its Proxmox credential end-to-end; orca just provides the encrypted
-place to keep it.
+Rotation re-runs the mint with a fresh token and deletes the old one (`delete_token`),
+so a leaked token has a bounded lifetime. The plugin owns its Proxmox credential
+end-to-end; orca just provides the encrypted place to keep it. Because it is pure REST,
+this is the same path whether orca runs remotely or on the node itself.
 
 ---
 
@@ -119,5 +127,6 @@ place to keep it.
 - Proxmox ships a self-signed cert on `:8006`. Set `insecure = true`, or install the
   node's CA and leave it `false`.
 - Token ids are permanent once issued; to "rotate" you add a new token and remove the
-  old one (there is no in-place secret reset).
-- Fleet reference: nodes `thor` / `loki` / `frigg`, PVE 9.1.x, API on `:8006`.
+  old one (there is no in-place secret reset) — `proxmox.access_bootstrap` automates this.
+- A PVE cluster exposes the same API on every member node's `:8006`; point `base_url`
+  at any node you can reach.

@@ -22,11 +22,12 @@ crate-type = ["cdylib", "rlib"]
 # over the whole spec. Refresh by overwriting `specs/apidoc.js` +
 # `specs/proxmox.openapi.json`.
 #
-# Beyond its tool surface, this plugin contributes two domain backends across
+# Beyond its tool surface, this plugin contributes three domain backends across
 # the cdylib ABI (see `src/abi_export.rs::backends`): a `cluster_roster`
-# provider and a `topology` collector. orca's loader registers both into the
-# matching `contract` registries, so a loaded proxmox plugin restores fleet
-# cluster grouping + parent-host topology with no static link into orca.
+# provider, a `topology` collector, and a `unit` provider (the five-verb vm/lxc
+# surface). orca's loader registers all three into the matching `contract`
+# registries, so a loaded proxmox plugin restores fleet cluster grouping +
+# parent-host topology + guest lifecycle with no static link into orca.
 
 [dependencies]
 # The SOLE orca dependency. All macro-emitted paths (`#[orca_tool]`,
