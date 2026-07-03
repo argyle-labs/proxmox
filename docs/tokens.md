@@ -46,7 +46,7 @@ Give orca:
 | field          | value                                            |
 | -------------- | ------------------------------------------------ |
 | `name`         | a label for this endpoint in the registry (e.g. `pve-node1`) |
-| `base_url`     | `https://<node>:8006` (e.g. `https://192.0.2.10:8006`) |
+| `address`      | one or more `--address kind=url` (e.g. `--address lan=https://192.0.2.10:8006`); repeat for fallback paths, tried in registered order |
 | `token_id`     | the `full-tokenid`, e.g. `root@pam!orca`         |
 | `token_secret` | the `value` UUID (secret — stored in the secrets domain) |
 | `insecure`     | `true` for the default self-signed certificate   |
@@ -128,5 +128,6 @@ this is the same path whether orca runs remotely or on the node itself.
   node's CA and leave it `false`.
 - Token ids are permanent once issued; to "rotate" you add a new token and remove the
   old one (there is no in-place secret reset) — `proxmox.access_bootstrap` automates this.
-- A PVE cluster exposes the same API on every member node's `:8006`; point `base_url`
-  at any node you can reach.
+- A PVE cluster exposes the same API on every member node's `:8006`; register one
+  `--address` per node you can reach and orca falls through them in order, so the
+  endpoint stays live even when one node is down.

@@ -22,10 +22,13 @@ use crate::generated;
 // proxmox.{list,detail,create,update,delete} — endpoint registry CRUD.
 // ═══════════════════════════════════════════════════════════════════════════
 
+// `addresses` is a built-in column on every `#[endpoint_resource]` — an ordered
+// fallback list (`--address kind=url`, repeatable) resolved by
+// `address::resolve_reachable`. Each entry's free-form `kind` (`fqdn` / `lan` /
+// `tailscale`) doubles as the locality class the fewest-hop router consumes.
 #[endpoint_resource(plugin = "proxmox")]
 pub struct ProxmoxEndpoint {
     pub name: String,
-    pub base_url: String,
     pub token_id: String,
     #[secret]
     pub token_secret: String,
@@ -59,16 +62,26 @@ impl From<crate::ProxmoxActionResult> for ProxmoxActionResult {
 
 // ── HTTP client helper ─────────────────────────────────────────────────────
 
-pub(crate) fn make_client(name: &str) -> Result<generated::Client> {
-    let conn = runtime::open_db()?;
-    let row = endpoint_db::get(&conn, name)?
-        .with_context(|| format!("proxmox endpoint '{name}' not registered"))?;
+/// Resolve a registered endpoint into a ready [`Config`]: the first reachable
+/// base URL (`resolve_reachable` over the endpoint's `addresses` fallback list)
+/// plus the secure-first token secret. Single place both the generated client
+/// and the topology/roster reqwest paths flow through.
+pub(crate) async fn resolve_config(name: &str) -> Result<Config> {
+    let row = {
+        let conn = runtime::open_db()?;
+        endpoint_db::get(&conn, name)?
+            .with_context(|| format!("proxmox endpoint '{name}' not registered"))?
+    };
     if !row.enabled {
         bail!("proxmox endpoint '{name}' is disabled");
     }
     let secret = resolve_token_secret(name, &row)?;
-    let cfg = Config::new(row.base_url, row.token_id, secret).insecure(row.insecure);
-    Ok(cfg.build_generated_client()?)
+    let base_url = address::resolve_reachable(name, &row.addresses).await?;
+    Ok(Config::new(base_url, row.token_id, secret).insecure(row.insecure))
+}
+
+pub(crate) async fn make_client(name: &str) -> Result<generated::Client> {
+    Ok(resolve_config(name).await?.build_generated_client()?)
 }
 
 /// Resolve an endpoint's token secret secure-first: prefer the abstract secrets
@@ -116,7 +129,7 @@ pub struct ProxmoxNodeRow {
 /// List Proxmox cluster nodes for a registered endpoint.
 #[orca_tool(domain = "proxmox", verb = "nodes")]
 async fn proxmox_nodes(args: ProxmoxNodesArgs, _ctx: &ToolCtx) -> Result<Vec<ProxmoxNodeRow>> {
-    let client = make_client(&args.endpoint)?;
+    let client = make_client(&args.endpoint).await?;
     let items = client
         .get_index_nodes()
         .await
@@ -170,7 +183,7 @@ async fn proxmox_node_detail(
     args: ProxmoxNodeDetailArgs,
     _ctx: &ToolCtx,
 ) -> Result<ProxmoxNodeDetailOutput> {
-    let client = make_client(&args.endpoint)?;
+    let client = make_client(&args.endpoint).await?;
     let vms = client
         .get_vmlist_nodes_node_qemu(&args.node, None)
         .await
@@ -233,7 +246,7 @@ async fn proxmox_action(args: ProxmoxActionArgs, _ctx: &ToolCtx) -> Result<Proxm
         bail!("set either `vmid` or `ctid`, not both");
     }
     let action: crate::ProxmoxAction = args.action.parse()?;
-    let client = make_client(&args.endpoint)?;
+    let client = make_client(&args.endpoint).await?;
     let (vmid, is_lxc) = match (args.vmid, args.ctid) {
         (Some(v), None) => (v, false),
         (None, Some(c)) => (c, true),
@@ -350,7 +363,7 @@ async fn proxmox_host_logs(
     args: ProxmoxHostLogsArgs,
     _ctx: &ToolCtx,
 ) -> Result<crate::responses::JournalResponse> {
-    let client = make_client(&args.endpoint)?;
+    let client = make_client(&args.endpoint).await?;
     let q = crate::responses::JournalQuery {
         since: args.since,
         until: args.until,
@@ -421,7 +434,7 @@ async fn proxmox_cluster_status(
     args: ProxmoxClusterStatusArgs,
     _ctx: &ToolCtx,
 ) -> Result<ProxmoxClusterStatusOutput> {
-    let client = make_client(&args.endpoint)?;
+    let client = make_client(&args.endpoint).await?;
     let status = crate::cluster::fetch_cluster_status(&client).await?;
     Ok(status.into())
 }
@@ -451,9 +464,10 @@ async fn proxmox_cluster_list(
     let mut out = Vec::new();
     for ep in endpoints.into_iter().filter(|e| e.enabled) {
         let name = ep.name.clone();
-        let cfg =
-            crate::Config::new(ep.base_url, ep.token_id, ep.token_secret).insecure(ep.insecure);
-        let client = match cfg.build_generated_client() {
+        // Route through `make_client` so both the reachable address
+        // (`resolve_reachable` over the endpoint's fallback list) and the
+        // secure-first token secret are resolved in one place.
+        let client = match make_client(&name).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(
