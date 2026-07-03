@@ -2543,6 +2543,7 @@ dependencies = [
  "regress 0.10.5",
  "reqwest",
  "rusqlite",
+ "rustls",
  "schemars 1.2.1",
  "serde",
  "serde_json",
