@@ -66,8 +66,28 @@ pub(crate) fn make_client(name: &str) -> Result<generated::Client> {
     if !row.enabled {
         bail!("proxmox endpoint '{name}' is disabled");
     }
-    let cfg = Config::new(row.base_url, row.token_id, row.token_secret).insecure(row.insecure);
+    let secret = resolve_token_secret(name, &row)?;
+    let cfg = Config::new(row.base_url, row.token_id, secret).insecure(row.insecure);
     Ok(cfg.build_generated_client()?)
+}
+
+/// Resolve an endpoint's token secret secure-first: prefer the abstract secrets
+/// domain (`proxmox.<endpoint>.token_secret`), falling back to a legacy
+/// plaintext column value only if the domain has none. Once
+/// `proxmox.access_bootstrap` has run, the column is empty and the secret lives
+/// only in the secrets domain ([[runtime-least-privilege-not-root]]).
+pub(crate) fn token_secret_name(endpoint: &str) -> String {
+    plugin_toolkit::secrets::scoped_name("proxmox", endpoint, "token_secret")
+}
+
+fn resolve_token_secret(name: &str, row: &ProxmoxEndpoint) -> Result<String> {
+    if let Some(v) = plugin_toolkit::secrets::get(&token_secret_name(name))? {
+        return Ok(v);
+    }
+    if !row.token_secret.is_empty() {
+        return Ok(row.token_secret.clone());
+    }
+    bail!("proxmox endpoint '{name}' has no token secret (neither in the secrets domain nor inline)")
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -16,6 +16,7 @@
 //! call site.
 
 pub mod abi_export;
+pub mod access;
 pub mod cluster;
 pub mod cluster_roster_impl;
 pub mod containers_adapter;
@@ -37,6 +38,34 @@ pub mod unit_provider;
 )]
 pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/proxmox_codegen.rs"));
+}
+
+/// How Proxmox VE wraps every response body: `{"data": <payload>}`.
+///
+/// The vendored OpenAPI spec describes only the inner `<payload>`, so the
+/// generated client would fail to deserialize the raw wire body. `build.rs`
+/// hands this function to `generate_all_with_unwrapper`, which routes the
+/// generated client's transport hook through
+/// `plugin_toolkit::api_client::exec_with_unwrapper` — peeling the `data` key
+/// before the typed types see the body. This is the plugin declaring *how* its
+/// endpoints wrap their data; no call site ever touches the envelope.
+pub fn unwrap_envelope(
+    value: plugin_toolkit::serde_json::Value,
+) -> Option<plugin_toolkit::serde_json::Value> {
+    use plugin_toolkit::serde_json::Value;
+    let inner = match value {
+        Value::Object(mut map) => map.remove("data")?,
+        _ => return None,
+    };
+    // PVE write endpoints (create/update/delete role, user, ACL, token) answer
+    // `{"data": null}`, but the generated success type models the endpoint's
+    // (empty) result object. Coerce a null payload to an empty object so those
+    // methods deserialize the "no content" success instead of erroring on null.
+    // Reads return arrays/objects, not null, so this is safe here.
+    Some(match inner {
+        Value::Null => Value::Object(Default::default()),
+        other => other,
+    })
 }
 
 use serde::{Deserialize, Serialize};
