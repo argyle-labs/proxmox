@@ -73,7 +73,7 @@ pub(crate) async fn resolve_config(name: &str) -> Result<Config> {
         bail!("proxmox endpoint '{name}' is disabled");
     }
     let secret = resolve_token_secret(name, &row)?;
-    let base_url = address::resolve_reachable(name, &row.addresses).await?;
+    let base_url = address::resolve_reachable(name, &row.addresses, row.insecure).await?;
     Ok(Config::new(base_url, row.token_id, secret).insecure(row.insecure))
 }
 
