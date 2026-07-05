@@ -73,8 +73,26 @@ pub(crate) async fn resolve_config(name: &str) -> Result<Config> {
         bail!("proxmox endpoint '{name}' is disabled");
     }
     let secret = resolve_token_secret(name, &row)?;
-    let base_url = address::resolve_reachable(name, &row.addresses, row.insecure).await?;
+    // Endpoints are registered as the bare host root (e.g. `https://host:8006`),
+    // which is also what the reachability probe hits. The PVE REST API lives
+    // under `/api2/json`; both the generated client and the hand-rolled
+    // `fetch_guest_config`/topology paths join their `/nodes/...` routes onto
+    // `Config::base_url`, so promote the reachable root to the API root here.
+    // Idempotent: an address already ending in `/api2/json` is left as-is.
+    let reachable = address::resolve_reachable(name, &row.addresses, row.insecure).await?;
+    let base_url = api_root(&reachable);
     Ok(Config::new(base_url, row.token_id, secret).insecure(row.insecure))
+}
+
+/// Promote a bare PVE host URL to its REST API root (`.../api2/json`),
+/// leaving a URL that already carries the suffix untouched.
+fn api_root(base: &str) -> String {
+    let trimmed = base.trim_end_matches('/');
+    if trimmed.ends_with("/api2/json") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/api2/json")
+    }
 }
 
 pub(crate) async fn make_client(name: &str) -> Result<generated::Client> {
@@ -547,4 +565,33 @@ async fn proxmox_collect_claims(
     _ctx: &ToolCtx,
 ) -> Result<Vec<plugin_toolkit::contract::TopologyClaim>> {
     crate::topology::collect_claims().await
+}
+
+#[cfg(test)]
+mod api_root_tests {
+    use super::api_root;
+
+    #[test]
+    fn appends_api_root_to_bare_host() {
+        assert_eq!(
+            api_root("https://10.0.0.7:8006"),
+            "https://10.0.0.7:8006/api2/json"
+        );
+    }
+
+    #[test]
+    fn trims_trailing_slash_before_appending() {
+        assert_eq!(
+            api_root("https://host:8006/"),
+            "https://host:8006/api2/json"
+        );
+    }
+
+    #[test]
+    fn idempotent_when_suffix_present() {
+        assert_eq!(
+            api_root("https://host:8006/api2/json"),
+            "https://host:8006/api2/json"
+        );
+    }
 }
