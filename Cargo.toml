@@ -98,6 +98,18 @@ anyhow    = "1"
 [build-dependencies]
 plugin-toolkit-build = { git = "https://github.com/argyle-labs/orca", branch = "main" }
 
+# Prototype spec→orca-surface generator (build/surface.rs). Reads the emitted
+# `<flavor>_codegen.rs`, pairs each generated client method back to its spec
+# operation via the doc-comment verb+path, applies a declarative ruleset, and
+# emits `#[orca_tool]` wrappers plus JsonSchema derives on the surfaced output
+# types' transitive closure. Lifts into plugin-toolkit-build once proven.
+syn         = { version = "2", features = ["full", "extra-traits", "parsing", "printing"] }
+quote       = "1"
+proc-macro2 = "1"
+prettyplease = "0.2"
+regex       = "1"
+anyhow      = "1"
+
 # Match orca's workspace lint floor: discarding a Result/Option via
 # `let _ = ...` was a load-bearing past incident, so keep it a hard error here
 # too — the plugin must stay portable back into the orca workspace.

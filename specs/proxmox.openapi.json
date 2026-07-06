@@ -145,7 +145,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -443,7 +443,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -477,7 +477,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -729,7 +729,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -761,7 +761,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -915,7 +915,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -1006,7 +1006,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -1035,7 +1035,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -1163,7 +1163,30 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "CSRFPreventionToken": {
+                      "type": "string"
+                    },
+                    "cap": {
+                      "type": "object"
+                    },
+                    "clustername": {
+                      "type": "string"
+                    },
+                    "ticket": {
+                      "type": "string"
+                    },
+                    "username": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "CSRFPreventionToken",
+                    "cap",
+                    "ticket",
+                    "username"
+                  ]
                 }
               }
             }
@@ -1216,7 +1239,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -1337,7 +1360,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -1558,7 +1581,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -1587,7 +1610,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -1996,7 +2019,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -2051,7 +2074,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -2070,7 +2093,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -2368,7 +2391,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -2526,7 +2549,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -2558,7 +2581,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -2984,7 +3007,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -3075,7 +3098,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -3931,7 +3954,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -4405,7 +4428,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -4436,7 +4459,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -4736,7 +4759,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -5096,7 +5119,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -5128,7 +5151,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -5745,7 +5768,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -6426,7 +6449,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -6577,7 +6600,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -6680,7 +6703,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -6724,7 +6747,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -6821,7 +6844,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -7081,7 +7104,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -7114,7 +7137,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -7395,7 +7418,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -7451,7 +7474,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -7548,7 +7571,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -7665,7 +7688,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -7708,7 +7731,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -7822,7 +7845,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -7878,7 +7901,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -8051,7 +8074,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -8344,7 +8367,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -8597,7 +8620,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -8639,7 +8662,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -8762,7 +8785,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -8795,7 +8818,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -8866,7 +8889,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -8897,7 +8920,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -9023,7 +9046,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -9196,7 +9219,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -9237,7 +9260,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -9567,7 +9590,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -9715,7 +9738,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -9746,7 +9769,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -9841,7 +9864,7 @@
                       },
                       "type": {
                         "description": "Type of status entry.",
-                        "type": "object"
+                        "type": "string"
                       }
                     },
                     "required": [
@@ -10092,7 +10115,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -10178,7 +10201,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -10207,7 +10230,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -10471,7 +10494,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -10567,7 +10590,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -10596,7 +10619,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -10737,7 +10760,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -10841,7 +10864,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -10870,7 +10893,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -10912,7 +10935,24 @@
                       },
                       "error": {
                         "description": "A list of errors when 'check_node' is given.",
-                        "type": "object"
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "message": {
+                              "description": "The message of the error",
+                              "type": "string"
+                            },
+                            "severity": {
+                              "description": "The severity of the error",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "message",
+                            "severity"
+                          ]
+                        }
                       },
                       "id": {
                         "description": "The logical ID of the mapping.",
@@ -10983,7 +11023,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -11083,7 +11123,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -11112,7 +11152,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -11498,7 +11538,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -11673,7 +11713,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -11702,7 +11742,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -11890,7 +11930,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -12022,7 +12062,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -12051,7 +12091,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -12194,7 +12234,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -12359,7 +12399,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -12388,7 +12428,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -12581,7 +12621,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -12794,7 +12834,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -12823,7 +12863,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -12984,7 +13024,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -13167,7 +13207,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -13196,7 +13236,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -13444,7 +13484,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -13643,7 +13683,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -13672,7 +13712,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -13766,7 +13806,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -13984,7 +14024,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -14159,7 +14199,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -14353,7 +14393,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -14405,7 +14445,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -14965,7 +15005,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -15018,7 +15058,134 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "asn": {
+                      "description": "The local ASN of the controller. BGP & EVPN only.",
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 4294967295
+                    },
+                    "bgp-multipath-as-relax": {
+                      "description": "Consider different AS paths of equal length for multipath computation. BGP only.",
+                      "type": "boolean"
+                    },
+                    "controller": {
+                      "description": "Name of the controller.",
+                      "type": "string"
+                    },
+                    "digest": {
+                      "description": "Digest of the controller section.",
+                      "type": "string"
+                    },
+                    "ebgp": {
+                      "description": "Enable eBGP (remote-as external). BGP only.",
+                      "type": "boolean"
+                    },
+                    "ebgp-multihop": {
+                      "description": "Set maximum amount of hops for eBGP peers. Needs ebgp set to 1. BGP only.",
+                      "type": "integer"
+                    },
+                    "isis-domain": {
+                      "description": "Name of the IS-IS domain. IS-IS only.",
+                      "type": "string"
+                    },
+                    "isis-ifaces": {
+                      "description": "Comma-separated list of interfaces where IS-IS should be active. IS-IS only.",
+                      "type": "string",
+                      "format": "pve-iface-list"
+                    },
+                    "isis-net": {
+                      "description": "Network Entity title for this node in the IS-IS network. IS-IS only.",
+                      "type": "string",
+                      "format": "pve-sdn-isis-net"
+                    },
+                    "loopback": {
+                      "description": "Name of the loopback/dummy interface that provides the Router-IP. BGP only.",
+                      "type": "string"
+                    },
+                    "node": {
+                      "description": "Node(s) where this controller is active.",
+                      "type": "string"
+                    },
+                    "peers": {
+                      "description": "Comma-separated list of the peers IP addresses.",
+                      "type": "string"
+                    },
+                    "pending": {
+                      "description": "Changes that have not yet been applied to the running configuration.",
+                      "type": "object",
+                      "properties": {
+                        "asn": {
+                          "description": "The local ASN of the controller. BGP & EVPN only.",
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 4294967295
+                        },
+                        "bgp-multipath-as-relax": {
+                          "description": "Consider different AS paths of equal length for multipath computation. BGP only.",
+                          "type": "boolean"
+                        },
+                        "ebgp": {
+                          "description": "Enable eBGP (remote-as external). BGP only.",
+                          "type": "boolean"
+                        },
+                        "ebgp-multihop": {
+                          "description": "Set maximum amount of hops for eBGP peers. Needs ebgp set to 1. BGP only.",
+                          "type": "integer"
+                        },
+                        "isis-domain": {
+                          "description": "Name of the IS-IS domain. IS-IS only.",
+                          "type": "string"
+                        },
+                        "isis-ifaces": {
+                          "description": "Comma-separated list of interfaces where IS-IS should be active. IS-IS only.",
+                          "type": "string",
+                          "format": "pve-iface-list"
+                        },
+                        "isis-net": {
+                          "description": "Network Entity title for this node in the IS-IS network. IS-IS only.",
+                          "type": "string",
+                          "format": "pve-sdn-isis-net"
+                        },
+                        "loopback": {
+                          "description": "Name of the loopback/dummy interface that provides the Router-IP. BGP only.",
+                          "type": "string"
+                        },
+                        "node": {
+                          "description": "Node(s) where this controller is active.",
+                          "type": "string"
+                        },
+                        "peers": {
+                          "description": "Comma-separated list of the peers IP addresses.",
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "state": {
+                      "description": "State of the SDN configuration object.",
+                      "type": "string",
+                      "enum": [
+                        "new",
+                        "changed",
+                        "deleted"
+                      ]
+                    },
+                    "type": {
+                      "description": "Type of the controller",
+                      "type": "string",
+                      "enum": [
+                        "bgp",
+                        "evpn",
+                        "faucet",
+                        "isis"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "controller",
+                    "type"
+                  ]
                 }
               }
             }
@@ -15126,7 +15293,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -15167,7 +15334,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -15288,7 +15455,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -15395,7 +15562,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -15436,7 +15603,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -15806,7 +15973,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -15986,7 +16153,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -16017,7 +16184,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -16296,7 +16463,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -16341,7 +16508,55 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "digest": {
+                      "description": "Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.",
+                      "type": "string",
+                      "maxLength": 64
+                    },
+                    "fabric_id": {
+                      "description": "Identifier for SDN fabrics",
+                      "type": "string",
+                      "format": "pve-sdn-fabric-id"
+                    },
+                    "interfaces": {
+                      "type": "array"
+                    },
+                    "ip": {
+                      "description": "IPv4 address for this node",
+                      "type": "string",
+                      "format": "ipv4"
+                    },
+                    "ip6": {
+                      "description": "IPv6 address for this node",
+                      "type": "string",
+                      "format": "ipv6"
+                    },
+                    "lock-token": {
+                      "description": "the token for unlocking the global SDN configuration",
+                      "type": "string"
+                    },
+                    "node_id": {
+                      "description": "Identifier for nodes in an SDN fabric",
+                      "type": "string",
+                      "format": "pve-node"
+                    },
+                    "protocol": {
+                      "description": "Type of configuration entry in an SDN Fabric section config",
+                      "type": "string",
+                      "enum": [
+                        "openfabric",
+                        "ospf"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "fabric_id",
+                    "interfaces",
+                    "node_id",
+                    "protocol"
+                  ]
                 }
               }
             }
@@ -16441,7 +16656,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -16484,7 +16699,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -16601,7 +16816,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -16705,7 +16920,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -16746,7 +16961,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -16852,7 +17067,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -16890,7 +17105,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -17091,7 +17306,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -17144,7 +17359,91 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "alias": {
+                      "description": "Alias name of the VNet.",
+                      "type": "string",
+                      "pattern": "(?:[\\(\\)-_.\\w\\d\\s]{0,256})",
+                      "maxLength": 256
+                    },
+                    "digest": {
+                      "description": "Digest of the VNet section.",
+                      "type": "string"
+                    },
+                    "isolate-ports": {
+                      "description": "If true, sets the isolated property for all interfaces on the bridge of this VNet.",
+                      "type": "boolean"
+                    },
+                    "pending": {
+                      "description": "Changes that have not yet been applied to the running configuration.",
+                      "type": "object",
+                      "properties": {
+                        "alias": {
+                          "description": "Alias name of the VNet.",
+                          "type": "string",
+                          "pattern": "(?:[\\(\\)-_.\\w\\d\\s]{0,256})",
+                          "maxLength": 256
+                        },
+                        "isolate-ports": {
+                          "description": "If true, sets the isolated property for all interfaces on the bridge of this VNet.",
+                          "type": "boolean"
+                        },
+                        "tag": {
+                          "description": "VLAN Tag (for VLAN or QinQ zones) or VXLAN VNI (for VXLAN or EVPN zones).",
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 16777215
+                        },
+                        "vlanaware": {
+                          "description": "Allow VLANs to pass through this VNet.",
+                          "type": "boolean"
+                        },
+                        "zone": {
+                          "description": "Name of the zone this VNet belongs to.",
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "state": {
+                      "description": "State of the SDN configuration object.",
+                      "type": "string",
+                      "enum": [
+                        "new",
+                        "changed",
+                        "deleted"
+                      ]
+                    },
+                    "tag": {
+                      "description": "VLAN Tag (for VLAN or QinQ zones) or VXLAN VNI (for VXLAN or EVPN zones).",
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 16777215
+                    },
+                    "type": {
+                      "description": "Type of the VNet.",
+                      "type": "string",
+                      "enum": [
+                        "vnet"
+                      ]
+                    },
+                    "vlanaware": {
+                      "description": "Allow VLANs to pass through this VNet.",
+                      "type": "boolean"
+                    },
+                    "vnet": {
+                      "description": "Name of the VNet.",
+                      "type": "string"
+                    },
+                    "zone": {
+                      "description": "Name of the zone this VNet belongs to.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "vnet"
+                  ]
                 }
               }
             }
@@ -17225,7 +17524,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -17266,7 +17565,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -17443,7 +17742,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -17699,7 +17998,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -17976,7 +18275,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -18030,7 +18329,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -18100,7 +18399,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -18162,7 +18461,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -18228,7 +18527,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -18372,7 +18671,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -18532,7 +18831,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -18585,7 +18884,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -19067,7 +19366,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -19120,7 +19419,256 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "advertise-subnets": {
+                      "description": "Advertise IP prefixes (Type-5 routes) instead of MAC/IP pairs (Type-2 routes). EVPN zone only.",
+                      "type": "boolean"
+                    },
+                    "bridge": {
+                      "description": "the bridge for which VLANs should be managed. VLAN & QinQ zone only.",
+                      "type": "string"
+                    },
+                    "bridge-disable-mac-learning": {
+                      "description": "Disable auto mac learning. VLAN zone only.",
+                      "type": "boolean"
+                    },
+                    "controller": {
+                      "description": "ID of the controller for this zone. EVPN zone only.",
+                      "type": "string"
+                    },
+                    "dhcp": {
+                      "description": "Name of DHCP server backend for this zone.",
+                      "type": "string",
+                      "enum": [
+                        "dnsmasq"
+                      ]
+                    },
+                    "digest": {
+                      "description": "Digest of the controller section.",
+                      "type": "string"
+                    },
+                    "disable-arp-nd-suppression": {
+                      "description": "Suppress IPv4 ARP && IPv6 Neighbour Discovery messages. EVPN zone only.",
+                      "type": "boolean"
+                    },
+                    "dns": {
+                      "description": "ID of the DNS server for this zone.",
+                      "type": "string"
+                    },
+                    "dnszone": {
+                      "description": "Domain name for this zone.",
+                      "type": "string"
+                    },
+                    "exitnodes": {
+                      "description": "List of PVE Nodes that should act as exit node for this zone. EVPN zone only.",
+                      "type": "string",
+                      "format": "pve-node-list"
+                    },
+                    "exitnodes-local-routing": {
+                      "description": "Create routes on the exit nodes, so they can connect to EVPN guests. EVPN zone only.",
+                      "type": "boolean"
+                    },
+                    "exitnodes-primary": {
+                      "description": "Force traffic through this exitnode first. EVPN zone only.",
+                      "type": "string",
+                      "format": "pve-node"
+                    },
+                    "ipam": {
+                      "description": "ID of the IPAM for this zone.",
+                      "type": "string"
+                    },
+                    "mac": {
+                      "description": "MAC address of the anycast router for this zone.",
+                      "type": "string"
+                    },
+                    "mtu": {
+                      "description": "MTU of the zone, will be used for the created VNet bridges.",
+                      "type": "integer"
+                    },
+                    "nodes": {
+                      "description": "Nodes where this zone should be created.",
+                      "type": "string"
+                    },
+                    "peers": {
+                      "description": "Comma-separated list of peers, that are part of the VXLAN zone. Usually the IPs of the nodes. VXLAN zone only.",
+                      "type": "string",
+                      "format": "ip-list"
+                    },
+                    "pending": {
+                      "description": "Changes that have not yet been applied to the running configuration.",
+                      "type": "object",
+                      "properties": {
+                        "advertise-subnets": {
+                          "description": "Advertise IP prefixes (Type-5 routes) instead of MAC/IP pairs (Type-2 routes). EVPN zone only.",
+                          "type": "boolean"
+                        },
+                        "bridge": {
+                          "description": "the bridge for which VLANs should be managed. VLAN & QinQ zone only.",
+                          "type": "string"
+                        },
+                        "bridge-disable-mac-learning": {
+                          "description": "Disable auto mac learning. VLAN zone only.",
+                          "type": "boolean"
+                        },
+                        "controller": {
+                          "description": "ID of the controller for this zone. EVPN zone only.",
+                          "type": "string"
+                        },
+                        "dhcp": {
+                          "description": "Name of DHCP server backend for this zone.",
+                          "type": "string",
+                          "enum": [
+                            "dnsmasq"
+                          ]
+                        },
+                        "disable-arp-nd-suppression": {
+                          "description": "Suppress IPv4 ARP && IPv6 Neighbour Discovery messages. EVPN zone only.",
+                          "type": "boolean"
+                        },
+                        "dns": {
+                          "description": "ID of the DNS server for this zone.",
+                          "type": "string"
+                        },
+                        "dnszone": {
+                          "description": "Domain name for this zone.",
+                          "type": "string"
+                        },
+                        "exitnodes": {
+                          "description": "List of PVE Nodes that should act as exit node for this zone. EVPN zone only.",
+                          "type": "string",
+                          "format": "pve-node-list"
+                        },
+                        "exitnodes-local-routing": {
+                          "description": "Create routes on the exit nodes, so they can connect to EVPN guests. EVPN zone only.",
+                          "type": "boolean"
+                        },
+                        "exitnodes-primary": {
+                          "description": "Force traffic through this exitnode first. EVPN zone only.",
+                          "type": "string",
+                          "format": "pve-node"
+                        },
+                        "ipam": {
+                          "description": "ID of the IPAM for this zone.",
+                          "type": "string"
+                        },
+                        "mac": {
+                          "description": "MAC address of the anycast router for this zone.",
+                          "type": "string"
+                        },
+                        "mtu": {
+                          "description": "MTU of the zone, will be used for the created VNet bridges.",
+                          "type": "integer"
+                        },
+                        "nodes": {
+                          "description": "Nodes where this zone should be created.",
+                          "type": "string"
+                        },
+                        "peers": {
+                          "description": "Comma-separated list of peers, that are part of the VXLAN zone. Usually the IPs of the nodes. VXLAN zone only.",
+                          "type": "string",
+                          "format": "ip-list"
+                        },
+                        "reversedns": {
+                          "description": "ID of the reverse DNS server for this zone.",
+                          "type": "string"
+                        },
+                        "rt-import": {
+                          "description": "Route-Targets that should be imported into the VRF of this zone via BGP. EVPN zone only.",
+                          "type": "string",
+                          "format": "pve-sdn-bgp-rt-list"
+                        },
+                        "tag": {
+                          "description": "Service-VLAN Tag (outer VLAN). QinQ zone only",
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "vlan-protocol": {
+                          "description": "VLAN protocol for the creation of the QinQ zone. QinQ zone only.",
+                          "type": "string",
+                          "enum": [
+                            "802.1q",
+                            "802.1ad"
+                          ]
+                        },
+                        "vrf-vxlan": {
+                          "description": "VNI for the zone VRF. EVPN zone only.",
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 16777215
+                        },
+                        "vxlan-port": {
+                          "description": "UDP port that should be used for the VXLAN tunnel (default 4789). VXLAN zone only.",
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 65536
+                        }
+                      }
+                    },
+                    "reversedns": {
+                      "description": "ID of the reverse DNS server for this zone.",
+                      "type": "string"
+                    },
+                    "rt-import": {
+                      "description": "Route-Targets that should be imported into the VRF of this zone via BGP. EVPN zone only.",
+                      "type": "string",
+                      "format": "pve-sdn-bgp-rt-list"
+                    },
+                    "state": {
+                      "description": "State of the SDN configuration object.",
+                      "type": "string",
+                      "enum": [
+                        "new",
+                        "changed",
+                        "deleted"
+                      ]
+                    },
+                    "tag": {
+                      "description": "Service-VLAN Tag (outer VLAN). QinQ zone only",
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "type": {
+                      "description": "Type of the zone.",
+                      "type": "string",
+                      "enum": [
+                        "evpn",
+                        "faucet",
+                        "qinq",
+                        "simple",
+                        "vlan",
+                        "vxlan"
+                      ]
+                    },
+                    "vlan-protocol": {
+                      "description": "VLAN protocol for the creation of the QinQ zone. QinQ zone only.",
+                      "type": "string",
+                      "enum": [
+                        "802.1q",
+                        "802.1ad"
+                      ]
+                    },
+                    "vrf-vxlan": {
+                      "description": "VNI for the zone VRF. EVPN zone only.",
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 16777215
+                    },
+                    "vxlan-port": {
+                      "description": "UDP port that should be used for the VXLAN tunnel (default 4789). VXLAN zone only.",
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 65536
+                    },
+                    "zone": {
+                      "description": "Name of the zone.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "zone"
+                  ]
                 }
               }
             }
@@ -19293,7 +19841,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -19334,7 +19882,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -19925,7 +20473,7 @@
                         "properties": {
                           "index": {
                             "description": "Index of the associated repository within the file.",
-                            "type": "string"
+                            "type": "integer"
                           },
                           "kind": {
                             "description": "Kind of the information (e.g. warning).",
@@ -20039,7 +20587,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -20103,7 +20651,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -21185,7 +21733,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -21998,7 +22546,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -22294,7 +22842,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -22353,7 +22901,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -23545,7 +24093,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -23800,7 +24348,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -24178,12 +24726,14 @@
                         "type": "string"
                       },
                       "mounted": {
+                        "nullable": true,
                         "type": "boolean"
                       },
                       "osdid": {
                         "type": "integer"
                       },
                       "osdid-list": {
+                        "nullable": true,
                         "type": "array",
                         "items": {
                           "type": "integer"
@@ -24212,9 +24762,7 @@
                     "required": [
                       "devpath",
                       "gpt",
-                      "mounted",
                       "osdid",
-                      "osdid-list",
                       "size"
                     ]
                   }
@@ -25239,7 +25787,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -25780,7 +26328,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -26036,7 +26584,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -26313,7 +26861,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -26367,7 +26915,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -26832,7 +27380,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -28123,7 +28671,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -28399,7 +28947,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -28552,7 +29100,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -28621,7 +29169,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -28772,7 +29320,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -28939,7 +29487,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -29007,7 +29555,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -29171,7 +29719,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -29252,7 +29800,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -29612,7 +30160,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -29984,7 +30532,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -30287,7 +30835,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -30354,7 +30902,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -31848,7 +32396,23 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "socket": {
+                      "type": "string"
+                    },
+                    "ticket": {
+                      "type": "string"
+                    },
+                    "upid": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "socket",
+                    "ticket",
+                    "upid"
+                  ]
                 }
               }
             }
@@ -33019,7 +33583,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -33157,7 +33721,31 @@
               "application/json": {
                 "schema": {
                   "description": "Returned values can be directly passed to the 'remote-viewer' application.",
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "host": {
+                      "type": "string"
+                    },
+                    "password": {
+                      "type": "string"
+                    },
+                    "proxy": {
+                      "type": "string"
+                    },
+                    "tls-port": {
+                      "type": "integer"
+                    },
+                    "type": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "host",
+                    "password",
+                    "proxy",
+                    "tls-port",
+                    "type"
+                  ]
                 }
               }
             }
@@ -33766,7 +34354,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -33812,7 +34400,27 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "port": {
+                      "type": "integer"
+                    },
+                    "ticket": {
+                      "type": "string"
+                    },
+                    "upid": {
+                      "type": "string"
+                    },
+                    "user": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "port",
+                    "ticket",
+                    "upid",
+                    "user"
+                  ]
                 }
               }
             }
@@ -33885,7 +34493,31 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "cert": {
+                      "type": "string"
+                    },
+                    "port": {
+                      "type": "integer"
+                    },
+                    "ticket": {
+                      "type": "string"
+                    },
+                    "upid": {
+                      "type": "string"
+                    },
+                    "user": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "cert",
+                    "port",
+                    "ticket",
+                    "upid",
+                    "user"
+                  ]
                 }
               }
             }
@@ -34682,7 +35314,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -34713,7 +35345,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -35000,7 +35632,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -35045,7 +35677,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -36342,7 +36974,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -37590,7 +38222,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -38730,7 +39362,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -39332,7 +39964,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -39615,7 +40247,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -39768,7 +40400,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -39837,7 +40469,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -39988,7 +40620,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -40155,7 +40787,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -40223,7 +40855,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -40387,7 +41019,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -40468,7 +41100,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -40828,7 +41460,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -41200,7 +41832,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -41503,7 +42135,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -41570,7 +42202,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -42730,7 +43362,23 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "socket": {
+                      "type": "string"
+                    },
+                    "ticket": {
+                      "type": "string"
+                    },
+                    "upid": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "socket",
+                    "ticket",
+                    "upid"
+                  ]
                 }
               }
             }
@@ -43366,7 +44014,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -43776,7 +44424,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -43914,7 +44562,31 @@
               "application/json": {
                 "schema": {
                   "description": "Returned values can be directly passed to the 'remote-viewer' application.",
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "host": {
+                      "type": "string"
+                    },
+                    "password": {
+                      "type": "string"
+                    },
+                    "proxy": {
+                      "type": "string"
+                    },
+                    "tls-port": {
+                      "type": "integer"
+                    },
+                    "type": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "host",
+                    "password",
+                    "proxy",
+                    "tls-port",
+                    "type"
+                  ]
                 }
               }
             }
@@ -44872,7 +45544,27 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "port": {
+                      "type": "integer"
+                    },
+                    "ticket": {
+                      "type": "string"
+                    },
+                    "upid": {
+                      "type": "string"
+                    },
+                    "user": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "port",
+                    "ticket",
+                    "upid",
+                    "user"
+                  ]
                 }
               }
             }
@@ -44942,7 +45634,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -45007,7 +45699,35 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "cert": {
+                      "type": "string"
+                    },
+                    "password": {
+                      "description": "Returned if requested with 'generate-password' param. Consists of printable ASCII characters ('!' .. '~').",
+                      "type": "string"
+                    },
+                    "port": {
+                      "type": "integer"
+                    },
+                    "ticket": {
+                      "type": "string"
+                    },
+                    "upid": {
+                      "type": "string"
+                    },
+                    "user": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "cert",
+                    "port",
+                    "ticket",
+                    "upid",
+                    "user"
+                  ]
                 }
               }
             }
@@ -47657,7 +48377,31 @@
               "application/json": {
                 "schema": {
                   "description": "Returned values can be directly passed to the 'remote-viewer' application.",
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "host": {
+                      "type": "string"
+                    },
+                    "password": {
+                      "type": "string"
+                    },
+                    "proxy": {
+                      "type": "string"
+                    },
+                    "tls-port": {
+                      "type": "integer"
+                    },
+                    "type": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "host",
+                    "password",
+                    "proxy",
+                    "tls-port",
+                    "type"
+                  ]
                 }
               }
             }
@@ -47955,7 +48699,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -48629,7 +49373,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -48956,7 +49700,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -49955,7 +50699,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -50001,7 +50745,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -50032,7 +50776,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -50455,7 +51199,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -50696,7 +51440,31 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "port": {
+                      "description": "port used to bind termproxy to.",
+                      "type": "integer"
+                    },
+                    "ticket": {
+                      "description": "VNC ticket used to verify websocket connection.",
+                      "type": "string"
+                    },
+                    "upid": {
+                      "description": "UPID for termproxy worker task.",
+                      "type": "string"
+                    },
+                    "user": {
+                      "description": "user/token that generated the VNC ticket in `ticket`.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "port",
+                    "ticket",
+                    "upid",
+                    "user"
+                  ]
                 }
               }
             }
@@ -50800,7 +51568,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -50925,7 +51693,31 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "cert": {
+                      "type": "string"
+                    },
+                    "port": {
+                      "type": "integer"
+                    },
+                    "ticket": {
+                      "type": "string"
+                    },
+                    "upid": {
+                      "type": "string"
+                    },
+                    "user": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "cert",
+                    "port",
+                    "ticket",
+                    "upid",
+                    "user"
+                  ]
                 }
               }
             }
@@ -51657,7 +52449,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -51696,7 +52488,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -51725,7 +52517,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -51872,7 +52664,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -51901,7 +52693,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }
@@ -52722,7 +53514,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "string"
                 }
               }
             }

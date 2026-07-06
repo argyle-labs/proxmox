@@ -363,7 +363,22 @@ fn build_operation(path: &str, method_upper: &str, m: &PveMethod) -> Operation {
         }))
     };
 
-    let responses = build_responses(m.returns.as_ref());
+    // Narrow, growable list of endpoints whose documented response string
+    // enums are incomplete on the wire (verified live). `/cluster/ha/status/current`
+    // documents `type` as [quorum,master,lrm,service] but also emits `fencing`.
+    // Only these have their response enums relaxed to plain strings; every other
+    // endpoint keeps its (complete, roster-consumed) enums intact.
+    let relax_response_enums = matches!(path, "/cluster/ha/status/current");
+    // Narrow, growable list of response fields PVE documents as `string` but
+    // sends as a JSON integer on the wire (verified live). `/nodes/{node}/apt/
+    // repositories` documents `infos[].index` as string but emits `0`, `1`, …
+    // Responses are descriptive (not validated), so widening the documented
+    // type to the observed wire type is always safe and fixes the parse.
+    let coerce_int_fields: &[&str] = match path {
+        "/nodes/{node}/apt/repositories" => &["index"],
+        _ => &[],
+    };
+    let responses = build_responses(m.returns.as_ref(), relax_response_enums, coerce_int_fields);
 
     Operation {
         operation_id: Some(synth_operation_id(method_upper, path, m.name.as_deref())),
@@ -468,7 +483,20 @@ fn pve_to_schema(s: &PveSchema) -> Schema {
         description: s.description.clone(),
         ..Default::default()
     };
-    let kind = match s.ty.as_ref().map(PveType::primary).unwrap_or("") {
+    // Effective type: PVE often omits `type` on documented fields. Infer it
+    // rather than falling back to an opaque `Map<String,Value>` (which both
+    // violates the no-opaque-JSON rule and mis-deserializes — e.g. the HA
+    // status `type` field is an untyped string on the wire, not an object):
+    //   properties present → object · items present → array · else → string
+    // (PVE's convention for an untyped scalar field). An explicit `type` always
+    // wins.
+    let effective_ty = match s.ty.as_ref().map(PveType::primary).unwrap_or("") {
+        "" if s.properties.is_some() => "object",
+        "" if s.items.is_some() => "array",
+        "" => "string",
+        other => other,
+    };
+    let kind = match effective_ty {
         "string" => SchemaKind::Type(Type::String(StringType {
             format: match s.format_str() {
                 Some(f) => VariantOrUnknownOrEmpty::Unknown(f.to_string()),
@@ -504,11 +532,23 @@ fn pve_to_schema(s: &PveSchema) -> Schema {
             let mut required: Vec<String> = Vec::new();
             if let Some(props) = &s.properties {
                 for (name, schema) in props {
-                    properties.insert(
-                        name.clone(),
-                        ReferenceOr::Item(Box::new(pve_to_schema(schema))),
-                    );
-                    if !schema.optional.as_ref().is_some_and(PveFlag::is_set) {
+                    // Narrow, growable override: PVE documents these response
+                    // fields as required but omits or `null`s them on the wire
+                    // (verified live via tests/live_read_sweep.rs). Mark them
+                    // optional AND nullable so progenitor emits `Option<T>` —
+                    // which absorbs both absence and an explicit `null` (a plain
+                    // non-required array otherwise becomes `Vec<T>` + default,
+                    // and `default` does not coerce an explicit `null`). Add a
+                    // field here only after the sweep proves it broken; keep
+                    // required-ness everywhere PVE actually honors it.
+                    let observed_optional = matches!(name.as_str(), "mounted" | "osdid-list");
+                    let mut prop = pve_to_schema(schema);
+                    if observed_optional {
+                        prop.schema_data.nullable = true;
+                    }
+                    properties.insert(name.clone(), ReferenceOr::Item(Box::new(prop)));
+                    if !observed_optional && !schema.optional.as_ref().is_some_and(PveFlag::is_set)
+                    {
                         required.push(name.clone());
                     }
                 }
@@ -521,9 +561,9 @@ fn pve_to_schema(s: &PveSchema) -> Schema {
                 max_properties: None,
             }))
         }
-        // Unknown / null / missing: emit as untyped object so progenitor
-        // falls back to flexible decoding.
-        _ => SchemaKind::Type(Type::Object(ObjectType::default())),
+        // Any other unrecognized PVE type (e.g. `null`): treat as a string
+        // scalar rather than an opaque object — never emit `Map<String,Value>`.
+        _ => SchemaKind::Type(Type::String(StringType::default())),
     };
     Schema {
         schema_data: data,
@@ -551,12 +591,75 @@ fn build_object_schema(props: &BTreeMap<String, PveSchema>, required: &BTreeSet<
     }
 }
 
-fn build_responses(returns: Option<&PveSchema>) -> Responses {
+/// Recursively strip `enum` constraints from string schemas in a *response*
+/// body. PVE documents string enums that its wire does not honor — the HA
+/// status `type` field is documented `[quorum,master,lrm,service]` but also
+/// emits `fencing`. A closed Rust enum then fails to deserialize the live body.
+/// Responses are descriptive, not validated, so dropping the enum (the field
+/// stays `String`) is always safe and fixes the incomplete-enum class at once.
+/// Request/parameter enums are untouched — those *are* validated on input.
+fn strip_response_enums(schema: &mut Schema) {
+    match &mut schema.schema_kind {
+        SchemaKind::Type(Type::String(s)) => s.enumeration.clear(),
+        SchemaKind::Type(Type::Object(o)) => {
+            for prop in o.properties.values_mut() {
+                if let ReferenceOr::Item(inner) = prop {
+                    strip_response_enums(inner);
+                }
+            }
+        }
+        SchemaKind::Type(Type::Array(a)) => {
+            if let Some(ReferenceOr::Item(items)) = a.items.as_mut() {
+                strip_response_enums(items);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Retype every response property named in `fields` from `string` to `integer`,
+/// recursing through objects and arrays. Narrow companion to
+/// [`strip_response_enums`] for the documented-string / wire-integer class.
+fn coerce_response_int_fields(schema: &mut Schema, fields: &[&str]) {
+    match &mut schema.schema_kind {
+        SchemaKind::Type(Type::Object(o)) => {
+            for (name, prop) in o.properties.iter_mut() {
+                if let ReferenceOr::Item(inner) = prop {
+                    if fields.contains(&name.as_str())
+                        && matches!(inner.schema_kind, SchemaKind::Type(Type::String(_)))
+                    {
+                        inner.schema_kind = SchemaKind::Type(Type::Integer(IntegerType::default()));
+                    } else {
+                        coerce_response_int_fields(inner, fields);
+                    }
+                }
+            }
+        }
+        SchemaKind::Type(Type::Array(a)) => {
+            if let Some(ReferenceOr::Item(items)) = a.items.as_mut() {
+                coerce_response_int_fields(items, fields);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn build_responses(
+    returns: Option<&PveSchema>,
+    relax_enums: bool,
+    coerce_int_fields: &[&str],
+) -> Responses {
     let mut responses = Responses::default();
-    let schema = returns.map(pve_to_schema).unwrap_or_else(|| Schema {
+    let mut schema = returns.map(pve_to_schema).unwrap_or_else(|| Schema {
         schema_data: SchemaData::default(),
         schema_kind: SchemaKind::Type(Type::Object(ObjectType::default())),
     });
+    if relax_enums {
+        strip_response_enums(&mut schema);
+    }
+    if !coerce_int_fields.is_empty() {
+        coerce_response_int_fields(&mut schema, coerce_int_fields);
+    }
     let mut content = IndexMap::new();
     content.insert(
         "application/json".to_string(),
