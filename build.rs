@@ -4,7 +4,11 @@
 //! node (Proxmox ships `apidoc.js`, not OpenAPI):
 //!   cargo run --example pve_to_openapi -- apidoc.js > specs/proxmox.openapi.json
 
+#[path = "build/surface.rs"]
+mod surface;
+
 fn main() {
+    println!("cargo:rerun-if-changed=build/surface.rs");
     let specs_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("specs");
     // Proxmox VE diverges from its own documented schema on the wire in three
     // ways, all handled at the deserialize/transport seam so the generated
@@ -25,4 +29,7 @@ fn main() {
         },
     )
     .expect("proxmox openapi codegen");
+
+    // Prototype: generate the orca tool surface from the just-emitted client.
+    surface::generate("proxmox").expect("proxmox surface codegen");
 }

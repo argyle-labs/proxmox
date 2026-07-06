@@ -11,6 +11,7 @@
 //! - [`Verb::Update`] → lifecycle action `start` / `stop` / `shutdown` / `reboot`
 //! - [`Verb::Create`] → action `provision` (typed [`ProvisionPayload`] → PVE create)
 //! - [`Verb::Delete`] → destroy the guest
+//! - [`Verb::Upsert`] → action `set`: ensure-present (provision if absent, else no-op)
 //!
 //! Endpoint credentials live in the plugin's endpoint registry
 //! (`proxmox.{list,create,…}`); this provider reads them through the same
@@ -21,8 +22,8 @@ use plugin_toolkit::anyhow::{Result, anyhow};
 use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::contract::unit::{
     ActionDecl, ActionOutcome, CreateArgs, DeleteArgs, DetailArgs, ItemOutcome, ItemsOutcome,
-    KindDeclaration, ListArgs, UnitDescriptor, UnitId, UnitProvider, UpdateArgs, Verb, VerbArgs,
-    VerbDecl, VerbOutcome,
+    KindDeclaration, ListArgs, UnitDescriptor, UnitId, UnitProvider, UpdateArgs, UpsertArgs, Verb,
+    VerbArgs, VerbDecl, VerbOutcome,
 };
 use plugin_toolkit::schemars::{JsonSchema, schema_for};
 use plugin_toolkit::serde::{Deserialize, Serialize};
@@ -380,6 +381,42 @@ impl ProxmoxUnitProvider {
         )))
     }
 
+    /// Idempotent create-or-ensure for a guest keyed by vmid. Per the `Upsert`
+    /// contract an upsert succeeds whether or not the item already exists. A
+    /// running VM/LXC must never be silently destroyed to "replace" it, so the
+    /// safe interpretation is *ensure present*: provision when the guest is
+    /// absent, no-op (unchanged) when it already exists. The payload is the same
+    /// [`ProvisionPayload`] `create`/provision consumes.
+    async fn do_upsert(&self, args: UpsertArgs) -> Result<VerbOutcome> {
+        let raw = args
+            .payload
+            .ok_or_else(|| anyhow!("upsert requires a payload"))?;
+        let p: ProvisionPayload =
+            serde_json::from_str(&raw).map_err(|e| anyhow!("upsert payload: {e}"))?;
+        let kind = kind_from_str(&p.kind)?;
+        let client = crate::tools::make_client(&p.endpoint).await?;
+
+        // Target vmid: explicit in the payload, else the unit key.
+        let vmid = p.vmid.or_else(|| args.id.id.parse::<u64>().ok());
+
+        // Already present → ensure-present is a no-op (idempotent success).
+        if let Some(v) = vmid
+            && resolve_node(&client, kind, v).await.is_ok()
+        {
+            return Ok(VerbOutcome::Action(ActionOutcome {
+                changed: false,
+                message: format!("{} {v} already present", kind_str(kind)),
+            }));
+        }
+
+        // Absent → provision through the same path as `create`.
+        self.do_create(CreateArgs {
+            action: "provision".to_string(),
+            payload: Some(raw),
+        })
+        .await
+    }
+
     async fn do_delete(&self, args: DeleteArgs) -> Result<VerbOutcome> {
         let endpoint = endpoint_of(&args.id)?;
         let kind = kind_from_str(&args.id.kind)?;
@@ -560,6 +597,17 @@ fn guest_verbs() -> Vec<VerbDecl> {
             query_schema: None,
             actions: vec![],
         },
+        // Idempotent ensure-present: provision the guest if absent, no-op if it
+        // already exists. Shares the `provision` payload/response schema.
+        VerbDecl {
+            verb: Verb::Upsert,
+            query_schema: None,
+            actions: vec![ActionDecl {
+                action: "set".into(),
+                payload_schema: Some(schema_for!(ProvisionPayload)),
+                response_schema: Some(schema_for!(ProvisionResponse)),
+            }],
+        },
     ]
 }
 
@@ -609,6 +657,7 @@ impl UnitProvider for ProxmoxUnitProvider {
                 VerbArgs::Update(a) => self.do_update(a).await,
                 VerbArgs::Create(a) => self.do_create(a).await,
                 VerbArgs::Delete(a) => self.do_delete(a).await,
+                VerbArgs::Upsert(a) => self.do_upsert(a).await,
             }
         })
     }
@@ -637,9 +686,9 @@ mod tests {
     fn canonical_is_cluster_scoped_when_clustered() {
         // Same guest seen from three member-node endpoints → identical canonical
         // id, so core's merge collapses them to one unit.
-        let a = ProxmoxUnitProvider::canonical(&guest("thor", Some("yggdrasil"), "lxc", 100));
-        let b = ProxmoxUnitProvider::canonical(&guest("loki", Some("yggdrasil"), "lxc", 100));
-        assert_eq!(a, "cluster:yggdrasil/lxc/100");
+        let a = ProxmoxUnitProvider::canonical(&guest("node-a", Some("cluster-a"), "lxc", 100));
+        let b = ProxmoxUnitProvider::canonical(&guest("node-b", Some("cluster-a"), "lxc", 100));
+        assert_eq!(a, "cluster:cluster-a/lxc/100");
         assert_eq!(a, b);
     }
 
@@ -652,8 +701,8 @@ mod tests {
     #[test]
     fn list_item_sets_datacenter_from_cluster() {
         let clustered =
-            ProxmoxUnitProvider::list_item(&guest("thor", Some("yggdrasil"), "lxc", 100));
-        assert_eq!(clustered.datacenter.as_deref(), Some("yggdrasil"));
+            ProxmoxUnitProvider::list_item(&guest("node-a", Some("cluster-a"), "lxc", 100));
+        assert_eq!(clustered.datacenter.as_deref(), Some("cluster-a"));
         // Standalone host → no datacenter grouping.
         let standalone = ProxmoxUnitProvider::list_item(&guest("pve1", None, "vm", 200));
         assert_eq!(standalone.datacenter, None);
