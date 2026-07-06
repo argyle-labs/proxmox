@@ -67,11 +67,7 @@ impl From<crate::ProxmoxActionResult> for ProxmoxActionResult {
 /// plus the secure-first token secret. Single place both the generated client
 /// and the topology/roster reqwest paths flow through.
 pub(crate) async fn resolve_config(name: &str) -> Result<Config> {
-    let row = endpoint_db::get(name)?
-        .with_context(|| format!("proxmox endpoint '{name}' not registered"))?;
-    if !row.enabled {
-        bail!("proxmox endpoint '{name}' is disabled");
-    }
+    let row = endpoint_db::require(name)?;
     let secret = resolve_token_secret(name, &row)?;
     // Endpoints are registered as the bare host root (e.g. `https://host:8006`),
     // which is also what the reachability probe hits. The PVE REST API lives
