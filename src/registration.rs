@@ -16,8 +16,8 @@
 use std::sync::OnceLock;
 
 use plugin_toolkit::abi::BackendDef;
-use plugin_toolkit::contract::unit::{self as unit_domain, UnitProvider};
-use plugin_toolkit::export::runtime;
+use plugin_toolkit::contract::unit::UnitProvider;
+use plugin_toolkit::export::{dispatch_unit_op, topology_backend_def, unit_backend_def};
 use plugin_toolkit::serde_json;
 
 use crate::unit_provider::ProxmoxUnitProvider;
@@ -40,18 +40,11 @@ pub fn backends_json() -> String {
             invoke_prefix: "proxmox".to_string(),
             ..Default::default()
         },
-        BackendDef {
-            domain: "topology".to_string(),
-            name: "proxmox".to_string(),
-            invoke_prefix: "proxmox".to_string(),
-            ..Default::default()
-        },
-        BackendDef {
-            domain: "unit".to_string(),
-            name: "proxmox".to_string(),
-            invoke_prefix: UNIT_PREFIX.to_string(),
-            ..Default::default()
-        },
+        topology_backend_def("proxmox", "proxmox"),
+        // Derived from the live provider's declarations rather than restated as
+        // a literal — add a kind or verb to ProxmoxUnitProvider and the
+        // registered unit backend follows automatically.
+        unit_backend_def(unit_provider() as &dyn UnitProvider, UNIT_PREFIX),
     ];
     serde_json::to_string(&defs).unwrap_or_else(|_| "[]".to_string())
 }
@@ -63,10 +56,9 @@ pub fn backends_json() -> String {
 /// runtime behind the synchronous FFI boundary.
 pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, String>> {
     let op = name.strip_prefix(UNIT_PREFIX)?.strip_prefix('.')?;
-    let out = runtime().block_on(unit_domain::dispatch_op(
+    Some(dispatch_unit_op(
         unit_provider() as &dyn UnitProvider,
         op,
         args_json,
-    ));
-    Some(out)
+    ))
 }
