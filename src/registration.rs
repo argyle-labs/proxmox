@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 
 use plugin_toolkit::abi::BackendDef;
 use plugin_toolkit::contract::unit::UnitProvider;
-use plugin_toolkit::export::{dispatch_unit_op, unit_backend_def};
+use plugin_toolkit::export::{dispatch_unit_op, topology_backend_def, unit_backend_def};
 use plugin_toolkit::serde_json;
 
 use crate::unit_provider::ProxmoxUnitProvider;
@@ -40,12 +40,7 @@ pub fn backends_json() -> String {
             invoke_prefix: "proxmox".to_string(),
             ..Default::default()
         },
-        BackendDef {
-            domain: "topology".to_string(),
-            name: "proxmox".to_string(),
-            invoke_prefix: "proxmox".to_string(),
-            ..Default::default()
-        },
+        topology_backend_def("proxmox", "proxmox"),
         // Derived from the live provider's declarations rather than restated as
         // a literal — add a kind or verb to ProxmoxUnitProvider and the
         // registered unit backend follows automatically.
