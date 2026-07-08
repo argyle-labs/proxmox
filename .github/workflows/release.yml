@@ -59,6 +59,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # Thinness budget (MiB). A plugin should be logic + generated types + serde,
+  # delegating heavy capabilities to orca — not bundling the runtime. Over this,
+  # the build emits a warning (see the "Build cdylib" step). Lower it as plugins
+  # shed bundled deps (e.g. reqwest); today proxmox is over budget by design
+  # until HTTP is delegated.
+  PLUGIN_SIZE_BUDGET_MIB: "20"
 
 jobs:
   # ── Compute the version/tag once, shared by every build job + the release. ──
@@ -167,6 +173,22 @@ jobs:
           cp "$so" "$asset"
           sha256sum "$asset" > "${asset}.sha256"
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+          # ── Thinness gate ──────────────────────────────────────────────────
+          # Plugins must stay as thin as possible: they should be logic + generated
+          # types + serde, delegating HTTP/DB/secret/transport to orca — never
+          # bundling the runtime. Report the size every release and flag anything
+          # over budget so bloat is visible per-build, not discovered later. Soft
+          # (a warning) so a known-bloated-but-valid release still ships while the
+          # reqwest-shedding pressure stays loud; flip to ::error:: + exit 1 to
+          # enforce hard once plugins are delegating HTTP too.
+          bytes=$(stat -c%s "$asset")
+          mib=$(( bytes / 1048576 ))
+          echo "### 📦 ${asset}: ${mib} MiB (${bytes} bytes)" >> "$GITHUB_STEP_SUMMARY"
+          echo "plugin artifact ${asset} = ${mib} MiB"
+          if [ "$mib" -gt "${PLUGIN_SIZE_BUDGET_MIB}" ]; then
+            echo "::warning title=Plugin over size budget::${asset} is ${mib} MiB (budget ${PLUGIN_SIZE_BUDGET_MIB} MiB). Delegate more to orca / shed bundled deps (e.g. reqwest) to slim it."
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
