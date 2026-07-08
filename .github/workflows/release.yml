@@ -1,32 +1,33 @@
 name: Release
 
 # Self-contained plugin release with pipeline-managed versioning. Builds the
-# cdylib against orca `main` for EVERY supported host target and publishes a
-# GitHub Release with one artifact + sha256 per target. The operator never edits
-# Cargo.toml — the pipeline computes the next version from the repo's own git
-# tags:
+# cdylib against orca `main` for EVERY supported host target IN PARALLEL and
+# publishes a GitHub Release with one artifact + sha256 per target. The operator
+# never edits Cargo.toml — the pipeline computes the next version from the repo's
+# own git tags:
 #   Actions → Release → Run workflow → channel (rc | stable) + bump.
 #
 # Version math (mirrors orca's compute_rc_version, one logic across all repos):
 #   • base = highest `vX.Y.Z` stable tag (v0.0.0 if none), bumped by `bump`
 #     (patch | minor | major).
-#   • channel=rc     → `v<base>-rc.<n>`, n = next free rc index for that base
-#     (prerelease).
+#   • channel=rc     → `v<base>-rc.<n>`, n = next free rc index for that base.
 #   • channel=stable → `v<base>` (full release).
-# The computed version is written into Cargo.toml at build time so the cdylib
-# embeds the right CARGO_PKG_VERSION; the git tag is the source of truth, so the
-# committed Cargo.toml version is never hand-managed.
 #
 # ## Universal (multi-target) artifacts
 #
 # A cdylib plugin is `dlopen`'d into the orca daemon, so its artifact is coupled
-# to the daemon's libc (glibc vs musl) and CPU arch. We therefore cross-compile
-# one asset per Rust target triple with cargo-zigbuild (zig as the C toolchain —
-# the centralized cross-compile recipe reused across every plugin repo), naming
-# each `{name}-v{version}-{triple}.so` + `.sha256`. orca's `plugin.install
-# --name` picks the asset matching the installing daemon's own target triple.
-# (Apple targets need native clang, not zigbuild, so macOS is a separate
-# follow-up — the Linux fleet is the target here.)
+# to the daemon's libc (glibc vs musl) and CPU arch. Each target builds in its
+# OWN matrix job (parallel — a cold cross-compile of the full dep tree is ~10min,
+# so serial would be ~Nx that), cross-compiled with cargo-zigbuild (zig as the C
+# toolchain), and uploads its asset. The release job gathers them and publishes
+# one `{name}-v{version}-{triple}.so` + `.sha256` per target. orca's
+# `plugin.install --name` picks the asset matching the installing daemon's triple.
+#
+# Targets match the orca release matrix (x86_64 gnu+musl; the fleet is all
+# x86_64 and orca itself ships no linux-arm). musl is built with
+# `-C target-feature=-crt-static` so the cdylib is a real shared object that the
+# (dynamically-linked) musl daemon can load. Add arm/darwin rows when a host
+# needs them.
 
 on:
   workflow_dispatch:
@@ -58,35 +59,19 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-  # Host targets an orca daemon can run on. One cdylib asset is published per
-  # entry. Keep in sync across all plugin repos.
-  TARGETS: >-
-    x86_64-unknown-linux-gnu
-    aarch64-unknown-linux-gnu
-    x86_64-unknown-linux-musl
-    aarch64-unknown-linux-musl
 
 jobs:
-  release:
+  # ── Compute the version/tag once, shared by every build job + the release. ──
+  version:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+      prerelease: ${{ steps.ver.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Drop local-dev cargo patch
-        run: rm -f .cargo/config.toml
-
-      - name: Authenticate private orca git dependency
-        run: |
-          git config --global \
-            url."https://x-access-token:${{ secrets.ORCA_FETCH_TOKEN }}@github.com/".insteadOf \
-            "https://github.com/"
-
       - name: Compute next version from tags
         id: ver
         run: |
@@ -115,48 +100,95 @@ jobs:
             echo "version=$version"
             echo "tag=$tag"
             echo "prerelease=$prerelease"
-            echo "previous_stable=$latest_stable"
           } >> "$GITHUB_OUTPUT"
           echo "→ ${{ inputs.channel }} (${{ inputs.bump }}) from ${latest_stable}: $tag"
+
+  # ── One parallel job per host target; each uploads its cdylib artifact. ──
+  build:
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            rustflags: ""
+          # musl: disable crt-static so the cdylib is a real .so the dynamic
+          # musl daemon can dlopen (a static musl build emits no shared object).
+          - target: x86_64-unknown-linux-musl
+            rustflags: "-C target-feature=-crt-static"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Drop local-dev cargo patch
+        run: rm -f .cargo/config.toml
+
+      - name: Authenticate private orca git dependency
+        run: |
+          git config --global \
+            url."https://x-access-token:${{ secrets.ORCA_FETCH_TOKEN }}@github.com/".insteadOf \
+            "https://github.com/"
 
       - name: Write computed version into Cargo.toml
         run: |
           set -euo pipefail
-          sed -i 's/^version = ".*"/version = "${{ steps.ver.outputs.version }}"/' Cargo.toml
+          sed -i 's/^version = ".*"/version = "${{ needs.version.outputs.version }}"/' Cargo.toml
           grep -m1 '^version = ' Cargo.toml
 
       - name: Install cross toolchain (zig + cargo-zigbuild)
         run: |
           set -euo pipefail
-          # Prebuilt wheels — no source compile of cargo-zigbuild.
           python3 -m pip install --user cargo-zigbuild ziglang
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          for t in $TARGETS; do rustup target add "$t"; done
+          rustup target add "${{ matrix.target }}"
 
-      - name: Build cdylib for every target
+      - name: Build cdylib
         id: meta
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           set -euo pipefail
           name=$(grep -m1 '^name = ' Cargo.toml | sed -E 's/name = "(.*)"/\1/')
           libname=$(echo "$name" | tr - _)
-          tag="${{ steps.ver.outputs.tag }}"
-          assets=()
-          for t in $TARGETS; do
-            echo "── building $t ──"
-            cargo zigbuild --release --target "$t"
-            so="target/${t}/release/lib${libname}.so"
-            if [ ! -f "$so" ]; then
-              echo "::error::cdylib not found at $so for $t"; ls -la "target/${t}/release" || true; exit 1
-            fi
-            asset="${name}-${tag}-${t}.so"
-            cp "$so" "$asset"
-            sha256sum "$asset" > "${asset}.sha256"
-            assets+=("$asset" "${asset}.sha256")
-          done
-          # Newline-separated list for the release step.
-          printf '%s\n' "${assets[@]}" > release-assets.txt
-          echo "count=${#assets[@]}" >> "$GITHUB_OUTPUT"
-          echo "Staged ${#assets[@]} files:"; cat release-assets.txt
+          cargo zigbuild --release --target "${{ matrix.target }}"
+          so="target/${{ matrix.target }}/release/lib${libname}.so"
+          if [ ! -f "$so" ]; then
+            echo "::error::cdylib not found at $so"; ls -la "target/${{ matrix.target }}/release" || true; exit 1
+          fi
+          asset="${name}-${{ needs.version.outputs.tag }}-${{ matrix.target }}.so"
+          cp "$so" "$asset"
+          sha256sum "$asset" > "${asset}.sha256"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cdylib-${{ matrix.target }}
+          path: |
+            ${{ steps.meta.outputs.asset }}
+            ${{ steps.meta.outputs.asset }}.sha256
+          retention-days: 3
+
+  # ── Gather every target's artifact and publish one release. ──
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all target artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: cdylib-*
+          merge-multiple: true
 
       - name: Create GitHub Release (pipeline-tagged)
         env:
@@ -164,13 +196,13 @@ jobs:
         run: |
           set -euo pipefail
           flags=""
-          [ "${{ steps.ver.outputs.prerelease }}" = "true" ] && flags="--prerelease"
+          [ "${{ needs.version.outputs.prerelease }}" = "true" ] && flags="--prerelease"
           notes="${{ inputs.notes }}"
-          [ -z "$notes" ] && notes="Automated ${{ inputs.channel }} release of \`${{ github.repository }}\`, built against orca \`main\`. One cdylib per host target (glibc/musl × x86_64/aarch64)."
-          mapfile -t assets < release-assets.txt
-          gh release create "${{ steps.ver.outputs.tag }}" \
+          [ -z "$notes" ] && notes="Automated ${{ inputs.channel }} release of \`${{ github.repository }}\`, built against orca \`main\`. One cdylib per host target (x86_64 glibc/musl)."
+          ls -la dist
+          gh release create "${{ needs.version.outputs.tag }}" \
             --target "${{ github.sha }}" \
-            --title "${{ steps.ver.outputs.tag }}" \
+            --title "${{ needs.version.outputs.tag }}" \
             --notes "$notes" \
             $flags \
-            "${assets[@]}"
+            dist/*
