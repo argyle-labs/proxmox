@@ -1,9 +1,10 @@
 name: Release
 
 # Self-contained plugin release with pipeline-managed versioning. Builds the
-# cdylib against orca `main` and publishes a GitHub Release with the artifact +
-# sha256. The operator never edits Cargo.toml — the pipeline computes the next
-# version from the repo's own git tags:
+# cdylib against orca `main` for EVERY supported host target and publishes a
+# GitHub Release with one artifact + sha256 per target. The operator never edits
+# Cargo.toml — the pipeline computes the next version from the repo's own git
+# tags:
 #   Actions → Release → Run workflow → channel (rc | stable) + bump.
 #
 # Version math (mirrors orca's compute_rc_version, one logic across all repos):
@@ -15,6 +16,17 @@ name: Release
 # The computed version is written into Cargo.toml at build time so the cdylib
 # embeds the right CARGO_PKG_VERSION; the git tag is the source of truth, so the
 # committed Cargo.toml version is never hand-managed.
+#
+# ## Universal (multi-target) artifacts
+#
+# A cdylib plugin is `dlopen`'d into the orca daemon, so its artifact is coupled
+# to the daemon's libc (glibc vs musl) and CPU arch. We therefore cross-compile
+# one asset per Rust target triple with cargo-zigbuild (zig as the C toolchain —
+# the centralized cross-compile recipe reused across every plugin repo), naming
+# each `{name}-v{version}-{triple}.so` + `.sha256`. orca's `plugin.install
+# --name` picks the asset matching the installing daemon's own target triple.
+# (Apple targets need native clang, not zigbuild, so macOS is a separate
+# follow-up — the Linux fleet is the target here.)
 
 on:
   workflow_dispatch:
@@ -46,6 +58,13 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # Host targets an orca daemon can run on. One cdylib asset is published per
+  # entry. Keep in sync across all plugin repos.
+  TARGETS: >-
+    x86_64-unknown-linux-gnu
+    aarch64-unknown-linux-gnu
+    x86_64-unknown-linux-musl
+    aarch64-unknown-linux-musl
 
 jobs:
   release:
@@ -106,23 +125,38 @@ jobs:
           sed -i 's/^version = ".*"/version = "${{ steps.ver.outputs.version }}"/' Cargo.toml
           grep -m1 '^version = ' Cargo.toml
 
-      - name: Build release cdylib
-        run: cargo build --release
+      - name: Install cross toolchain (zig + cargo-zigbuild)
+        run: |
+          set -euo pipefail
+          # Prebuilt wheels — no source compile of cargo-zigbuild.
+          python3 -m pip install --user cargo-zigbuild ziglang
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          for t in $TARGETS; do rustup target add "$t"; done
 
-      - name: Stage artifact
+      - name: Build cdylib for every target
         id: meta
         run: |
           set -euo pipefail
           name=$(grep -m1 '^name = ' Cargo.toml | sed -E 's/name = "(.*)"/\1/')
           libname=$(echo "$name" | tr - _)
-          so="target/release/lib${libname}.so"
-          if [ ! -f "$so" ]; then
-            echo "::error::cdylib not found at $so"; ls -la target/release; exit 1
-          fi
-          asset="${name}-${{ steps.ver.outputs.tag }}-x86_64-unknown-linux-gnu.so"
-          cp "$so" "$asset"
-          sha256sum "$asset" > "${asset}.sha256"
-          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+          tag="${{ steps.ver.outputs.tag }}"
+          assets=()
+          for t in $TARGETS; do
+            echo "── building $t ──"
+            cargo zigbuild --release --target "$t"
+            so="target/${t}/release/lib${libname}.so"
+            if [ ! -f "$so" ]; then
+              echo "::error::cdylib not found at $so for $t"; ls -la "target/${t}/release" || true; exit 1
+            fi
+            asset="${name}-${tag}-${t}.so"
+            cp "$so" "$asset"
+            sha256sum "$asset" > "${asset}.sha256"
+            assets+=("$asset" "${asset}.sha256")
+          done
+          # Newline-separated list for the release step.
+          printf '%s\n' "${assets[@]}" > release-assets.txt
+          echo "count=${#assets[@]}" >> "$GITHUB_OUTPUT"
+          echo "Staged ${#assets[@]} files:"; cat release-assets.txt
 
       - name: Create GitHub Release (pipeline-tagged)
         env:
@@ -132,11 +166,11 @@ jobs:
           flags=""
           [ "${{ steps.ver.outputs.prerelease }}" = "true" ] && flags="--prerelease"
           notes="${{ inputs.notes }}"
-          [ -z "$notes" ] && notes="Automated ${{ inputs.channel }} release of \`${{ github.repository }}\`, built against orca \`main\` (x86_64-unknown-linux-gnu)."
+          [ -z "$notes" ] && notes="Automated ${{ inputs.channel }} release of \`${{ github.repository }}\`, built against orca \`main\`. One cdylib per host target (glibc/musl × x86_64/aarch64)."
+          mapfile -t assets < release-assets.txt
           gh release create "${{ steps.ver.outputs.tag }}" \
             --target "${{ github.sha }}" \
             --title "${{ steps.ver.outputs.tag }}" \
             --notes "$notes" \
             $flags \
-            "${{ steps.meta.outputs.asset }}" \
-            "${{ steps.meta.outputs.asset }}.sha256"
+            "${assets[@]}"
