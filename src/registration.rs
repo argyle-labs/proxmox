@@ -1,9 +1,11 @@
 //! Domain-backend registration for the hybrid export.
 //!
-//! proxmox contributes three backends to orca's `contract` registries:
+//! proxmox contributes four backends to orca's `contract` registries:
 //!
 //! - `cluster_roster` (`proxmox.list_clusters`) — fleet cluster grouping.
 //! - `topology` (`proxmox.collect_claims`) — parent-host nesting by guest MACs.
+//! - `host_facts` (`proxmox.get_facts`) — this host's cluster membership, folded
+//!   into its mesh-propagated system snapshot for grouping from any vantage.
 //! - `unit` (`proxmox.__unit.*`) — the five-verb managed-unit surface exposing
 //!   every cluster VM/LXC as a unit (see [`crate::unit_provider`]).
 //!
@@ -17,7 +19,9 @@ use std::sync::OnceLock;
 
 use plugin_toolkit::abi::BackendDef;
 use plugin_toolkit::contract::unit::UnitProvider;
-use plugin_toolkit::export::{dispatch_unit_op, topology_backend_def, unit_backend_def};
+use plugin_toolkit::export::{
+    dispatch_unit_op, host_facts_backend_def, topology_backend_def, unit_backend_def,
+};
 use plugin_toolkit::serde_json;
 
 use crate::unit_provider::ProxmoxUnitProvider;
@@ -41,6 +45,9 @@ pub fn backends_json() -> String {
             ..Default::default()
         },
         topology_backend_def("proxmox", "proxmox"),
+        // Reports this host's cluster membership (via the PVE API) into its
+        // mesh-propagated system snapshot → routes to `proxmox.get_facts`.
+        host_facts_backend_def("proxmox", "proxmox"),
         // Derived from the live provider's declarations rather than restated as
         // a literal — add a kind or verb to ProxmoxUnitProvider and the
         // registered unit backend follows automatically.

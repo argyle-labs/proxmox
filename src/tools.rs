@@ -563,6 +563,28 @@ async fn proxmox_collect_claims(
     crate::topology::collect_claims().await
 }
 
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct ProxmoxGetFactsArgs {}
+
+/// Host-facts backend op. Reports facts about THIS host for its mesh-propagated
+/// `system` snapshot — currently the corosync cluster name, read from the PVE
+/// API (not the on-disk `corosync.conf`, which core must not parse). Lets any
+/// vantage group PVE peers by cluster without the proxmox plugin loaded there.
+/// Takes the first cluster with a name across enabled endpoints (the fleet runs
+/// one cluster); `None` when standalone.
+#[orca_tool(domain = "proxmox", verb = "get_facts")]
+async fn proxmox_get_facts(
+    _args: ProxmoxGetFactsArgs,
+    _ctx: &ToolCtx,
+) -> Result<plugin_toolkit::contract::HostFacts> {
+    use plugin_toolkit::contract::ClusterRoster;
+    let clusters = crate::cluster_roster_impl::ProxmoxClusterRoster
+        .list_clusters()
+        .await?;
+    let cluster = clusters.into_iter().find_map(|c| c.name);
+    Ok(plugin_toolkit::contract::HostFacts { cluster })
+}
+
 #[cfg(test)]
 mod api_root_tests {
     use super::api_root;
