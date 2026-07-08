@@ -100,6 +100,10 @@ async fn collect_for_endpoint(
             // parent it correctly despite cluster-shared pmxcfs config making
             // every cluster peer report every guest.
             runs_on: Some(g.node),
+            // PVE config exposes no listening ports; endpoints/image stay
+            // empty. In-guest port + service-role discovery arrives via the
+            // runtime service-identity registration path, not the claim.
+            ..Default::default()
         })
     });
     let claims = plugin_toolkit::futures_util::future::join_all(futs)
