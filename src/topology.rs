@@ -96,6 +96,10 @@ async fn collect_for_endpoint(
             macs,
             provider: "proxmox".to_string(),
             provider_instance: provider_instance.to_string(),
+            // The node this guest actually runs on — lets the inventory layer
+            // parent it correctly despite cluster-shared pmxcfs config making
+            // every cluster peer report every guest.
+            runs_on: Some(g.node),
         })
     });
     let claims = plugin_toolkit::futures_util::future::join_all(futs)
