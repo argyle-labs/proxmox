@@ -16,6 +16,14 @@ path = "src/lib.rs"
 # as a normal Rust lib.
 crate-type = ["cdylib", "rlib"]
 
+# Out-of-process entrypoint: orca spawns this binary as a subprocess and speaks
+# the plugin wire protocol over a Unix socket (see `src/bin/proxmox-plugin.rs`).
+# The cdylib above is the legacy in-process artifact, retired once every host
+# runs a daemon new enough to spawn subprocesses.
+[[bin]]
+name = "proxmox-plugin"
+path = "src/bin/proxmox-plugin.rs"
+
 # Proxmox VE plugin. Typed client codegenned by progenitor from the vendored
 # upstream spec (`specs/proxmox.openapi.json`, derived from a cluster node's
 # `apidoc.js`). `build.rs` runs `plugin_toolkit_build::openapi::generate_all`
@@ -81,6 +89,9 @@ uuid        = { version = "1", features = ["serde", "v4"] }
 schemars    = { version = "1", features = ["derive"] }
 anyhow      = "1"
 tracing     = "0.1"
+# Subprocess entrypoint only: format the plugin's own tracing to stderr, which
+# orca's supervisor inherits. `env-filter` honors `RUST_LOG`.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio       = { version = "1", features = ["full"] }
 
 [dev-dependencies]
