@@ -21,6 +21,7 @@ use crate::generated::{self, types as gtypes};
 use crate::tools::for_each_enabled_endpoint;
 use crate::{GuestKind, fetch_guest_config};
 use plugin_toolkit::contract::TopologyClaim;
+use plugin_toolkit::reqwest;
 
 /// Walk every registered + enabled Proxmox endpoint and return the union
 /// of TopologyClaims. Endpoints that fail are logged and skipped.

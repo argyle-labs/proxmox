@@ -17,6 +17,7 @@
 //!
 //! The test FAILS iff any DESER occurs.
 
+use plugin_toolkit::reqwest;
 use proxmox::Config;
 use proxmox::generated::Client;
 
@@ -57,14 +58,19 @@ fn classify<T>(r: Result<T, proxmox::generated::Error<()>>) -> (Outcome, String)
 /// test setup from typed structs so discovery can't itself fail deser.
 async fn raw(http: &reqwest::Client, base: &str, path: &str) -> serde_json::Value {
     let url = format!("{}/{}", base.trim_end_matches('/'), path);
-    http.get(&url)
+    let resp = http
+        .get(&url)
         .send()
         .await
-        .and_then(|r| r.error_for_status())
-        .expect("discovery request failed")
-        .json::<serde_json::Value>()
-        .await
-        .expect("discovery body not json")
+        .expect("discovery request failed");
+    assert!(
+        resp.status().is_success(),
+        "discovery request failed: {} -> {}",
+        url,
+        resp.status().as_u16()
+    );
+    let bytes = resp.bytes().await.expect("discovery body read failed");
+    serde_json::from_slice(&bytes).expect("discovery body not json")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -76,13 +82,6 @@ async fn live_read_sweep() {
     let tid = std::env::var("PVE_TID").expect("PVE_TID");
     let sec = std::env::var("PVE_SEC").expect("PVE_SEC");
     let insecure = std::env::var("PVE_INSECURE").is_ok();
-    // Ignore the Err(already-installed) — a sibling test may have installed it.
-    if rustls::crypto::ring::default_provider()
-        .install_default()
-        .is_err()
-    {
-        eprintln!("rustls default provider already installed");
-    }
 
     let cfg = Config::new(&base, &tid, &sec).insecure(insecure);
     let http = cfg.build_reqwest_client().expect("reqwest client");

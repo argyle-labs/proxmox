@@ -49,15 +49,22 @@ path = "src/bin/proxmox-plugin.rs"
 # The committed `[patch]` in `.cargo/config.toml` overrides this to the local
 # in-tree toolkit for development; the git branch is what an external checkout
 # without the orca repo resolves against.
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+# Thin profile: `delegated-http` retargets the progenitor-generated client onto
+# orca's `http.request` capability, so this plugin links NO reqwest/rustls/hyper/
+# progenitor-client. `default-features = false` drops the real `http`/`openapi`
+# stacks; `tools` (orca_tool anchors) + `db` (thin endpoint_resource CRUD over
+# db_op) + `containers` (the domain proxmox registers) + `delegated-http` are all
+# it needs. `secrets`/`serve`/`storage` are always-on. See [[plugins-stay-thin]].
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "containers", "delegated-http"] }
 
-# Genuinely-external, non-orca runtime deps emitted by progenitor's generated
-# client. progenitor + thiserror v2 + serde derives hard-code bare `::serde` /
-# `::serde_json` / `::thiserror` / `::reqwest` / `::chrono` / `::uuid` crate-root
-# paths that no `crate = ...` attribute can redirect — they are the plugin's own
-# transitive deps, exactly as a third-party progenitor plugin would carry. Cargo
-# unifies these with the toolkit's same-version copies into a single crate
-# instance, so types cross the api boundary cleanly.
+# Light, genuinely-external deps the plugin's own source + generated client still
+# name at the crate root. The toolkit-build codegen (`rewrite_codegen_paths`)
+# redirects progenitor's `::serde`/`::serde_json`/`::reqwest`/`::progenitor_client`/
+# `::chrono`/`::uuid`/`::regress`/`::bytes` to `::plugin_toolkit::*`, so those are
+# NOT direct deps — the delegated shims + always-on chrono/uuid/regress supply
+# them. `thiserror` is NOT rewritten (generated code emits bare `::thiserror`), and
+# the hand-written source uses `serde`/`serde_json` derives directly, so those three
+# stay. None drags a transitive heavyweight.
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 thiserror   = "2"
@@ -67,18 +74,6 @@ thiserror   = "2"
 # Pinned to the orca workspace version (0.11) so the layout hash baked into the
 # cdylib matches what orca's plugin-loader checks at load time.
 abi_stable = "0.11"
-
-progenitor-client = "0.14"
-futures-core = "0.3"
-bytes       = "1"
-regress     = "0.10"
-# Must match the orca workspace pin (0.13) so progenitor's generated client and
-# the toolkit's http layer share one reqwest version. `multipart` + `cookies`:
-# the full PVE spec generates upload + session endpoints that need them.
-reqwest     = { version = "0.13", default-features = false, features = ["json", "stream", "rustls-no-provider", "multipart", "cookies"] }
-# progenitor emits `::chrono` / `::uuid` paths for date-time + uuid formats.
-chrono      = { version = "0.4", features = ["serde"] }
-uuid        = { version = "1", features = ["serde", "v4"] }
 
 # This plugin's hand-written source (carried over from the in-tree crate) names
 # these crates fully-qualified — `schemars::JsonSchema` derives, `anyhow::Result`
@@ -96,8 +91,6 @@ tokio       = { version = "1", features = ["full"] }
 
 [dev-dependencies]
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
-wiremock = "0.6"
-rustls   = "0.23"
 # Spec-refresh tool only (examples/pve_to_openapi.rs + spec-tools/from_pve.rs):
 # parse Proxmox's `apidoc.js` dialect into an `openapiv3` document. Proxmox-
 # specific, so it lives here, not in orca's generic `openapi` crate. The

@@ -76,6 +76,7 @@ pub fn unwrap_envelope(
     })
 }
 
+use plugin_toolkit::reqwest;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -318,35 +319,51 @@ mod tests {
         assert!("foo".parse::<ProxmoxAction>().is_err());
     }
 
-    #[tokio::test]
-    async fn reqwest_client_attaches_pve_auth_header() {
-        use wiremock::matchers::{header, method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+    #[test]
+    fn reqwest_client_attaches_pve_auth_header() {
+        // The cap-backed client seeds default headers onto every request, so
+        // one call is enough to prove the PVE token header is attached. We
+        // capture the `http.request` JSON the shim routes through the sink and
+        // assert the auth header value is present.
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let cap = captured.clone();
+        let reply = serde_json::json!({
+            "status": 200,
+            "headers": [],
+            "body": Vec::<u8>::from(b"ok".as_slice()),
+        })
+        .to_string();
 
-        _ = rustls::crypto::ring::default_provider().install_default();
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/probe"))
-            .and(header(
-                "authorization",
-                "PVEAPIToken=user@pve!auto=deadbeef-1111-2222-3333-444444444444",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
-            .mount(&server)
-            .await;
-
-        let cfg = Config::new(
-            server.uri(),
-            "user@pve!auto",
-            "deadbeef-1111-2222-3333-444444444444",
+        plugin_toolkit::capsink::with_cap_sink(
+            Box::new(move |c: &str, json: &str| {
+                assert_eq!(c, "http.request");
+                cap.lock().unwrap().push(json.to_string());
+                Ok(reply.clone())
+            }),
+            || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let cfg = Config::new(
+                        "https://pve.test",
+                        "user@pve!auto",
+                        "deadbeef-1111-2222-3333-444444444444",
+                    );
+                    let http = cfg.build_reqwest_client().unwrap();
+                    let r = http.get("https://pve.test/probe").send().await.unwrap();
+                    assert_eq!(r.status().as_u16(), 200);
+                });
+            },
         );
-        let http = cfg.build_reqwest_client().unwrap();
-        let r = http
-            .get(format!("{}/probe", server.uri()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status(), 200);
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].contains("PVEAPIToken=user@pve!auto=deadbeef-1111-2222-3333-444444444444"),
+            "captured request missing PVE auth header: {}",
+            requests[0]
+        );
     }
 }
