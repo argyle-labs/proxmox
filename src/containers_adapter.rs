@@ -19,6 +19,7 @@ use plugin_toolkit::containers::{
     AdapterError, Container, ContainerState, ListFilter, Liveness, LogTail, RestartPolicy,
     RuntimeAdapter, RuntimeKind, WedgeRecoverer,
 };
+use plugin_toolkit::reqwest;
 use std::time::Duration;
 
 use crate::generated::{self, types as gtypes};
@@ -493,14 +494,6 @@ mod tests {
     use super::*;
     use plugin_toolkit::containers::{ContainerPort, RestartPolicy};
 
-    /// reqwest 0.13 (rustls/ring, no aws-lc) panics `No provider set` when a
-    /// `reqwest::Client` is built before a process-default crypto provider is
-    /// installed. The daemon installs ring at startup; unit tests must do the
-    /// same. Idempotent — `install_default` errors if already set, ignored.
-    fn ensure_crypto_provider() {
-        _ = rustls::crypto::ring::default_provider().install_default();
-    }
-
     fn container(name: &str, image: Option<&str>, host: &str) -> Container {
         Container {
             id: "100".into(),
@@ -569,13 +562,27 @@ mod tests {
         assert!(media_service_endpoint(&container("plex", None, "")).is_none());
     }
 
-    #[tokio::test]
-    async fn http_probe_unknown_on_connect_failure() {
-        // Port 1 on localhost: connection refused → Unknown (do-not-act),
-        // not a false Wedged that would trigger a needless restart.
-        ensure_crypto_provider();
-        let http = reqwest::Client::new();
-        let live = probe_http_service(&http, "127.0.0.1", 1).await;
-        assert_eq!(live, Liveness::Unknown);
+    #[test]
+    fn http_probe_unknown_on_connect_failure() {
+        // A transport failure (the cap sink reports an error, standing in for
+        // a refused connection) must read as Unknown (do-not-act), not a false
+        // Wedged that would trigger a needless restart.
+        plugin_toolkit::capsink::with_cap_sink(
+            Box::new(|cap: &str, _json: &str| {
+                assert_eq!(cap, "http.request");
+                Err("connection refused".to_string())
+            }),
+            || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let http = reqwest::Client::new();
+                    let live = probe_http_service(&http, "127.0.0.1", 1).await;
+                    assert_eq!(live, Liveness::Unknown);
+                });
+            },
+        );
     }
 }
