@@ -107,7 +107,7 @@ async fn collect_for_endpoint(
             ..Default::default()
         })
     });
-    let claims = plugin_toolkit::futures_util::future::join_all(futs)
+    let claims = plugin_toolkit::reactor::join_all(futs)
         .await
         .into_iter()
         .flatten()
