@@ -15,7 +15,6 @@
 //! Everything else routes through generated methods directly at the
 //! call site.
 
-pub mod abi_export;
 pub mod access;
 pub mod cluster;
 pub mod cluster_roster_impl;
@@ -242,7 +241,7 @@ pub async fn fetch_guest_config(
     let url = format!(
         "{}/nodes/{}/{}/{}/config",
         base_url.trim_end_matches('/'),
-        plugin_toolkit::urlencoding::encode(node),
+        plugin_toolkit::progenitor_client::encode_path(node),
         kind.as_str(),
         vmid
     );

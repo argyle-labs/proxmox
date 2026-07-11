@@ -11,18 +11,18 @@ category = "infra"
 [lib]
 name = "proxmox"
 path = "src/lib.rs"
-# `cdylib` is the orca plugin artifact orca's `plugin-loader` `dlopen`s;
 # `rlib` retains the in-crate `#[cfg(test)]` harness + lets the workspace use it
-# as a normal Rust lib.
-crate-type = ["cdylib", "rlib"]
+# as a normal Rust lib. The plugin artifact is now the `[[bin]]` below — a
+# dynamic subprocess orca's loader spawns, not a dlopened cdylib.
+crate-type = ["rlib"]
 
 # Out-of-process entrypoint: orca spawns this binary as a subprocess and speaks
-# the plugin wire protocol over a Unix socket (see `src/bin/proxmox-plugin.rs`).
-# The cdylib above is the legacy in-process artifact, retired once every host
-# runs a daemon new enough to spawn subprocesses.
+# the plugin wire protocol over a Unix socket. The toolkit's `serve_tool_plugin!`
+# in `src/main.rs` emits `fn main`; this is the sole plugin artifact now that the
+# in-process cdylib export has been retired.
 [[bin]]
-name = "proxmox-plugin"
-path = "src/bin/proxmox-plugin.rs"
+name = "proxmox"
+path = "src/main.rs"
 
 # Proxmox VE plugin. Typed client codegenned by progenitor from the vendored
 # upstream spec (`specs/proxmox.openapi.json`, derived from a cluster node's
@@ -30,10 +30,10 @@ path = "src/bin/proxmox-plugin.rs"
 # over the whole spec. Refresh by overwriting `specs/apidoc.js` +
 # `specs/proxmox.openapi.json`.
 #
-# Beyond its tool surface, this plugin contributes three domain backends across
-# the cdylib ABI (see `src/abi_export.rs::backends`): a `cluster_roster`
-# provider, a `topology` collector, and a `unit` provider (the five-verb vm/lxc
-# surface). orca's loader registers all three into the matching `contract`
+# Beyond its tool surface, this plugin contributes three domain backends over the
+# subprocess wire protocol (see `src/registration.rs` + `src/main.rs`): a
+# `cluster_roster` provider, a `topology` collector, and a `unit` provider (the
+# five-verb vm/lxc surface). orca's loader registers all three into the matching `contract`
 # registries, so a loaded proxmox plugin restores fleet cluster grouping +
 # parent-host topology + guest lifecycle with no static link into orca.
 
@@ -68,12 +68,6 @@ plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main",
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 thiserror   = "2"
-
-# The `#[export_root_module]` macro (re-exported by the toolkit) expands to bare
-# `::abi_stable` paths in this crate's root, so abi_stable must be a direct dep.
-# Pinned to the orca workspace version (0.11) so the layout hash baked into the
-# cdylib matches what orca's plugin-loader checks at load time.
-abi_stable = "0.11"
 
 # This plugin's hand-written source (carried over from the in-tree crate) names
 # these crates fully-qualified — `schemars::JsonSchema` derives, `anyhow::Result`
