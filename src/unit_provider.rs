@@ -21,9 +21,12 @@
 use plugin_toolkit::anyhow::{Result, anyhow};
 use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::contract::unit::{
-    ActionDecl, ActionOutcome, CreateArgs, DeleteArgs, DetailArgs, ItemOutcome, ItemsOutcome,
-    KindDeclaration, ListArgs, UnitDescriptor, UnitId, UnitProvider, UpdateArgs, UpsertArgs, Verb,
-    VerbArgs, VerbDecl, VerbOutcome,
+    ACTION_BACKUP, ActionDecl, ActionOutcome, CreateArgs, DeleteArgs, DetailArgs, ItemOutcome,
+    ItemsOutcome, KindDeclaration, ListArgs, UnitDescriptor, UnitId, UnitProvider, UpdateArgs,
+    UpsertArgs, Verb, VerbArgs, VerbDecl, VerbOutcome,
+};
+use plugin_toolkit::contract::{
+    BackupRef, GuardViolation, UnitFacts, UnitGuard, partition_violations,
 };
 use plugin_toolkit::schemars::{JsonSchema, schema_for};
 use plugin_toolkit::serde::{Deserialize, Serialize};
@@ -73,10 +76,19 @@ pub struct GuestSummary {
     pub status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu: Option<f64>,
+    /// Configured CPU cores (`maxcpu`), used to check the kind's [`UnitGuard`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maxcpu: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem: Option<u64>,
+    /// Configured memory in bytes (`maxmem`); the guard floor is compared in MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maxmem: Option<i64>,
+    /// This guest's config-standard [`UnitGuard`] violations (empty = compliant),
+    /// surfaced on every list/detail so the unit surface shows which guests
+    /// breach their kind's provisioning floors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guard_violations: Vec<String>,
 }
 
 /// Typed payload for `Create { action: "provision" }`. Shared by both kinds;
@@ -133,6 +145,25 @@ pub struct ProvisionResponse {
     pub upid: Option<String>,
 }
 
+/// Optional payload for `Update { action: "backup" }`. Every field defaults, so
+/// the core pre-mutation guard (which dispatches `backup` with no payload) drives
+/// a minimal snapshot vzdump to the node's default backup storage.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct BackupPayload {
+    /// PVE storage to write the archive to. `None` → the first backup-content
+    /// storage on the guest's node (a system-owned WHERE, per the storage layer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<String>,
+    /// vzdump mode: `snapshot` (default, no downtime) | `suspend` | `stop`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Optional notes-template recorded on the backup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────
 
 fn manager_for(endpoint: &str) -> String {
@@ -162,6 +193,43 @@ fn kind_str(k: GuestKind) -> &'static str {
     match k {
         GuestKind::Qemu => KIND_VM,
         GuestKind::Lxc => KIND_LXC,
+    }
+}
+
+// ── config-standard guards (MINIMAL-BACKUP.md §4.4) ──────────────────────────
+
+/// Baseline provisioning invariants per guest kind — conservative, universal
+/// floors a well-formed guest must clear. orca refuses to create (or auto-raises)
+/// a guest below these, the typed replacement for a guest updater's ad-hoc
+/// "under-provisioned / may cause data loss" prompt. Fleet-specific tightening
+/// (higher floors, console/update requirements) layers on later via config.
+fn guest_guard(kind: GuestKind) -> UnitGuard {
+    match kind {
+        GuestKind::Lxc => UnitGuard::min_resources(KIND_LXC, 1, 512),
+        GuestKind::Qemu => UnitGuard::min_resources(KIND_VM, 1, 1024),
+    }
+}
+
+/// Observed facts for a live guest, from its cluster-resource row. PVE exposes no
+/// console / update-command reachability here, so those stay unchecked (the
+/// baseline guard declares no such requirement).
+fn facts_of(g: &GuestSummary) -> UnitFacts {
+    UnitFacts {
+        cpu: g.maxcpu.map(|c| c.round() as u32),
+        mem_mb: g.maxmem.map(|b| (b.max(0) as u64) / (1024 * 1024)),
+        has_root_console: false,
+        has_update_command: false,
+    }
+}
+
+/// Facts a provision request *will* produce, so the guard can auto-raise or
+/// refuse an under-provisioned guest before it is created.
+fn facts_of_provision(p: &ProvisionPayload) -> UnitFacts {
+    UnitFacts {
+        cpu: p.cores.map(|c| c as u32),
+        mem_mb: p.memory.map(|m| m.max(0) as u64),
+        has_root_console: false,
+        has_update_command: false,
     }
 }
 
@@ -200,9 +268,21 @@ async fn guests_for_endpoint(
                 .unwrap_or_else(|| format!("{}-{}", kind_str(kind), vmid)),
             status: r.status,
             cpu: r.cpu,
+            maxcpu: r.maxcpu,
             mem: r.mem,
             maxmem: r.maxmem,
+            guard_violations: Vec::new(),
         });
+    }
+    // Stamp each guest's guard compliance so the unit surface shows breaches.
+    for g in &mut out {
+        if let Ok(k) = kind_from_str(&g.kind) {
+            g.guard_violations = guest_guard(k)
+                .check(&facts_of(g))
+                .iter()
+                .map(GuardViolation::reason)
+                .collect();
+        }
     }
     Ok(out)
 }
@@ -242,6 +322,24 @@ async fn resolve_node(client: &generated::Client, kind: GuestKind, vmid: u64) ->
         .find(|g| g.vmid == vmid && g.kind == kind_str(kind))
         .map(|g| g.node)
         .ok_or_else(|| anyhow!("{} vmid {vmid} not found in cluster", kind_str(kind)))
+}
+
+/// The storage a `backup` writes to when the payload names none: the first
+/// enabled backup-content storage on `node`. Errors (rather than guessing) if the
+/// node exposes no backup storage — a clear signal to configure one or pass it.
+async fn default_backup_storage(client: &generated::Client, node: &str) -> Result<String> {
+    let storages = client
+        .get_index_nodes_node_storage(node, Some("backup"), Some(true), None, None, None)
+        .await
+        .map_err(|e| anyhow!("list backup storages on {node}: {e}"))?
+        .into_inner();
+    storages
+        .into_iter()
+        .find(|s| s.content.split(',').any(|c| c.trim() == "backup"))
+        .map(|s| s.storage)
+        .ok_or_else(|| {
+            anyhow!("no backup-content storage on node {node}; pass storage in the backup payload")
+        })
 }
 
 impl ProxmoxUnitProvider {
@@ -322,6 +420,11 @@ impl ProxmoxUnitProvider {
     }
 
     async fn do_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
+        // Backup is a first-class managed-unit action (the pre-mutation guard and
+        // scheduler both dispatch it) — route it before lifecycle transitions.
+        if args.action == ACTION_BACKUP {
+            return self.do_backup(&args.id, args.payload).await;
+        }
         let endpoint = endpoint_of(&args.id)?;
         let kind = kind_from_str(&args.id.kind)?;
         let vmid: u64 = args
@@ -338,6 +441,60 @@ impl ProxmoxUnitProvider {
         }))
     }
 
+    /// Take the guest's minimal backup via `vzdump` and return a [`BackupRef`].
+    /// The unit's manager routes this to the owning endpoint over the mesh, so a
+    /// backup runs wherever the guest actually lives. The archive is captured as
+    /// a PVE task; the returned locator is its UPID (poll-to-path is a follow-up).
+    async fn do_backup(&self, id: &UnitId, payload: Option<String>) -> Result<VerbOutcome> {
+        let endpoint = endpoint_of(id)?;
+        let kind = kind_from_str(&id.kind)?;
+        let vmid: u64 = id
+            .id
+            .parse()
+            .map_err(|_| anyhow!("vmid '{}' is not a u64", id.id))?;
+        let p: BackupPayload = match payload {
+            Some(raw) => serde_json::from_str(&raw).map_err(|e| anyhow!("backup payload: {e}"))?,
+            None => BackupPayload::default(),
+        };
+        let client = crate::tools::make_client(&endpoint).await?;
+        let node = resolve_node(&client, kind, vmid).await?;
+        let storage = match p.storage {
+            Some(s) => s,
+            None => default_backup_storage(&client, &node).await?,
+        };
+
+        let mut body = serde_json::Map::new();
+        // vzdump's `vmid` is a string on the wire (it accepts a list).
+        body.insert("vmid".into(), json!(vmid.to_string()));
+        body.insert("storage".into(), json!(storage));
+        body.insert(
+            "mode".into(),
+            json!(p.mode.as_deref().unwrap_or("snapshot")),
+        );
+        if let Some(notes) = &p.notes {
+            body.insert("notes-template".into(), json!(notes));
+        }
+        let typed: gtypes::PostVzdumpNodesNodeVzdumpBody =
+            serde_json::from_value(serde_json::Value::Object(body))
+                .map_err(|e| anyhow!("vzdump body: {e}"))?;
+        let upid = client
+            .post_vzdump_nodes_node_vzdump(&node, &typed)
+            .await
+            .map_err(|e| anyhow!("vzdump {} {vmid} on {node}: {e}", kind_str(kind)))?
+            .into_inner();
+
+        let backup = BackupRef {
+            locator: upid,
+            manager: manager_for(&endpoint),
+            timestamp: plugin_toolkit::time::now().unix_seconds(),
+            checksum: None,
+        };
+        Ok(VerbOutcome::Item(ItemOutcome::new(
+            id.clone(),
+            serde_json::to_string(&backup).unwrap_or_default(),
+        )))
+    }
+
     async fn do_create(&self, args: CreateArgs) -> Result<VerbOutcome> {
         if args.action != "provision" {
             return Err(anyhow!("unknown proxmox create action: {}", args.action));
@@ -345,9 +502,39 @@ impl ProxmoxUnitProvider {
         let raw = args
             .payload
             .ok_or_else(|| anyhow!("provision requires a payload"))?;
-        let p: ProvisionPayload =
+        let mut p: ProvisionPayload =
             serde_json::from_str(&raw).map_err(|e| anyhow!("provision payload: {e}"))?;
         let kind = kind_from_str(&p.kind)?;
+
+        // Config-standard guard (§4.4): auto-raise under-min resources to the
+        // kind's floor, refuse on anything that can't be fixed by editing the
+        // spec. Prevents provisioning an under-provisioned guest in the first
+        // place — the orca-owned version of the guest updater's warning.
+        let (fixable, refuse) =
+            partition_violations(guest_guard(kind).check(&facts_of_provision(&p)));
+        if !refuse.is_empty() {
+            let reasons = refuse
+                .iter()
+                .map(GuardViolation::reason)
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(anyhow!(
+                "provision of {} refused by guard: {reasons}",
+                kind_str(kind)
+            ));
+        }
+        for v in &fixable {
+            match v {
+                GuardViolation::UnderCpu { min, .. } => {
+                    p.cores = Some(p.cores.unwrap_or(0).max(*min as u64));
+                }
+                GuardViolation::UnderMem { min, .. } => {
+                    p.memory = Some(p.memory.unwrap_or(0).max(*min as i64));
+                }
+                _ => {}
+            }
+        }
+
         let client = crate::tools::make_client(&p.endpoint).await?;
 
         let vmid = match p.vmid {
@@ -567,7 +754,7 @@ async fn provision(
 /// Verbs shared by both guest kinds. `provision` payload/response schemas differ
 /// only in which fields matter per kind, so one [`ProvisionPayload`] serves both.
 fn guest_verbs() -> Vec<VerbDecl> {
-    let lifecycle_actions = ["start", "stop", "shutdown", "reboot"]
+    let mut update_actions: Vec<ActionDecl> = ["start", "stop", "shutdown", "reboot"]
         .into_iter()
         .map(|a| ActionDecl {
             action: a.to_string(),
@@ -575,13 +762,21 @@ fn guest_verbs() -> Vec<VerbDecl> {
             response_schema: None,
         })
         .collect();
+    // Minimal backup as a managed-unit action: the pre-mutation guard and the
+    // scheduler both reach it via `Update { action: "backup" }`, routed to the
+    // owning endpoint over the mesh. Optional typed payload; returns a BackupRef.
+    update_actions.push(ActionDecl {
+        action: ACTION_BACKUP.to_string(),
+        payload_schema: Some(schema_for!(BackupPayload)),
+        response_schema: Some(schema_for!(BackupRef)),
+    });
     vec![
         VerbDecl::list(),
         VerbDecl::detail(),
         VerbDecl {
             verb: Verb::Update,
             query_schema: None,
-            actions: lifecycle_actions,
+            actions: update_actions,
         },
         VerbDecl {
             verb: Verb::Create,
@@ -677,8 +872,10 @@ mod tests {
             name: "g".into(),
             status: None,
             cpu: None,
+            maxcpu: None,
             mem: None,
             maxmem: None,
+            guard_violations: Vec::new(),
         }
     }
 
@@ -772,6 +969,61 @@ mod tests {
         let schema = serde_json::to_string(provision.payload_schema.as_ref().unwrap()).unwrap();
         assert!(schema.contains("endpoint"));
         assert!(schema.contains("ostemplate"));
+    }
+
+    #[test]
+    fn guest_guard_flags_underprovisioned_live_guest() {
+        // A 1-core / 256 MiB lxc is below the lxc floor (1 core / 512 MiB).
+        let mut g = guest("n", None, "lxc", 100);
+        g.maxcpu = Some(1.0);
+        g.maxmem = Some(256 * 1024 * 1024);
+        let violations = guest_guard(GuestKind::Lxc).check(&facts_of(&g));
+        assert_eq!(violations.len(), 1, "only memory is under the floor");
+        assert!(matches!(
+            violations[0],
+            GuardViolation::UnderMem { min: 512, .. }
+        ));
+        // Raise it above the floor → compliant.
+        g.maxmem = Some(1024 * 1024 * 1024);
+        assert!(guest_guard(GuestKind::Lxc).is_satisfied(&facts_of(&g)));
+    }
+
+    #[test]
+    fn provision_facts_convert_cores_and_memory() {
+        let p: ProvisionPayload = serde_json::from_str(
+            r#"{"endpoint":"e","node":"n","kind":"vm","cores":4,"memory":8192}"#,
+        )
+        .unwrap();
+        let f = facts_of_provision(&p);
+        assert_eq!(f.cpu, Some(4));
+        assert_eq!(f.mem_mb, Some(8192));
+        // A 4-core / 8 GiB vm clears the vm floor (1 core / 1 GiB).
+        assert!(guest_guard(GuestKind::Qemu).is_satisfied(&f));
+    }
+
+    #[test]
+    fn backup_action_is_declared_with_typed_schemas() {
+        let decls = ProxmoxUnitProvider::new().declarations();
+        for kind in [KIND_VM, KIND_LXC] {
+            let d = decls.iter().find(|d| d.kind == kind).unwrap();
+            let update = d.verbs.iter().find(|v| v.verb == Verb::Update).unwrap();
+            let backup = update
+                .actions
+                .iter()
+                .find(|a| a.action == ACTION_BACKUP)
+                .unwrap_or_else(|| panic!("{kind} missing backup action"));
+            assert!(backup.payload_schema.is_some());
+            assert!(backup.response_schema.is_some());
+        }
+    }
+
+    #[test]
+    fn backup_payload_defaults_are_all_none() {
+        let p = BackupPayload::default();
+        assert!(p.storage.is_none() && p.mode.is_none() && p.notes.is_none());
+        // Empty JSON (what the guard dispatches) parses to the defaults.
+        let p2: BackupPayload = serde_json::from_str("{}").unwrap();
+        assert!(p2.storage.is_none());
     }
 
     #[test]
