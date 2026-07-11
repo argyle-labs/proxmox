@@ -18,10 +18,8 @@
 use std::sync::OnceLock;
 
 use plugin_toolkit::abi::BackendDef;
+use plugin_toolkit::backend_def::{host_facts_backend_def, topology_backend_def, unit_backend_def};
 use plugin_toolkit::contract::unit::UnitProvider;
-use plugin_toolkit::export::{
-    dispatch_unit_op, host_facts_backend_def, topology_backend_def, unit_backend_def,
-};
 use plugin_toolkit::serde_json;
 
 use crate::unit_provider::ProxmoxUnitProvider;
@@ -59,13 +57,15 @@ pub fn backends_json() -> String {
 /// Handle the loader's `proxmox.__unit.*` backend calls against the singleton
 /// [`ProxmoxUnitProvider`]. Returns `None` for anything else so the macro's
 /// hybrid `invoke` falls through to the `proxmox.` tool surface (which owns the
-/// cluster_roster + topology ops). Async work runs on the toolkit's shared
-/// runtime behind the synchronous FFI boundary.
+/// cluster_roster + topology ops). Async work is driven to completion on the
+/// subprocess reactor via [`plugin_toolkit::reactor::block_on`].
 pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, String>> {
     let op = name.strip_prefix(UNIT_PREFIX)?.strip_prefix('.')?;
-    Some(dispatch_unit_op(
-        unit_provider() as &dyn UnitProvider,
-        op,
-        args_json,
+    Some(plugin_toolkit::reactor::block_on(
+        plugin_toolkit::contract::unit::dispatch_op(
+            unit_provider() as &dyn UnitProvider,
+            op,
+            args_json,
+        ),
     ))
 }
