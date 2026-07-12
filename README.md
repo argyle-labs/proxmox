@@ -67,7 +67,7 @@ Every VM and LXC across every enabled endpoint is a **unit** (`kind = vm` or `lx
 
 > `proxmox.action` overlaps with the unit `update` verb — both power-manage a guest. Use the unit surface for orca-managed fleet lifecycle; `proxmox.action` is the direct tool form.
 
-Under the hood the plugin also contributes three **domain backends** across the cdylib ABI — `cluster_roster` (fleet grouping), `topology` (parent-host nesting), and `unit` (the surface above) — registered automatically by orca's loader.
+Under the hood the plugin also contributes three **domain backends** over the plugin-toolkit capability seams — `cluster_roster` (fleet grouping), `topology` (parent-host nesting), and `unit` (the surface above) — registered automatically when orca spawns the plugin subprocess.
 
 ## Credentials
 
