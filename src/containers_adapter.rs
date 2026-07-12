@@ -14,11 +14,11 @@
 //! `(host, runtime, container_id)`, so multi-node enumeration flows
 //! through unchanged.
 
-use plugin_toolkit::async_trait::async_trait;
 use plugin_toolkit::containers::{
     AdapterError, Container, ContainerState, ListFilter, Liveness, LogTail, RestartPolicy,
     RuntimeAdapter, RuntimeKind, WedgeRecoverer,
 };
+use plugin_toolkit::orca_async;
 use plugin_toolkit::reqwest;
 use std::time::Duration;
 
@@ -71,7 +71,7 @@ impl LxcProxmoxApiAdapter {
     }
 }
 
-#[async_trait]
+#[orca_async]
 impl RuntimeAdapter for LxcProxmoxApiAdapter {
     fn kind(&self) -> RuntimeKind {
         RuntimeKind::Lxc
@@ -165,7 +165,7 @@ impl RuntimeAdapter for LxcProxmoxApiAdapter {
     }
 }
 
-#[async_trait]
+#[orca_async]
 impl WedgeRecoverer for LxcProxmoxApiAdapter {
     /// API-only recovery: hard `Stop` then `Start`, polling status
     /// between transitions. `Stop` is the hard variant — `Shutdown`

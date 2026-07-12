@@ -7,14 +7,14 @@
 //! `warn!` — matching the resilience pattern in
 //! `tools::proxmox_cluster_list`.
 
-use plugin_toolkit::async_trait::async_trait;
 use plugin_toolkit::contract::{ClusterEntry, ClusterNode, ClusterRoster};
+use plugin_toolkit::orca_async;
 
 use crate::tools::for_each_enabled_endpoint;
 
 pub struct ProxmoxClusterRoster;
 
-#[async_trait]
+#[orca_async]
 impl ClusterRoster for ProxmoxClusterRoster {
     fn name(&self) -> &str {
         "proxmox"
