@@ -210,6 +210,20 @@ fn kind_str(k: GuestKind) -> &'static str {
 /// a guest below these, the typed replacement for a guest updater's ad-hoc
 /// "under-provisioned / may cause data loss" prompt. Fleet-specific tightening
 /// (higher floors, console/update requirements) layers on later via config.
+/// A guest's declared minimal state. proxmox's backup is `vzdump`, which images
+/// the whole guest — its definition plus its rootfs — so the spec reflects that
+/// (both strategies, no explicit include: the whole guest is the archive). Bulk
+/// data kept on separate mounts is excluded by keeping it off the guest's disks,
+/// not by this spec; narrowing to a paths-only minimal is future work.
+fn guest_backup_spec() -> plugin_toolkit::contract::backup::BackupSpec {
+    use plugin_toolkit::contract::backup::{BackupSpec, BackupStrategy};
+    BackupSpec {
+        include: Vec::new(),
+        exclude: Vec::new(),
+        strategies: vec![BackupStrategy::Definition, BackupStrategy::Rootfs],
+    }
+}
+
 fn guest_guard(kind: GuestKind) -> UnitGuard {
     match kind {
         GuestKind::Lxc => UnitGuard::min_resources(KIND_LXC, 1, 512),
@@ -969,14 +983,8 @@ impl UnitProvider for ProxmoxUnitProvider {
 
     fn declarations(&self) -> Vec<KindDeclaration> {
         vec![
-            KindDeclaration {
-                kind: KIND_VM.into(),
-                verbs: guest_verbs(),
-            },
-            KindDeclaration {
-                kind: KIND_LXC.into(),
-                verbs: guest_verbs(),
-            },
+            KindDeclaration::new(KIND_VM, guest_verbs()).with_backup_spec(guest_backup_spec()),
+            KindDeclaration::new(KIND_LXC, guest_verbs()).with_backup_spec(guest_backup_spec()),
         ]
     }
 
