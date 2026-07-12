@@ -21,12 +21,12 @@
 use plugin_toolkit::anyhow::{Result, anyhow};
 use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::contract::unit::{
-    ACTION_BACKUP, ActionDecl, ActionOutcome, CreateArgs, DeleteArgs, DetailArgs, ItemOutcome,
-    ItemsOutcome, KindDeclaration, ListArgs, UnitDescriptor, UnitId, UnitProvider, UpdateArgs,
-    UpsertArgs, Verb, VerbArgs, VerbDecl, VerbOutcome,
+    ACTION_BACKUP, ACTION_RESTORE, ActionDecl, ActionOutcome, CreateArgs, DeleteArgs, DetailArgs,
+    ItemOutcome, ItemsOutcome, KindDeclaration, ListArgs, UnitDescriptor, UnitId, UnitProvider,
+    UpdateArgs, UpsertArgs, Verb, VerbArgs, VerbDecl, VerbOutcome,
 };
 use plugin_toolkit::contract::{
-    BackupRef, GuardViolation, UnitFacts, UnitGuard, partition_violations,
+    BackupRef, GuardViolation, RestorePayload, UnitFacts, UnitGuard, partition_violations,
 };
 use plugin_toolkit::schemars::{JsonSchema, schema_for};
 use plugin_toolkit::serde::{Deserialize, Serialize};
@@ -37,6 +37,13 @@ use crate::generated::{self, types as gtypes};
 
 const KIND_VM: &str = "vm";
 const KIND_LXC: &str = "lxc";
+
+/// Upper bound orca waits for a vzdump / restore task before giving up. A minimal
+/// state backup is small, but a large qemu restore can run long; generous so a
+/// legitimately-slow task is not aborted, bounded so a wedged one cannot hang the
+/// guarded mutation forever.
+const BACKUP_TASK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const RESTORE_TASK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Stateless — every call re-reads the endpoint registry so newly-registered
 /// hosts show up without a reload.
@@ -342,6 +349,69 @@ async fn default_backup_storage(client: &generated::Client, node: &str) -> Resul
         })
 }
 
+/// Poll a PVE task (vzdump / restore) to completion. A backup is a prerequisite
+/// of the mutation it guards, so orca must *wait* for it and fail loudly on a
+/// non-`OK` exit — a silently-running or failed task must never let a mutation
+/// proceed. Bounded by `deadline`; returns the terminal exit status text.
+async fn wait_for_task(
+    client: &generated::Client,
+    node: &str,
+    upid: &str,
+    deadline: plugin_toolkit::time::Deadline,
+) -> Result<String> {
+    loop {
+        let status = client
+            .get_read_task_status_nodes_node_tasks_upid_status(node, upid)
+            .await
+            .map_err(|e| anyhow!("task status {upid} on {node}: {e}"))?
+            .into_inner();
+        // `status` is Running until the task stops; then `exitstatus` is set.
+        use gtypes::GetReadTaskStatusNodesNodeTasksUpidStatusResponseStatus as TaskStatus;
+        if !matches!(status.status, TaskStatus::Running) {
+            let exit = status.exitstatus.unwrap_or_default();
+            if exit == "OK" {
+                return Ok(exit);
+            }
+            return Err(anyhow!("task {upid} on {node} failed: {exit}"));
+        }
+        if deadline.reached() {
+            return Err(anyhow!(
+                "task {upid} on {node} did not finish before deadline"
+            ));
+        }
+        plugin_toolkit::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+}
+
+/// Resolve a completed vzdump task to the archive it produced by scanning its
+/// log for the `creating … archive '<path>'` line PVE emits. This turns the
+/// task UPID into a concrete restore locator (an absolute archive path the
+/// restore create call accepts as `archive` / `ostemplate`).
+async fn archive_from_task_log(
+    client: &generated::Client,
+    node: &str,
+    upid: &str,
+) -> Result<String> {
+    let lines = client
+        .get_read_task_log_nodes_node_tasks_upid_log(node, upid, None, None, None)
+        .await
+        .map_err(|e| anyhow!("task log {upid} on {node}: {e}"))?
+        .into_inner();
+    lines
+        .iter()
+        .find_map(|l| parse_archive_line(&l.t))
+        .ok_or_else(|| anyhow!("no archive path in vzdump log for task {upid}"))
+}
+
+/// Extract the archive path from a vzdump log line, e.g.
+/// `INFO: creating vzdump archive '/mnt/pve/backup/dump/vzdump-lxc-100-….tar.zst'`.
+/// Split out from the async fetch so it is unit-testable without a client.
+fn parse_archive_line(text: &str) -> Option<String> {
+    let rest = text.split_once("archive '")?.1;
+    let path = rest.split_once('\'')?.0;
+    (!path.is_empty()).then(|| path.to_string())
+}
+
 impl ProxmoxUnitProvider {
     fn unit_id(g: &GuestSummary) -> UnitId {
         UnitId {
@@ -425,6 +495,9 @@ impl ProxmoxUnitProvider {
         if args.action == ACTION_BACKUP {
             return self.do_backup(&args.id, args.payload).await;
         }
+        if args.action == ACTION_RESTORE {
+            return self.do_restore(&args.id, args.payload).await;
+        }
         let endpoint = endpoint_of(&args.id)?;
         let kind = kind_from_str(&args.id.kind)?;
         let vmid: u64 = args
@@ -443,8 +516,10 @@ impl ProxmoxUnitProvider {
 
     /// Take the guest's minimal backup via `vzdump` and return a [`BackupRef`].
     /// The unit's manager routes this to the owning endpoint over the mesh, so a
-    /// backup runs wherever the guest actually lives. The archive is captured as
-    /// a PVE task; the returned locator is its UPID (poll-to-path is a follow-up).
+    /// backup runs wherever the guest actually lives. Because a backup gates the
+    /// mutation that triggered it, this *waits* for the vzdump task and fails on a
+    /// non-`OK` exit; the returned locator is the concrete archive path (resolved
+    /// from the task log), so a later `restore` can consume it directly.
     async fn do_backup(&self, id: &UnitId, payload: Option<String>) -> Result<VerbOutcome> {
         let endpoint = endpoint_of(id)?;
         let kind = kind_from_str(&id.kind)?;
@@ -483,8 +558,13 @@ impl ProxmoxUnitProvider {
             .map_err(|e| anyhow!("vzdump {} {vmid} on {node}: {e}", kind_str(kind)))?
             .into_inner();
 
+        // A backup gates a mutation — wait for it and fail loudly if it errors.
+        let deadline = plugin_toolkit::time::Deadline::after(BACKUP_TASK_DEADLINE);
+        wait_for_task(&client, &node, &upid, deadline).await?;
+        let archive = archive_from_task_log(&client, &node, &upid).await?;
+
         let backup = BackupRef {
-            locator: upid,
+            locator: archive,
             manager: manager_for(&endpoint),
             timestamp: plugin_toolkit::time::now().unix_seconds(),
             checksum: None,
@@ -492,6 +572,75 @@ impl ProxmoxUnitProvider {
         Ok(VerbOutcome::Item(ItemOutcome::new(
             id.clone(),
             serde_json::to_string(&backup).unwrap_or_default(),
+        )))
+    }
+
+    /// Restore the guest in place from a prior [`BackupRef`]. Recreates the same
+    /// vmid on its current node from the backup archive, overwriting the existing
+    /// guest (`force`); waits for the restore task and fails loudly on error.
+    /// Restore-to-a-new-vmid/node is a follow-up — this is the in-place inverse of
+    /// [`do_backup`], which the RFC pairs it with.
+    async fn do_restore(&self, id: &UnitId, payload: Option<String>) -> Result<VerbOutcome> {
+        let endpoint = endpoint_of(id)?;
+        let kind = kind_from_str(&id.kind)?;
+        let vmid: u64 = id
+            .id
+            .parse()
+            .map_err(|_| anyhow!("vmid '{}' is not a u64", id.id))?;
+        let raw = payload.ok_or_else(|| anyhow!("restore requires a payload"))?;
+        let p: RestorePayload =
+            serde_json::from_str(&raw).map_err(|e| anyhow!("restore payload: {e}"))?;
+        if let Some(component) = &p.component {
+            // A guest is a single unit; there is no sub-component to scope to.
+            return Err(anyhow!(
+                "proxmox restore has no component scope (got '{component}')"
+            ));
+        }
+        let archive = p.from.locator;
+        if archive.is_empty() {
+            return Err(anyhow!("restore backup ref has an empty locator"));
+        }
+        let client = crate::tools::make_client(&endpoint).await?;
+        let node = resolve_node(&client, kind, vmid).await?;
+
+        let mut body = serde_json::Map::new();
+        body.insert("vmid".into(), json!(vmid));
+        body.insert("force".into(), json!(1));
+        body.insert("restore".into(), json!(1));
+        let upid = match kind {
+            // LXC restore reuses the create endpoint: the archive rides in
+            // `ostemplate` with `restore=1`.
+            GuestKind::Lxc => {
+                body.insert("ostemplate".into(), json!(archive));
+                let typed: gtypes::PostCreateVmNodesNodeLxcBody =
+                    serde_json::from_value(serde_json::Value::Object(body))
+                        .map_err(|e| anyhow!("lxc restore body: {e}"))?;
+                client
+                    .post_create_vm_nodes_node_lxc(&node, &typed)
+                    .await
+                    .map_err(|e| anyhow!("lxc restore {vmid} on {node}: {e}"))?
+                    .into_inner()
+            }
+            // QEMU restore rides in `archive`.
+            GuestKind::Qemu => {
+                body.insert("archive".into(), json!(archive));
+                let typed: gtypes::PostCreateVmNodesNodeQemuBody =
+                    serde_json::from_value(serde_json::Value::Object(body))
+                        .map_err(|e| anyhow!("qemu restore body: {e}"))?;
+                client
+                    .post_create_vm_nodes_node_qemu(&node, &typed)
+                    .await
+                    .map_err(|e| anyhow!("qemu restore {vmid} on {node}: {e}"))?
+                    .into_inner()
+            }
+        };
+        if !upid.is_empty() {
+            let deadline = plugin_toolkit::time::Deadline::after(RESTORE_TASK_DEADLINE);
+            wait_for_task(&client, &node, &upid, deadline).await?;
+        }
+        Ok(VerbOutcome::Item(ItemOutcome::new(
+            id.clone(),
+            json!({ "restored": vmid, "node": node }).to_string(),
         )))
     }
 
@@ -770,6 +919,13 @@ fn guest_verbs() -> Vec<VerbDecl> {
         payload_schema: Some(schema_for!(BackupPayload)),
         response_schema: Some(schema_for!(BackupRef)),
     });
+    // Restore the guest in place from a prior BackupRef — the inverse of backup,
+    // reached via `Update { action: "restore" }` and routed the same way.
+    update_actions.push(ActionDecl {
+        action: ACTION_RESTORE.to_string(),
+        payload_schema: Some(schema_for!(RestorePayload)),
+        response_schema: None,
+    });
     vec![
         VerbDecl::list(),
         VerbDecl::detail(),
@@ -1015,6 +1171,45 @@ mod tests {
             assert!(backup.payload_schema.is_some());
             assert!(backup.response_schema.is_some());
         }
+    }
+
+    #[test]
+    fn restore_action_is_declared_with_payload_schema() {
+        let decls = ProxmoxUnitProvider::new().declarations();
+        for kind in [KIND_VM, KIND_LXC] {
+            let d = decls.iter().find(|d| d.kind == kind).unwrap();
+            let update = d.verbs.iter().find(|v| v.verb == Verb::Update).unwrap();
+            let restore = update
+                .actions
+                .iter()
+                .find(|a| a.action == ACTION_RESTORE)
+                .unwrap_or_else(|| panic!("{kind} missing restore action"));
+            assert!(restore.payload_schema.is_some());
+        }
+    }
+
+    #[test]
+    fn parse_archive_line_extracts_path() {
+        let line = "INFO: creating vzdump archive '/mnt/pve/backup/dump/vzdump-lxc-100-2026_07_11.tar.zst'";
+        assert_eq!(
+            parse_archive_line(line).as_deref(),
+            Some("/mnt/pve/backup/dump/vzdump-lxc-100-2026_07_11.tar.zst")
+        );
+        // Unrelated log lines yield nothing.
+        assert!(parse_archive_line("INFO: starting new backup job").is_none());
+        // A malformed line with an opening quote but no close yields nothing.
+        assert!(parse_archive_line("creating archive 'unterminated").is_none());
+    }
+
+    #[test]
+    fn restore_payload_round_trips() {
+        let raw = r#"{"from":{"locator":"/mnt/pve/backup/dump/vzdump-lxc-100.tar.zst","manager":"proxmox@a","timestamp":1}}"#;
+        let p: RestorePayload = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            p.from.locator,
+            "/mnt/pve/backup/dump/vzdump-lxc-100.tar.zst"
+        );
+        assert!(p.component.is_none());
     }
 
     #[test]
