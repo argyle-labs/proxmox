@@ -253,8 +253,8 @@ mod tests {
         assert_eq!(classify_ip("fe80::1"), None);
         assert_eq!(classify_ip("not-an-ip"), None);
         assert_eq!(
-            classify_ip("10.10.10.27/24"),
-            Some(("lan_v4", "10.10.10.27".to_string()))
+            classify_ip("192.0.2.27/24"),
+            Some(("lan_v4", "192.0.2.27".to_string()))
         );
         assert_eq!(
             classify_ip("2607:fb90::1"),
@@ -288,7 +288,7 @@ mod tests {
             "result": [
                 { "name": "lo", "ip-addresses": [ { "ip-address": "127.0.0.1", "ip-address-type": "ipv4" } ] },
                 { "name": "eth0", "ip-addresses": [
-                    { "ip-address": "10.10.10.5", "ip-address-type": "ipv4", "prefix": 24 },
+                    { "ip-address": "192.0.2.5", "ip-address-type": "ipv4", "prefix": 24 },
                     { "ip-address": "fe80::abc", "ip-address-type": "ipv6" }
                 ] }
             ]
@@ -296,7 +296,7 @@ mod tests {
         let map = payload.as_object().unwrap().clone();
         let got = addresses_from_qemu_agent(&map);
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].value, "10.10.10.5");
+        assert_eq!(got[0].value, "192.0.2.5");
         assert_eq!(got[0].kind, "lan_v4");
     }
 }
