@@ -1,6 +1,6 @@
 //! Domain-backend registration for the hybrid export.
 //!
-//! proxmox contributes four backends to orca's `contract` registries:
+//! proxmox contributes five backends to orca's `contract` registries:
 //!
 //! - `cluster_roster` (`proxmox.list_clusters`) — fleet cluster grouping.
 //! - `topology` (`proxmox.collect_claims`) — parent-host nesting by guest MACs.
@@ -8,12 +8,15 @@
 //!   into its mesh-propagated system snapshot for grouping from any vantage.
 //! - `unit` (`proxmox.__unit.*`) — the five-verb managed-unit surface exposing
 //!   every cluster VM/LXC as a unit (see [`crate::unit_provider`]).
+//! - `diagnostics` (`proxmox.__diagnostics.*`) — QEMU guest-agent assurance
+//!   (see [`crate::diagnostics`]).
 //!
-//! The first two route back through the normal `proxmox.` tool dispatch (their
-//! ops ARE `#[orca_tool]`s), so [`backend_dispatch`] returns `None` for them and
-//! the macro's hybrid `invoke` falls through to the tool surface. Only the
-//! `unit` backend needs bespoke routing — it dispatches through
-//! [`contract::unit::dispatch_op`] against the singleton provider.
+//! The first three route back through the normal `proxmox.` tool dispatch (their
+//! ops ARE `#[orca_tool]`s), so [`backend_dispatch`] falls through for them and
+//! the macro's hybrid `invoke` reaches the tool surface. The `unit` and
+//! `diagnostics` backends need bespoke routing — they dispatch through
+//! [`contract::unit::dispatch_op`] / [`crate::diagnostics::dispatch`] against
+//! their providers.
 
 use std::sync::OnceLock;
 
@@ -50,6 +53,8 @@ pub fn backends_json() -> String {
         // a literal — add a kind or verb to ProxmoxUnitProvider and the
         // registered unit backend follows automatically.
         unit_backend_def(unit_provider() as &dyn UnitProvider, UNIT_PREFIX),
+        // QEMU guest-agent assurance — routes `proxmox.__diagnostics.*`.
+        crate::diagnostics::diagnostics_backend_def(),
     ];
     serde_json::to_string(&defs).unwrap_or_else(|_| "[]".to_string())
 }
@@ -60,12 +65,18 @@ pub fn backends_json() -> String {
 /// cluster_roster + topology ops). Async work is driven to completion on the
 /// subprocess reactor via [`plugin_toolkit::reactor::block_on`].
 pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, String>> {
-    let op = name.strip_prefix(UNIT_PREFIX)?.strip_prefix('.')?;
-    Some(plugin_toolkit::reactor::block_on(
-        plugin_toolkit::contract::unit::dispatch_op(
-            unit_provider() as &dyn UnitProvider,
-            op,
-            args_json,
-        ),
-    ))
+    if let Some(op) = name
+        .strip_prefix(UNIT_PREFIX)
+        .and_then(|s| s.strip_prefix('.'))
+    {
+        return Some(plugin_toolkit::reactor::block_on(
+            plugin_toolkit::contract::unit::dispatch_op(
+                unit_provider() as &dyn UnitProvider,
+                op,
+                args_json,
+            ),
+        ));
+    }
+    // QEMU guest-agent diagnostics (`proxmox.__diagnostics.*`).
+    crate::diagnostics::dispatch(name, args_json)
 }
