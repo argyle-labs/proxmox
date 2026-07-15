@@ -66,6 +66,7 @@ async fn collect_for_endpoint(
                 vmid: vmid as u64,
                 kind,
                 name: e.name,
+                status: e.status,
             })
         })
         .collect();
@@ -94,6 +95,7 @@ async fn collect_for_endpoint(
         // interfaces reports nothing — that's an expected gap, not an error,
         // so failures are swallowed and `addresses` is simply left empty.
         let addresses = fetch_guest_addresses(client, g.kind, &g.node, g.vmid).await;
+        let state = normalize_state(g.status.as_deref());
         Some(TopologyClaim {
             kind: kind_to_claim_kind(g.kind).to_string(),
             id: g.vmid.to_string(),
@@ -108,6 +110,7 @@ async fn collect_for_endpoint(
             // every cluster peer report every guest.
             runs_on: Some(g.node),
             addresses,
+            state,
             // PVE config exposes no listening ports; endpoints/image stay
             // empty. In-guest port + service-role discovery arrives via the
             // runtime service-identity registration path, not the claim.
@@ -126,6 +129,19 @@ fn kind_to_claim_kind(k: GuestKind) -> &'static str {
     match k {
         GuestKind::Qemu => "vm",
         GuestKind::Lxc => "lxc",
+    }
+}
+
+/// Map a PVE `cluster/resources` status onto orca's normalized run-state
+/// vocabulary. PVE reports `running`/`stopped` for guests plus `paused`/
+/// `suspended` transients; anything else (or absent) yields `None` (Unknown,
+/// not assumed down).
+fn normalize_state(status: Option<&str>) -> Option<String> {
+    match status.map(str::trim).map(str::to_lowercase).as_deref() {
+        Some("running") => Some("running".to_string()),
+        Some("stopped") => Some("stopped".to_string()),
+        Some("paused" | "suspended") => Some("paused".to_string()),
+        _ => None,
     }
 }
 
@@ -245,6 +261,16 @@ mod tests {
     use plugin_toolkit::serde_json::json;
 
     #[test]
+    fn normalize_state_maps_pve_status() {
+        assert_eq!(normalize_state(Some("running")), Some("running".into()));
+        assert_eq!(normalize_state(Some("stopped")), Some("stopped".into()));
+        assert_eq!(normalize_state(Some("paused")), Some("paused".into()));
+        assert_eq!(normalize_state(Some("suspended")), Some("paused".into()));
+        assert_eq!(normalize_state(None), None);
+        assert_eq!(normalize_state(Some("unknown")), None);
+    }
+
+    #[test]
     fn classify_filters_loopback_and_link_local() {
         assert_eq!(classify_ip("127.0.0.1"), None);
         assert_eq!(classify_ip("169.254.3.4"), None);
@@ -307,4 +333,6 @@ struct GuestRef {
     vmid: u64,
     kind: GuestKind,
     name: Option<String>,
+    /// Raw PVE run-status from `cluster/resources` (`running`/`stopped`/…).
+    status: Option<String>,
 }
