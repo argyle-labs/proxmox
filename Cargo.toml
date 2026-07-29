@@ -12,14 +12,11 @@ category = "infra"
 name = "proxmox"
 path = "src/lib.rs"
 # `rlib` retains the in-crate `#[cfg(test)]` harness + lets the workspace use it
-# as a normal Rust lib. The plugin artifact is now the `[[bin]]` below — a
-# dynamic subprocess orca's loader spawns, not a dlopened cdylib.
+# as a normal Rust lib. The plugin artifact is the `[[bin]]` below.
 crate-type = ["rlib"]
 
-# Out-of-process entrypoint: orca spawns this binary as a subprocess and speaks
-# the plugin wire protocol over a Unix socket. The toolkit's `serve_tool_plugin!`
-# in `src/main.rs` emits `fn main`; this is the sole plugin artifact now that the
-# in-process cdylib export has been retired.
+# Plugin entrypoint: a subprocess `[[bin]]` that talks to the orca daemon over
+# its Unix socket via `serve_tool_plugin!` from plugin-toolkit. No FFI/cdylib.
 [[bin]]
 name = "proxmox"
 path = "src/main.rs"

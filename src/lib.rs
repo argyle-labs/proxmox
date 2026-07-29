@@ -4,9 +4,8 @@
 //! Token format follows Proxmox's documented header:
 //!   Authorization: PVEAPIToken=USER@REALM!TOKENID=UUID
 //!
-//! The wire surface is the progenitor-generated `generated::Client` —
-//! every hand-rolled HTTP method has been retired. Two endpoints still
-//! need a raw-URL helper because the upstream schema models indexed
+//! The wire surface is the progenitor-generated `generated::Client`. Two
+//! endpoints still need a raw-URL helper because the upstream schema models indexed
 //! keys (`netN`, `mpN`) as a single `[n]` field that progenitor can't
 //! materialize into separate keys:
 //!   - `fetch_guest_config` — pulls the full guest config so callers
