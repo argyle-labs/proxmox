@@ -1,9 +1,8 @@
 //! Dynamic (subprocess) entrypoint for the proxmox plugin.
 //!
 //! The toolkit's `serve_tool_plugin!` (hybrid arm) emits `fn main`, serving this
-//! plugin over the orca socket. This is the dynamic replacement for the retired
-//! cdylib `export_tool_plugin!` export — the plugin is a `[[bin]]`, owns only its
-//! domain client, and reaches orca only through the socket.
+//! plugin over the orca socket. The plugin is a `[[bin]]`, owns only its domain
+//! client, and reaches orca only through the socket.
 //!
 //! proxmox is a **hybrid** plugin: the `proxmox.` tool surface PLUS three domain
 //! backends — `cluster_roster`, `topology`, and the five-verb `unit` surface (see

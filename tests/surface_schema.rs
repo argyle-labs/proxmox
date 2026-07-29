@@ -12,7 +12,7 @@
 
 use plugin_toolkit::serde_json::{self, Value};
 
-/// Force the proxmox cdylib/rlib to link so its inventory entries register.
+/// Force the proxmox rlib to link so its inventory entries register.
 #[allow(unused_imports)]
 use proxmox as _;
 
