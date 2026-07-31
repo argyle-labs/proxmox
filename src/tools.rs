@@ -22,9 +22,9 @@ use crate::generated;
 // proxmox.{list,detail,create,update,delete} — endpoint registry CRUD.
 // ═══════════════════════════════════════════════════════════════════════════
 
-// `addresses` is a built-in column on every `#[endpoint_resource]` — an ordered
-// fallback list (`--address kind=url`, repeatable) resolved by
-// `address::resolve_reachable`. Each entry's free-form `kind` (`fqdn` / `lan` /
+// `routes` is a built-in column on every `#[endpoint_resource]` — an ordered
+// fallback list (`--route kind=url`, repeatable) resolved by
+// `route::resolve_reachable`. Each entry's free-form `kind` (`fqdn` / `lan` /
 // `tailscale`) doubles as the locality class the fewest-hop router consumes.
 #[endpoint_resource(plugin = "proxmox")]
 pub struct ProxmoxEndpoint {
@@ -63,7 +63,7 @@ impl From<crate::ProxmoxActionResult> for ProxmoxActionResult {
 // ── HTTP client helper ─────────────────────────────────────────────────────
 
 /// Resolve a registered endpoint into a ready [`Config`]: the first reachable
-/// base URL (`resolve_reachable` over the endpoint's `addresses` fallback list)
+/// base URL (`resolve_reachable` over the endpoint's `routes` fallback list)
 /// plus the secure-first token secret. Single place both the generated client
 /// and the topology/roster reqwest paths flow through.
 pub(crate) async fn resolve_config(name: &str) -> Result<Config> {
@@ -75,7 +75,7 @@ pub(crate) async fn resolve_config(name: &str) -> Result<Config> {
     // `fetch_guest_config`/topology paths join their `/nodes/...` routes onto
     // `Config::base_url`, so promote the reachable root to the API root here.
     // Idempotent: an address already ending in `/api2/json` is left as-is.
-    let reachable = address::resolve_reachable(name, &row.addresses, row.insecure).await?;
+    let reachable = route::resolve_reachable(name, &row.routes, row.insecure).await?;
     let base_url = api_root(&reachable);
     Ok(Config::new(base_url, row.token_id, secret).insecure(row.insecure))
 }

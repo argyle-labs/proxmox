@@ -21,7 +21,7 @@ use crate::generated::{self, types as gtypes};
 use crate::tools::for_each_enabled_endpoint;
 use crate::{GuestKind, fetch_guest_config};
 use plugin_toolkit::contract::TopologyClaim;
-use plugin_toolkit::contract::topology::ClaimAddress;
+use plugin_toolkit::contract::topology::Route;
 use plugin_toolkit::reqwest;
 use std::net::IpAddr;
 
@@ -93,8 +93,8 @@ async fn collect_for_endpoint(
         }
         // Best-effort live IPs. A guest with no agent (QEMU) or no running
         // interfaces reports nothing — that's an expected gap, not an error,
-        // so failures are swallowed and `addresses` is simply left empty.
-        let addresses = fetch_guest_addresses(client, g.kind, &g.node, g.vmid).await;
+        // so failures are swallowed and `routes` is simply left empty.
+        let routes = fetch_guest_routes(client, g.kind, &g.node, g.vmid).await;
         let state = normalize_state(g.status.as_deref());
         Some(TopologyClaim {
             kind: kind_to_claim_kind(g.kind).to_string(),
@@ -109,7 +109,7 @@ async fn collect_for_endpoint(
             // parent it correctly despite cluster-shared pmxcfs config making
             // every cluster peer report every guest.
             runs_on: Some(g.node),
-            addresses,
+            routes: routes.into(),
             state,
             // PVE config exposes no listening ports; endpoints/image stay
             // empty. In-guest port + service-role discovery arrives via the
@@ -145,16 +145,16 @@ fn normalize_state(status: Option<&str>) -> Option<String> {
     }
 }
 
-/// Fetch a guest's live IPs and map them to `ClaimAddress`es. Never fails:
+/// Fetch a guest's live IPs and map them to `Route`s. Never fails:
 /// any transport/agent error (e.g. QEMU guest-agent not installed, LXC not
 /// running) is logged at debug and yields an empty vec — a noted gap, not a
 /// hard error, so one guest can't break the whole collect.
-async fn fetch_guest_addresses(
+async fn fetch_guest_routes(
     client: &generated::Client,
     kind: GuestKind,
     node: &str,
     vmid: u64,
-) -> Vec<ClaimAddress> {
+) -> Vec<Route> {
     let vmid = vmid as i64;
     match kind {
         GuestKind::Lxc => match client
@@ -171,7 +171,7 @@ async fn fetch_guest_addresses(
                         .chain(iface.inet6)
                         .collect::<Vec<_>>()
                 });
-                addresses_from_ips(raw)
+                routes_from_ips(raw)
             }
             Err(e) => {
                 tracing::debug!(node = %node, vmid, error = %e, "proxmox topology: lxc interfaces failed");
@@ -184,7 +184,7 @@ async fn fetch_guest_addresses(
             )
             .await
         {
-            Ok(resp) => addresses_from_qemu_agent(&resp.into_inner()),
+            Ok(resp) => routes_from_qemu_agent(&resp.into_inner()),
             Err(e) => {
                 tracing::debug!(node = %node, vmid, error = %e, "proxmox topology: qemu guest-agent network-get-interfaces failed (agent absent?)");
                 Vec::new()
@@ -195,10 +195,10 @@ async fn fetch_guest_addresses(
 
 /// Parse the QEMU guest-agent `network-get-interfaces` payload (an untyped
 /// JSON map: `{ "result": [ { "ip-addresses": [ { "ip-address": .. } ] } ] }`)
-/// into `ClaimAddress`es.
-fn addresses_from_qemu_agent(
+/// into `Route`s.
+fn routes_from_qemu_agent(
     map: &plugin_toolkit::serde_json::Map<String, plugin_toolkit::serde_json::Value>,
-) -> Vec<ClaimAddress> {
+) -> Vec<Route> {
     let ips = map
         .get("result")
         .and_then(|v| v.as_array())
@@ -211,21 +211,23 @@ fn addresses_from_qemu_agent(
                 .and_then(|v| v.as_str())
                 .map(String::from)
         });
-    addresses_from_ips(ips)
+    routes_from_ips(ips)
 }
 
 /// Turn raw IP strings (bare or CIDR, v4 or v6) into deduped, routable
-/// `ClaimAddress`es — dropping loopback, link-local and unspecified.
-fn addresses_from_ips<I: IntoIterator<Item = String>>(ips: I) -> Vec<ClaimAddress> {
-    let mut out: Vec<ClaimAddress> = Vec::new();
+/// `Route`s — dropping loopback, link-local and unspecified.
+fn routes_from_ips<I: IntoIterator<Item = String>>(ips: I) -> Vec<Route> {
+    let mut out: Vec<Route> = Vec::new();
     for raw in ips {
         if let Some((kind, value)) = classify_ip(&raw)
             && !out.iter().any(|a| a.value == value)
         {
-            out.push(ClaimAddress {
-                kind: kind.to_string(),
-                value,
-                source: "proxmox".to_string(),
+            // Live-discovered guest IP: a schemeless, enabled mesh route tagged
+            // with where it was learned. No `last_seen_at` — these are fetched
+            // fresh each collect, not read back from an addressing DB row.
+            out.push(Route {
+                source: Some("proxmox".to_string()),
+                ..Route::mesh(kind, value, None)
             });
         }
     }
@@ -289,8 +291,8 @@ mod tests {
     }
 
     #[test]
-    fn addresses_dedupe_and_tag() {
-        let got = addresses_from_ips(
+    fn routes_dedupe_and_tag() {
+        let got = routes_from_ips(
             [
                 "10.0.0.5/24",
                 "10.0.0.5", // dup of the above once CIDR is stripped
@@ -303,7 +305,7 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].kind, "lan_v4");
         assert_eq!(got[0].value, "10.0.0.5");
-        assert_eq!(got[0].source, "proxmox");
+        assert_eq!(got[0].source.as_deref(), Some("proxmox"));
         assert_eq!(got[1].kind, "lan_v6");
         assert_eq!(got[1].value, "fd00::5");
     }
@@ -320,7 +322,7 @@ mod tests {
             ]
         });
         let map = payload.as_object().unwrap().clone();
-        let got = addresses_from_qemu_agent(&map);
+        let got = routes_from_qemu_agent(&map);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].value, "192.0.2.5");
         assert_eq!(got[0].kind, "lan_v4");
