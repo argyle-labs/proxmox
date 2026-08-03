@@ -38,7 +38,7 @@ fn unit_provider() -> &'static ProxmoxUnitProvider {
 /// their `proxmox` prefix (routing to `proxmox.list_clusters` /
 /// `proxmox.collect_claims` tools); the unit backend routes to `proxmox.__unit`.
 pub fn backends_json() -> String {
-    let defs = vec![
+    let mut defs = vec![
         BackendDef {
             domain: "cluster_roster".to_string(),
             name: "proxmox".to_string(),
@@ -56,6 +56,9 @@ pub fn backends_json() -> String {
         // QEMU guest-agent assurance — routes `proxmox.__diagnostics.*`.
         crate::diagnostics::diagnostics_backend_def(),
     ];
+    // Three config-backup KINDs — pve-config / vm / lxc — each routing
+    // `proxmox.__backup_*.*` (see [`crate::backup`]).
+    defs.extend(crate::backup::backend_defs());
     serde_json::to_string(&defs).unwrap_or_else(|_| "[]".to_string())
 }
 
@@ -76,6 +79,10 @@ pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, St
                 args_json,
             ),
         ));
+    }
+    // Config-backup KINDs (`proxmox.__backup_pveconfig|vm|lxc.*`).
+    if let Some(res) = crate::backup::dispatch(name, args_json) {
+        return Some(res);
     }
     // QEMU guest-agent diagnostics (`proxmox.__diagnostics.*`).
     crate::diagnostics::dispatch(name, args_json)

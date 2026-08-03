@@ -148,6 +148,23 @@ pub(crate) fn token_secret_name(endpoint: &str) -> String {
     plugin_toolkit::secrets::scoped_name("proxmox", endpoint, "token_secret")
 }
 
+/// Names of every **enabled** endpoint, for callers (e.g. the backup KINDs) that
+/// need to resolve a specific endpoint's [`Config`] by name via
+/// [`resolve_config`] rather than fan out over all of them at once.
+pub(crate) fn enabled_endpoint_names() -> Vec<String> {
+    match endpoint_db::list() {
+        Ok(eps) => eps
+            .into_iter()
+            .filter(|e| e.enabled)
+            .map(|e| e.name)
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "proxmox: enabled endpoint list failed");
+            Vec::new()
+        }
+    }
+}
+
 fn resolve_token_secret(name: &str, row: &ProxmoxEndpoint) -> Result<String> {
     plugin_toolkit::secrets::resolve_scoped(
         "proxmox",

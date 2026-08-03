@@ -15,6 +15,7 @@
 //! call site.
 
 pub mod access;
+pub mod backup;
 pub mod cluster;
 pub mod cluster_roster_impl;
 pub mod containers_adapter;
