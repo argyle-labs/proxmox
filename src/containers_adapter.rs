@@ -341,6 +341,9 @@ impl LxcProxmoxApiAdapter {
             runtime: RuntimeKind::Lxc,
             host: row.node.clone(),
             state,
+            // Lifecycle enumeration reports no health signal here; core defaults
+            // it to Unknown until a health-reporting adapter populates it.
+            health: plugin_toolkit::contract::health::Health::Unknown,
             restart_policy,
             image: None,
             labels: Vec::new(),
@@ -501,6 +504,7 @@ mod tests {
             runtime: RuntimeKind::Lxc,
             host: host.into(),
             state: ContainerState::Running,
+            health: plugin_toolkit::contract::health::Health::Unknown,
             restart_policy: RestartPolicy::No,
             image: image.map(Into::into),
             labels: Vec::new(),

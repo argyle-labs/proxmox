@@ -1,19 +1,16 @@
 #!/usr/bin/env bash
-# Pre-push gate — must mirror .github/workflows/ci.yml EXACTLY so lints are
-# caught locally, not in CI (dev/CI strictness parity). If CI changes, change
-# this to match.
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
-echo "==> rustfmt (cargo fmt --all -- --check)"
+# Pre-push is intentionally fmt-only (fast). The heavy gates — clippy (-D warnings)
+# and the full test suite — run on Gitea Actions on every PR
+# (.github/workflows/ci.yml via the reusable plugin-ci pipeline), which is the
+# source of truth. Running them again locally on every push was slow, redundant,
+# and — because the committed dev-patch .cargo/config.toml points at a sibling
+# ../orca checkout that need not exist — could not even resolve deps offline.
+echo "==> rustfmt"
 cargo fmt --all -- --check
 
-echo "==> clippy (cargo clippy --all-targets -- -D warnings)"
-cargo clippy --all-targets -- -D warnings
-
-echo "==> cargo test"
-cargo test
-
-echo "All checks passed."
+echo "pre-push fmt check passed (clippy/tests run in Gitea CI)."
