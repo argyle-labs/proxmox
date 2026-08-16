@@ -10,6 +10,8 @@
 //!   every cluster VM/LXC as a unit (see [`crate::unit_provider`]).
 //! - `diagnostics` (`proxmox.__diagnostics.*`) — QEMU guest-agent assurance
 //!   (see [`crate::diagnostics`]).
+//! - `deploy_target` (`proxmox.__deploy.{endpoint}/{kind}.*`) — the generic
+//!   deploy front door, one target per configured row (see [`crate::deploy`]).
 //!
 //! The first three route back through the normal `proxmox.` tool dispatch (their
 //! ops ARE `#[orca_tool]`s), so [`backend_dispatch`] falls through for them and
@@ -59,6 +61,9 @@ pub fn backends_json() -> String {
     // Three config-backup KINDs — pve-config / vm / lxc — each routing
     // `proxmox.__backup_*.*` (see [`crate::backup`]).
     defs.extend(crate::backup::backend_defs());
+    // One generic `deploy_target` per configured `(endpoint, kind)` row —
+    // routes `proxmox.__deploy.{endpoint}/{kind}.*` (see [`crate::deploy`]).
+    defs.extend(crate::deploy::backend_defs());
     serde_json::to_string(&defs).unwrap_or_else(|_| "[]".to_string())
 }
 
@@ -82,6 +87,10 @@ pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, St
     }
     // Config-backup KINDs (`proxmox.__backup_pveconfig|vm|lxc.*`).
     if let Some(res) = crate::backup::dispatch(name, args_json) {
+        return Some(res);
+    }
+    // Generic deploy-target ops (`proxmox.__deploy.{endpoint}/{kind}.*`).
+    if let Some(res) = crate::deploy::dispatch(name, args_json) {
         return Some(res);
     }
     // QEMU guest-agent diagnostics (`proxmox.__diagnostics.*`).

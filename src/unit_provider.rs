@@ -665,8 +665,31 @@ impl ProxmoxUnitProvider {
         let raw = args
             .payload
             .ok_or_else(|| anyhow!("provision requires a payload"))?;
-        let mut p: ProvisionPayload =
+        let p: ProvisionPayload =
             serde_json::from_str(&raw).map_err(|e| anyhow!("provision payload: {e}"))?;
+        let name = p.name.clone();
+        let resp = self.provision_guest(p).await?;
+        Ok(VerbOutcome::Item(ItemOutcome::new(
+            UnitId {
+                manager: manager_for(&resp.endpoint),
+                kind: resp.kind.clone(),
+                id: resp.vmid.to_string(),
+                name: name.unwrap_or_else(|| format!("{}-{}", resp.kind, resp.vmid)),
+            },
+            serde_json::to_string(&resp).unwrap_or_default(),
+        )))
+    }
+
+    /// Provision one guest from a typed [`ProvisionPayload`], returning the
+    /// [`ProvisionResponse`]. This is the shared core of `create`/`upsert` AND
+    /// the generic `deploy_target` adapter (`crate::deploy`), so the config-guard
+    /// auto-raise, nextid allocation, and PVE create call live in exactly one
+    /// place — the deploy front door delegates here rather than duplicating the
+    /// create path.
+    pub(crate) async fn provision_guest(
+        &self,
+        mut p: ProvisionPayload,
+    ) -> Result<ProvisionResponse> {
         let kind = kind_from_str(&p.kind)?;
 
         // Config-standard guard (§4.4): auto-raise under-min resources to the
@@ -710,25 +733,36 @@ impl ProxmoxUnitProvider {
         };
 
         let upid = provision(&client, &p, kind, vmid).await?;
-        let resp = ProvisionResponse {
+        Ok(ProvisionResponse {
             endpoint: p.endpoint.clone(),
             node: p.node.clone(),
             kind: kind_str(kind).to_string(),
             vmid,
             upid,
-        };
-        Ok(VerbOutcome::Item(ItemOutcome::new(
-            UnitId {
-                manager: manager_for(&p.endpoint),
-                kind: kind_str(kind).to_string(),
-                id: vmid.to_string(),
-                name: p
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("{}-{vmid}", kind_str(kind))),
-            },
-            serde_json::to_string(&resp).unwrap_or_default(),
-        )))
+        })
+    }
+
+    /// Run a lifecycle transition against the guest identified by `name` on
+    /// `endpoint`. The generic `deploy_target` surface addresses a workload by
+    /// its stable name, whereas PVE lifecycle is keyed by `(node, vmid)`; this
+    /// resolves the name → the live guest's `(node, vmid)` on that endpoint and
+    /// drives [`lifecycle`], returning the resolved `(vmid, node)`. Fails loudly
+    /// when no guest of that kind+name exists on the endpoint.
+    pub(crate) async fn lifecycle_by_name(
+        &self,
+        endpoint: &str,
+        kind: GuestKind,
+        name: &str,
+        action: &str,
+    ) -> Result<(u64, String)> {
+        let client = crate::tools::make_client(endpoint).await?;
+        let guest = guests_for_endpoint(&client, endpoint)
+            .await?
+            .into_iter()
+            .find(|g| g.name == name && g.kind == kind_str(kind))
+            .ok_or_else(|| anyhow!("{} named '{name}' not found on {endpoint}", kind_str(kind)))?;
+        lifecycle(&client, &guest.node, guest.vmid, kind, action).await?;
+        Ok((guest.vmid, guest.node))
     }
 
     /// Idempotent create-or-ensure for a guest keyed by vmid. Per the `Upsert`

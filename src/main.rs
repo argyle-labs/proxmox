@@ -14,4 +14,5 @@ plugin_toolkit::serve_tool_plugin! {
     target_compat: ">=7.0",
     backends: proxmox::registration::backends_json(),
     backend_dispatch: proxmox::registration::backend_dispatch,
+    schemas: proxmox::deploy::schemas_json(),
 }
