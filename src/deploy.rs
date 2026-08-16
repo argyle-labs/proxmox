@@ -246,7 +246,7 @@ async fn deploy_target_upsert(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct DeployTargetList {
+pub struct DeployTargetListResult {
     pub targets: Vec<DeployTargetRow>,
 }
 
@@ -255,8 +255,8 @@ pub struct DeployTargetList {
 async fn deploy_target_list(
     _args: DeployTargetListArgs,
     _ctx: &ToolCtx,
-) -> Result<DeployTargetList> {
-    Ok(DeployTargetList {
+) -> Result<DeployTargetListResult> {
+    Ok(DeployTargetListResult {
         targets: deploy_db::list()?,
     })
 }
