@@ -23,6 +23,7 @@ pub mod deploy;
 pub mod diagnostics;
 pub mod registration;
 pub mod responses;
+pub mod shm_trap;
 pub mod tools;
 pub mod topology;
 pub mod unit_provider;
