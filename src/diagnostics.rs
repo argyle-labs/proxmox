@@ -108,8 +108,19 @@ fn config_agent_enabled(cfg: &GuestConfigData) -> bool {
     false
 }
 
+/// Diagnose every running QEMU VM across all enabled endpoints, plus the
+/// node-local LXC shm-trap sweep.
+pub async fn diagnose(args: DiagnoseArgs) -> Vec<Finding> {
+    let mut findings = diagnose_qemu_agents(args).await;
+    // Node-local: reads /etc/pve/lxc/*.conf directly (raw lxc.mount.entry sizes
+    // aren't in the PVE API), so it only yields on a cluster node. Harmless
+    // (empty) elsewhere.
+    findings.extend(diagnose_lxc_shm_traps());
+    findings
+}
+
 /// Diagnose every running QEMU VM across all enabled endpoints.
-pub async fn diagnose(_args: DiagnoseArgs) -> Vec<Finding> {
+async fn diagnose_qemu_agents(_args: DiagnoseArgs) -> Vec<Finding> {
     for_each_enabled_endpoint("diagnostics.qemu_agent", |cfg, ep| async move {
         let http = cfg.build_reqwest_client()?;
         let client = generated::Client::new_with_client(&cfg.base_url, http.clone());
@@ -181,6 +192,116 @@ pub async fn diagnose(_args: DiagnoseArgs) -> Vec<Finding> {
         Ok(findings)
     })
     .await
+}
+
+/// This node's name (PVE node == hostname). Falls back to `"local"` so a
+/// finding id stays stable-ish even if the hostname can't be read.
+fn local_node() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .or_else(|_| std::fs::read_to_string("/etc/hostname"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "local".to_string())
+}
+
+/// The CT's `hostname:` from its conf, for a friendly finding title.
+fn ct_name(conf: &str) -> Option<String> {
+    conf.lines()
+        .find_map(|l| l.trim().strip_prefix("hostname:"))
+        .map(|v| v.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Node-local sweep: parse every `/etc/pve/lxc/<vmid>.conf` and flag any tmpfs
+/// mount sized at/above the CT's memory cgroup — the shm-trap that OOM-kills
+/// whatever fills it (e.g. a Plex/Jellyfin transcode into `/dev/shm`).
+fn diagnose_lxc_shm_traps() -> Vec<Finding> {
+    let dir = std::path::Path::new("/etc/pve/lxc");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new(); // not a PVE node
+    };
+    let node = local_node();
+    let mut findings = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("conf") {
+            continue;
+        }
+        let Some(vmid) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let Ok(conf) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let name = ct_name(&conf).unwrap_or_else(|| format!("ct-{vmid}"));
+        let profile = crate::shm_trap::parse_lxc_conf(&conf);
+        for trap in crate::shm_trap::classify_traps(&profile) {
+            findings.push(finding_shm_trap(&node, vmid, &name, &trap));
+        }
+    }
+    findings
+}
+
+fn finding_shm_trap(node: &str, vmid: u64, name: &str, trap: &crate::shm_trap::ShmTrap) -> Finding {
+    let suggested = crate::shm_trap::suggested_shm_mb(trap.memory_mb);
+    Finding {
+        id: format!("lxc-shm-trap::{node}::{vmid}::{}", trap.target),
+        provider: PROVIDER.to_string(),
+        // High: this actively OOM-kills the workload and crash-loops it.
+        severity: Severity::Crit,
+        title: format!(
+            "CT {vmid} ('{name}') tmpfs /{} is {} MiB but the memory cap is {} MiB — OOM-kill risk",
+            trap.target, trap.tmpfs_mb, trap.memory_mb
+        ),
+        detail: format!(
+            "The tmpfs mount /{tgt} in CT {vmid} on node '{node}' is sized {tmpfs} MiB, which is \
+             at/above the container's {mem} MiB memory cgroup. tmpfs pages count against that \
+             cgroup, so filling /{tgt} (e.g. a Plex/Jellyfin transcode writing to /dev/shm) pushes \
+             the CT past its limit and the kernel OOM-kills the process — a crash-loop. Cap the \
+             tmpfs below the memory limit (suggested {suggested} MiB, leaving headroom for the \
+             workload) or raise the CT's memory. Change applies on the next CT restart.",
+            tgt = trap.target,
+            tmpfs = trap.tmpfs_mb,
+            mem = trap.memory_mb,
+        ),
+        repair: Some(RepairSpec {
+            id: format!("shm-resize::{vmid}::{}::{suggested}", trap.target),
+            description: format!(
+                "Rewrite the tmpfs /{} entry in /etc/pve/lxc/{vmid}.conf to size={suggested}m \
+                 (leaves headroom under the {} MiB cap). Takes effect on the next CT restart; \
+                 does not resize the live mount.",
+                trap.target, trap.memory_mb
+            ),
+            // Confirmation required — it edits the CT config and needs a restart.
+            automatic: false,
+            privileged: true,
+            delegate: None,
+        }),
+    }
+}
+
+/// Apply an `shm-resize::<vmid>::<target>::<new_mb>` repair by rewriting the
+/// tmpfs `size=` in the CT's conf. Node-local; returns honest failure if the
+/// conf can't be read/written or the entry isn't found.
+fn repair_shm_resize(vmid: u64, target: &str, new_mb: u64) -> Result<String, String> {
+    let path = format!("/etc/pve/lxc/{vmid}.conf");
+    let conf = std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))?;
+    let (rewritten, changed) = crate::shm_trap::rewrite_tmpfs_size(&conf, target, new_mb);
+    if !changed {
+        return Err(format!(
+            "no tmpfs /{target} entry with a size= found in {path} (already fixed?)"
+        ));
+    }
+    std::fs::write(&path, rewritten).map_err(|e| format!("write {path}: {e}"))?;
+    Ok(format!(
+        "Set tmpfs /{target} to size={new_mb}m in {path}. Restart CT {vmid} \
+         (`pct reboot {vmid}`) for it to take effect."
+    ))
 }
 
 fn finding_disabled(endpoint: &str, node: &str, vmid: u64, name: &str) -> Finding {
@@ -257,6 +378,30 @@ fn outcome(repair_id: &str, ok: bool, message: String) -> RepairOutcome {
 
 /// Run a repair by its `RepairSpec.id`.
 pub async fn repair(args: RepairArgs) -> RepairOutcome {
+    // shm-resize::<vmid>::<target>::<new_mb> — node-local conf edit, distinct
+    // from the endpoint-scoped qemu-agent ids parsed below.
+    if let Some(rest) = args.repair_id.strip_prefix("shm-resize::") {
+        let parts: Vec<&str> = rest.split("::").collect();
+        let parsed = match parts.as_slice() {
+            [vmid, target, new_mb] => vmid
+                .parse::<u64>()
+                .ok()
+                .zip(new_mb.parse::<u64>().ok())
+                .map(|(v, m)| (v, target.to_string(), m)),
+            _ => None,
+        };
+        let Some((vmid, target, new_mb)) = parsed else {
+            return outcome(
+                &args.repair_id,
+                false,
+                format!("malformed shm-resize repair id '{}'", args.repair_id),
+            );
+        };
+        return match repair_shm_resize(vmid, &target, new_mb) {
+            Ok(msg) => outcome(&args.repair_id, true, msg),
+            Err(e) => outcome(&args.repair_id, false, e),
+        };
+    }
     let Some((action, endpoint, node, vmid)) = parse_repair_id(&args.repair_id) else {
         return outcome(
             &args.repair_id,
@@ -379,6 +524,37 @@ mod tests {
         assert_eq!(vmid, 104);
         assert!(parse_repair_id("enable::pve::hyp1").is_none());
         assert!(parse_repair_id("enable::pve::hyp1::notanum").is_none());
+    }
+
+    #[test]
+    fn shm_trap_finding_is_high_with_matching_resize_repair() {
+        let trap = crate::shm_trap::ShmTrap {
+            target: "dev/shm".into(),
+            tmpfs_mb: 6144,
+            memory_mb: 4096,
+        };
+        let f = finding_shm_trap("thor", 110, "mimir", &trap);
+        assert_eq!(f.id, "lxc-shm-trap::thor::110::dev/shm");
+        assert_eq!(f.severity, Severity::Crit);
+        let r = f.repair.unwrap();
+        // suggested = half of 4096 = 2048
+        assert_eq!(r.id, "shm-resize::110::dev/shm::2048");
+        assert!(!r.automatic && r.privileged);
+    }
+
+    #[test]
+    fn malformed_shm_resize_id_fails_cleanly() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = rt.block_on(repair(RepairArgs {
+            provider: "proxmox".into(),
+            repair_id: "shm-resize::notanum::dev/shm".into(),
+            confirm: true,
+        }));
+        assert!(!out.ok);
+        assert!(out.message.contains("malformed"));
     }
 
     #[test]
