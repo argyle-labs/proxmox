@@ -59,10 +59,22 @@ pub fn backend_defs() -> Vec<BackendDef> {
 /// Handle a `proxmox.__backup_*` bridge call. Returns `None` for anything that
 /// isn't one of the three backup prefixes so [`crate::registration::backend_dispatch`]
 /// falls through to the next handler (and ultimately the `#[orca_tool]` surface).
-pub fn dispatch(name: &str, args_json: &str) -> Option<Result<String, String>> {
+pub fn dispatch(
+    name: &str,
+    args: plugin_toolkit::serde_json::Value,
+) -> Option<Result<plugin_toolkit::serde_json::Value, plugin_toolkit::serde_json::Value>> {
     let (kind, op) = match_prefix(name)?;
+    // `run` still speaks JSON strings internally; the backend ABI now hands us a
+    // parsed `Value` and expects a `Value` back, so convert at this boundary.
+    let args_json = args.to_string();
     Some(plugin_toolkit::reactor::block_on(async move {
-        run(kind, op, args_json).await.map_err(|e| e.to_string())
+        run(kind, op, &args_json)
+            .await
+            .map(|s| {
+                plugin_toolkit::serde_json::from_str(&s)
+                    .unwrap_or(plugin_toolkit::serde_json::Value::String(s))
+            })
+            .map_err(|e| plugin_toolkit::serde_json::Value::String(e.to_string()))
     }))
 }
 

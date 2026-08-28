@@ -482,25 +482,43 @@ pub fn backend_defs() -> Vec<BackendDef> {
 /// Route a `proxmox.__deploy.{endpoint}/{kind}.{op}` backend call to the matching
 /// target's [`dispatch_op`]. Returns `None` for names outside this prefix so the
 /// caller falls through to other backends.
-pub fn dispatch(name: &str, args_json: &str) -> Option<Result<String, String>> {
+pub fn dispatch(
+    name: &str,
+    args: plugin_toolkit::serde_json::Value,
+) -> Option<Result<plugin_toolkit::serde_json::Value, plugin_toolkit::serde_json::Value>> {
     let rest = name
         .strip_prefix(DEPLOY_PREFIX)
         .and_then(|s| s.strip_prefix('.'))?;
     // `rest` = "{endpoint}/{kind}.{op}"; op has no '.', so split at the last one.
     let (row_key, op) = match rest.rsplit_once('.') {
         Some(parts) => parts,
-        None => return Some(Err(format!("malformed deploy op name '{name}'"))),
+        None => return Some(Err(err_val(format!("malformed deploy op name '{name}'")))),
     };
     let row = match deploy_db::get(row_key) {
         Ok(Some(r)) => r,
-        Ok(None) => return Some(Err(format!("no proxmox deploy target '{row_key}'"))),
-        Err(e) => return Some(Err(format!("deploy target lookup '{row_key}': {e}"))),
+        Ok(None) => {
+            return Some(Err(err_val(format!(
+                "no proxmox deploy target '{row_key}'"
+            ))));
+        }
+        Err(e) => {
+            return Some(Err(err_val(format!(
+                "deploy target lookup '{row_key}': {e}"
+            ))));
+        }
     };
     let target = match ProxmoxDeployTarget::from_row(row) {
         Ok(t) => t,
-        Err(e) => return Some(Err(e.to_string())),
+        Err(e) => return Some(Err(err_val(e.to_string()))),
     };
+    // `dispatch_op` now takes a parsed `Value` and returns `Result<Value, Value>`,
+    // which is exactly this backend ABI's shape — pass it through directly.
     Some(plugin_toolkit::reactor::block_on(dispatch_op(
-        &target, op, args_json,
+        &target, op, args,
     )))
+}
+
+/// A backend-ABI error value (message-only errors are a plain JSON string).
+fn err_val(msg: impl Into<String>) -> plugin_toolkit::serde_json::Value {
+    plugin_toolkit::serde_json::Value::String(msg.into())
 }

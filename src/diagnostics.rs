@@ -48,27 +48,35 @@ pub fn diagnostics_backend_def() -> BackendDef {
 
 /// Route a `proxmox.__diagnostics.{diagnose|repair}` backend call. Returns
 /// `None` for any other name so the caller can fall through.
-pub fn dispatch(name: &str, args_json: &str) -> Option<Result<String, String>> {
+pub fn dispatch(
+    name: &str,
+    args: serde_json::Value,
+) -> Option<Result<serde_json::Value, serde_json::Value>> {
     let op = name
         .strip_prefix(DIAG_PREFIX)?
         .strip_prefix('.')?
         .to_string();
-    let args_json = args_json.to_string();
     Some(plugin_toolkit::reactor::block_on(async move {
         if op == DIAGNOSE_OP {
             let args: DiagnoseArgs =
-                serde_json::from_str(&args_json).map_err(|e| format!("diagnose args: {e}"))?;
+                serde_json::from_value(args).map_err(|e| err_val(format!("diagnose args: {e}")))?;
             let findings = diagnose(args).await;
-            serde_json::to_string(&findings).map_err(|e| e.to_string())
+            serde_json::to_value(&findings).map_err(|e| err_val(e.to_string()))
         } else if op == REPAIR_OP {
             let args: RepairArgs =
-                serde_json::from_str(&args_json).map_err(|e| format!("repair args: {e}"))?;
+                serde_json::from_value(args).map_err(|e| err_val(format!("repair args: {e}")))?;
             let outcome = repair(args).await;
-            serde_json::to_string(&outcome).map_err(|e| e.to_string())
+            serde_json::to_value(&outcome).map_err(|e| err_val(e.to_string()))
         } else {
-            Err(format!("unknown diagnostics op '{op}'"))
+            Err(err_val(format!("unknown diagnostics op '{op}'")))
         }
     }))
+}
+
+/// A backend-ABI error value: the toolkit's `Result<Value, Value>` uses a plain
+/// JSON string for a message-only error.
+fn err_val(msg: impl Into<String>) -> serde_json::Value {
+    serde_json::Value::String(msg.into())
 }
 
 /// Guest-agent state for one running QEMU VM.
@@ -116,7 +124,47 @@ pub async fn diagnose(args: DiagnoseArgs) -> Vec<Finding> {
     // aren't in the PVE API), so it only yields on a cluster node. Harmless
     // (empty) elsewhere.
     findings.extend(diagnose_lxc_shm_traps());
+    // Node-local: scans /proc for non-hypervisor workloads running on the host
+    // itself (the PVE API exposes no process list). Empty off a PVE node.
+    findings.extend(diagnose_host_workloads());
     findings
+}
+
+/// Node-local sweep: flag any non-hypervisor workload (e.g. `minio`,
+/// `act_runner`) running directly on this PVE host instead of inside a guest.
+/// See [`crate::host_workloads`]. Empty off a PVE node.
+fn diagnose_host_workloads() -> Vec<Finding> {
+    let node = local_node();
+    crate::host_workloads::scan_host_workloads()
+        .into_iter()
+        .map(|label| finding_host_workload(&node, &label))
+        .collect()
+}
+
+fn finding_host_workload(node: &str, label: &str) -> Finding {
+    Finding {
+        id: format!("host-workload::{node}::{label}"),
+        provider: PROVIDER.to_string(),
+        // Warn, not Crit: it's a hygiene/architecture problem, not an active
+        // outage — the host still runs, but it's no longer clean/disposable.
+        severity: Severity::Warn,
+        title: format!(
+            "Non-hypervisor workload '{label}' is running directly on PVE node '{node}'"
+        ),
+        detail: format!(
+            "The process/service '{label}' is running on the bare-metal PVE node '{node}' rather \
+             than inside an LXC or VM. A hypervisor host should run only the virtualization + \
+             base-OS stack (pve*, qemu/kvm, corosync, zfs, sshd, systemd) so it stays clean and \
+             disposable — able to be backed up, migrated, and rebuilt as a unit. A workload on the \
+             node itself can't be managed that way and competes with guests for the node's \
+             resources. Move '{label}' into a dedicated LXC or VM and remove it from the host. \
+             orca does not stop host processes automatically — this needs a deliberate migration."
+        ),
+        // No safe automatic repair: relocating a live service into a guest is a
+        // manual migration. The detail carries the guidance; the notification is
+        // the action.
+        repair: None,
+    }
 }
 
 /// Diagnose every running QEMU VM across all enabled endpoints.
@@ -543,6 +591,16 @@ mod tests {
     }
 
     #[test]
+    fn host_workload_finding_is_warn_with_no_auto_repair() {
+        let f = finding_host_workload("frigg", "minio");
+        assert_eq!(f.id, "host-workload::frigg::minio");
+        assert_eq!(f.severity, Severity::Warn);
+        assert!(f.title.contains("minio") && f.title.contains("frigg"));
+        // Relocation is a manual migration — no automatic repair.
+        assert!(f.repair.is_none());
+    }
+
+    #[test]
     fn malformed_shm_resize_id_fails_cleanly() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -559,10 +617,10 @@ mod tests {
 
     #[test]
     fn unknown_diagnostics_op_is_an_error() {
-        let r = dispatch("proxmox.__diagnostics.bogus", "{}").unwrap();
+        let r = dispatch("proxmox.__diagnostics.bogus", serde_json::json!({})).unwrap();
         assert!(r.is_err());
         // A non-diagnostics name falls through.
-        assert!(dispatch("proxmox.__unit.list", "{}").is_none());
+        assert!(dispatch("proxmox.__unit.list", serde_json::json!({})).is_none());
     }
 
     #[test]

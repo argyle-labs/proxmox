@@ -72,27 +72,34 @@ pub fn backends_json() -> String {
 /// hybrid `invoke` falls through to the `proxmox.` tool surface (which owns the
 /// cluster_roster + topology ops). Async work is driven to completion on the
 /// subprocess reactor via [`plugin_toolkit::reactor::block_on`].
-pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, String>> {
+pub fn backend_dispatch(
+    name: &str,
+    args: plugin_toolkit::serde_json::Value,
+) -> Option<Result<plugin_toolkit::serde_json::Value, plugin_toolkit::serde_json::Value>> {
     if let Some(op) = name
         .strip_prefix(UNIT_PREFIX)
         .and_then(|s| s.strip_prefix('.'))
     {
+        // `dispatch_op` now takes a parsed `Value` and returns
+        // `Result<Value, Value>` — exactly this backend ABI's shape.
         return Some(plugin_toolkit::reactor::block_on(
             plugin_toolkit::contract::unit::dispatch_op(
                 unit_provider() as &dyn UnitProvider,
                 op,
-                args_json,
+                args,
             ),
         ));
     }
+    // The sub-dispatchers each take the args `Value` by value and return `None`
+    // when the name isn't theirs, so clone for every attempt but the last.
     // Config-backup KINDs (`proxmox.__backup_pveconfig|vm|lxc.*`).
-    if let Some(res) = crate::backup::dispatch(name, args_json) {
+    if let Some(res) = crate::backup::dispatch(name, args.clone()) {
         return Some(res);
     }
     // Generic deploy-target ops (`proxmox.__deploy.{endpoint}/{kind}.*`).
-    if let Some(res) = crate::deploy::dispatch(name, args_json) {
+    if let Some(res) = crate::deploy::dispatch(name, args.clone()) {
         return Some(res);
     }
     // QEMU guest-agent diagnostics (`proxmox.__diagnostics.*`).
-    crate::diagnostics::dispatch(name, args_json)
+    crate::diagnostics::dispatch(name, args)
 }
