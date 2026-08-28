@@ -21,6 +21,7 @@ pub mod cluster_roster_impl;
 pub mod containers_adapter;
 pub mod deploy;
 pub mod diagnostics;
+pub mod host_workloads;
 pub mod registration;
 pub mod responses;
 pub mod shm_trap;
