@@ -57,6 +57,9 @@ pub fn backends_json() -> String {
         unit_backend_def(unit_provider() as &dyn UnitProvider, UNIT_PREFIX),
         // QEMU guest-agent assurance — routes `proxmox.__diagnostics.*`.
         crate::diagnostics::diagnostics_backend_def(),
+        // Per-guest network mounts (unprivileged LXC `lxc.mount.entry`) — routes
+        // `proxmox.__guest_mount.*` (see [`crate::guest_mount`]).
+        crate::guest_mount::guest_mount_backend_def(),
     ];
     // Three config-backup KINDs — pve-config / vm / lxc — each routing
     // `proxmox.__backup_*.*` (see [`crate::backup`]).
@@ -98,6 +101,10 @@ pub fn backend_dispatch(
     }
     // Generic deploy-target ops (`proxmox.__deploy.{endpoint}/{kind}.*`).
     if let Some(res) = crate::deploy::dispatch(name, args.clone()) {
+        return Some(res);
+    }
+    // Per-guest network mounts (`proxmox.__guest_mount.*`).
+    if let Some(res) = crate::guest_mount::dispatch(name, args.clone()) {
         return Some(res);
     }
     // QEMU guest-agent diagnostics (`proxmox.__diagnostics.*`).

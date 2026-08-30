@@ -52,7 +52,7 @@ path = "src/main.rs"
 # stacks; `tools` (orca_tool anchors) + `db` (thin endpoint_resource CRUD over
 # db_op) + `containers` (the domain proxmox registers) + `delegated-http` are all
 # it needs. `secrets`/`serve`/`storage` are always-on. See [[plugins-stay-thin]].
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.1.9-rc.11", default-features = false, features = ["tools", "db", "containers", "delegated-http"] }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.1.9-rc.19", default-features = false, features = ["tools", "db", "containers", "delegated-http"] }
 
 # Light, genuinely-external deps the plugin's own source + generated client still
 # name at the crate root. The toolkit-build codegen (`rewrite_codegen_paths`)
@@ -91,7 +91,7 @@ indexmap  = "2"
 anyhow    = "1"
 
 [build-dependencies]
-plugin-toolkit-build = { git = "https://github.com/argyle-labs/orca", tag = "v0.1.9-rc.11" }
+plugin-toolkit-build = { git = "https://github.com/argyle-labs/orca", tag = "v0.1.9-rc.19" }
 
 # Prototype spec→orca-surface generator (build/surface.rs). Reads the emitted
 # `<flavor>_codegen.rs`, pairs each generated client method back to its spec
