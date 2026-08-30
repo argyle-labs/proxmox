@@ -2,9 +2,12 @@ name: Release
 
 # Thin caller: the whole release flow lives ONCE in the org reusable
 # argyle-labs/.github → .github/workflows/plugin-release.yml. This repo forwards
-# the manual dispatch inputs and requests BOTH host targets (glibc + musl) so the
-# plugin binary is published per host libc. See that file for version math +
-# artifact staging (plugin binary + sha256, built against orca `main`).
+# the manual dispatch inputs and inherits that workflow's DEFAULT target set
+# (x86_64 linux gnu+musl AND aarch64-apple-darwin). Darwin is required, not
+# optional: any orca host — including the arm64 Mac controller/laptop — can
+# install this plugin to drive Proxmox's native PVE API remotely, with no orca
+# on the Proxmox host at all. See that file for version math + artifact staging
+# (plugin binary + sha256, built against orca `main`).
 #   Actions → Release → Run workflow → channel (rc | stable) + bump.
 
 on:
@@ -37,4 +40,3 @@ jobs:
       channel: ${{ inputs.channel }}
       bump: ${{ inputs.bump }}
       notes: ${{ inputs.notes }}
-      targets: '["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]'
