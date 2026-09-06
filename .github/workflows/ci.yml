@@ -58,11 +58,13 @@ jobs:
       - name: Drop local-dev cargo patch
         run: rm -f .cargo/config.toml
 
-      # NOTE: no github->gitea insteadOf rewrite. The orca dep is pinned to the
-      # PUBLIC github.com/argyle-labs/orca mirror, which the runners reach
-      # directly. Rewriting to gitea.scottkey.me sends the fetch to an internal
-      # host the runner can't resolve — the failure this removes (same landmine
-      # that broke nfs CI; see the fixed nfs/.gitea workflow).
+      - name: Authenticate private orca git dependency (Gitea)
+        env:
+          ORCA_FETCH_TOKEN: ${{ secrets.ORCA_FETCH_TOKEN }}
+        run: |
+          base="${GITHUB_SERVER_URL:-https://gitea.scottkey.me}"
+          auth="${base/:\/\//://x-access-token:${ORCA_FETCH_TOKEN}@}"
+          git config --global url."${auth}/".insteadOf "https://github.com/"
 
       - name: Format check
         run: cargo fmt --all --check
