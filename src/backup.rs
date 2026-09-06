@@ -57,7 +57,7 @@ pub fn backend_defs() -> Vec<BackendDef> {
 }
 
 /// Handle a `proxmox.__backup_*` bridge call. Returns `None` for anything that
-/// isn't one of the three backup prefixes so [`crate::registration::backend_dispatch`]
+/// isn't one of the three backup prefixes so the composed `Plugin` dispatch
 /// falls through to the next handler (and ultimately the `#[orca_tool]` surface).
 pub fn dispatch(
     name: &str,

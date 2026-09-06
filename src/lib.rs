@@ -23,7 +23,6 @@ pub mod deploy;
 pub mod diagnostics;
 pub mod guest_mount;
 pub mod host_workloads;
-pub mod registration;
 pub mod responses;
 pub mod shm_trap;
 pub mod tools;

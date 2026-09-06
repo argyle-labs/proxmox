@@ -20,12 +20,25 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-  # Shared sccache → MinIO S3 on frigg (10.10.10.31). CARGO_INCREMENTAL=0 is
-  # mandatory — sccache and incremental compilation are mutually exclusive.
+  # Shared sccache → MinIO S3 (endpoint in the repo Actions variable
+  # SCCACHE_ENDPOINT — a real fleet IP, kept out of this public-mirrored file).
+  # CARGO_INCREMENTAL=0 is mandatory — sccache and incremental are mutually exclusive.
   CARGO_INCREMENTAL: "0"
+  # This crate is huge — 517 generated tool surfaces + 1261 JsonSchema types —
+  # so a full-debuginfo clippy-driver on the lib peaked past the runner's RAM
+  # and got OOM-killed (signal 9). Debuginfo is useless for fmt/clippy/test, so
+  # drop it, and cap parallel jobs so several heavy crates don't compile at once
+  # and stack their peaks. Both cut peak memory; neither changes what's checked.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  # jobs=1: the OOM is a SINGLE giant rustc process (proxmox lib / lib-test,
+  # type-checking 1261 schemars types), so serialize the build — nothing else
+  # compiles alongside it and it gets the whole runner's RAM. If this still gets
+  # signal-9'd, the crate genuinely needs more memory than the runner has and the
+  # durable fix is more RAM on the act_runner host (not a code/CI change).
+  CARGO_BUILD_JOBS: "1"
   RUSTC_WRAPPER: sccache
   SCCACHE_BUCKET: sccache
-  SCCACHE_ENDPOINT: 10.10.10.31:9000
+  SCCACHE_ENDPOINT: ${{ vars.SCCACHE_ENDPOINT }}
   SCCACHE_S3_USE_SSL: "false"
   SCCACHE_REGION: us-east-1
   AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
@@ -59,10 +72,12 @@ jobs:
         run: rm -f .cargo/config.toml
 
       - name: Authenticate private orca git dependency (Gitea)
+        env:
+          ORCA_FETCH_TOKEN: ${{ secrets.ORCA_FETCH_TOKEN }}
         run: |
-          git config --global \
-            url."https://x-access-token:${{ secrets.ORCA_FETCH_TOKEN }}@gitea.scottkey.me/".insteadOf \
-            "https://github.com/"
+          base="${GITHUB_SERVER_URL:-https://gitea.scottkey.me}"
+          auth="${base/:\/\//://x-access-token:${ORCA_FETCH_TOKEN}@}"
+          git config --global url."${auth}/".insteadOf "https://github.com/"
 
       - name: Format check
         run: cargo fmt --all --check

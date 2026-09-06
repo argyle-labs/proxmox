@@ -21,9 +21,25 @@ use crate::generated::{self, types as gtypes};
 use crate::tools::for_each_enabled_endpoint;
 use crate::{GuestKind, fetch_guest_config};
 use plugin_toolkit::contract::TopologyClaim;
-use plugin_toolkit::contract::topology::Route;
+use plugin_toolkit::contract::topology::{Route, TopologyCollector};
 use plugin_toolkit::reqwest;
 use std::net::IpAddr;
+
+/// Typed `topology` facet for the `Plugin` builder. Wraps the module's
+/// [`collect_claims`] free fn so the builder drives it over the wire via
+/// `contract::topology::dispatch_op` — no hand-written op routing.
+pub struct ProxmoxTopology;
+
+#[plugin_toolkit::async_trait::async_trait]
+impl TopologyCollector for ProxmoxTopology {
+    fn name(&self) -> &str {
+        "proxmox"
+    }
+
+    async fn collect_claims(&self) -> anyhow::Result<Vec<TopologyClaim>> {
+        collect_claims().await
+    }
+}
 
 /// Walk every registered + enabled Proxmox endpoint and return the union
 /// of TopologyClaims. Endpoints that fail are logged and skipped.
