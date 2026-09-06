@@ -29,7 +29,12 @@ env:
   # drop it, and cap parallel jobs so several heavy crates don't compile at once
   # and stack their peaks. Both cut peak memory; neither changes what's checked.
   CARGO_PROFILE_DEV_DEBUG: "0"
-  CARGO_BUILD_JOBS: "2"
+  # jobs=1: the OOM is a SINGLE giant rustc process (proxmox lib / lib-test,
+  # type-checking 1261 schemars types), so serialize the build — nothing else
+  # compiles alongside it and it gets the whole runner's RAM. If this still gets
+  # signal-9'd, the crate genuinely needs more memory than the runner has and the
+  # durable fix is more RAM on the act_runner host (not a code/CI change).
+  CARGO_BUILD_JOBS: "1"
   RUSTC_WRAPPER: sccache
   SCCACHE_BUCKET: sccache
   SCCACHE_ENDPOINT: 10.10.10.31:9000
