@@ -23,6 +23,13 @@ env:
   # Shared sccache → MinIO S3 on frigg (10.10.10.31). CARGO_INCREMENTAL=0 is
   # mandatory — sccache and incremental compilation are mutually exclusive.
   CARGO_INCREMENTAL: "0"
+  # This crate is huge — 517 generated tool surfaces + 1261 JsonSchema types —
+  # so a full-debuginfo clippy-driver on the lib peaked past the runner's RAM
+  # and got OOM-killed (signal 9). Debuginfo is useless for fmt/clippy/test, so
+  # drop it, and cap parallel jobs so several heavy crates don't compile at once
+  # and stack their peaks. Both cut peak memory; neither changes what's checked.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_BUILD_JOBS: "2"
   RUSTC_WRAPPER: sccache
   SCCACHE_BUCKET: sccache
   SCCACHE_ENDPOINT: 10.10.10.31:9000
