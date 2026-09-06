@@ -59,10 +59,12 @@ jobs:
         run: rm -f .cargo/config.toml
 
       - name: Authenticate private orca git dependency (Gitea)
+        env:
+          ORCA_FETCH_TOKEN: ${{ secrets.ORCA_FETCH_TOKEN }}
         run: |
-          git config --global \
-            url."https://x-access-token:${{ secrets.ORCA_FETCH_TOKEN }}@gitea.scottkey.me/".insteadOf \
-            "https://github.com/"
+          base="${GITHUB_SERVER_URL:-https://gitea.scottkey.me}"
+          auth="${base/:\/\//://x-access-token:${ORCA_FETCH_TOKEN}@}"
+          git config --global url."${auth}/".insteadOf "https://github.com/"
 
       - name: Format check
         run: cargo fmt --all --check

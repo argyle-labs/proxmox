@@ -7,12 +7,33 @@
 //! `warn!` — matching the resilience pattern in
 //! `tools::proxmox_cluster_list`.
 
-use plugin_toolkit::contract::{ClusterEntry, ClusterNode, ClusterRoster};
+use plugin_toolkit::contract::host_facts::HostFactsProvider;
+use plugin_toolkit::contract::{ClusterEntry, ClusterNode, ClusterRoster, HostFacts};
 use plugin_toolkit::orca_async;
 
 use crate::tools::for_each_enabled_endpoint;
 
 pub struct ProxmoxClusterRoster;
+
+/// Typed `host_facts` facet for the `Plugin` builder. Reports THIS host's
+/// corosync cluster membership (via the PVE API) for its mesh-propagated
+/// `system` snapshot. Takes the first named cluster across enabled endpoints
+/// (the fleet runs one cluster); `None` when standalone. Mirrors the
+/// `proxmox.get_facts` tool, reusing [`ProxmoxClusterRoster`].
+pub struct ProxmoxHostFacts;
+
+#[orca_async]
+impl HostFactsProvider for ProxmoxHostFacts {
+    fn name(&self) -> &str {
+        "proxmox"
+    }
+
+    async fn get_facts(&self) -> anyhow::Result<HostFacts> {
+        let clusters = ProxmoxClusterRoster.list_clusters().await?;
+        let cluster = clusters.into_iter().find_map(|c| c.name);
+        Ok(HostFacts { cluster })
+    }
+}
 
 #[orca_async]
 impl ClusterRoster for ProxmoxClusterRoster {

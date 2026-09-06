@@ -26,13 +26,35 @@ use crate::generated::{self, types as gtypes};
 use crate::tools::{for_each_enabled_endpoint, resolve_config};
 use crate::{GuestKind, fetch_guest_config, responses::GuestConfigData};
 use plugin_toolkit::abi::BackendDef;
+use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::contract::diagnostics::{
-    DIAGNOSE_OP, DiagnoseArgs, Finding, REPAIR_OP, RepairArgs, RepairOutcome, RepairSpec, Severity,
+    DIAGNOSE_OP, DiagnoseArgs, DiagnosticsProvider, Finding, REPAIR_OP, RepairArgs, RepairOutcome,
+    RepairSpec, Severity,
 };
 use plugin_toolkit::serde_json;
 
-/// Backend invoke prefix — the loader forms `{prefix}.{diagnose|repair}` and
-/// routes it here through [`crate::registration::backend_dispatch`].
+/// Typed `diagnostics` facet for the `Plugin` builder. Wraps the module's
+/// [`diagnose`]/[`repair`] free fns; the builder drives it over the wire via
+/// `contract::diagnostics::dispatch_op`.
+pub struct ProxmoxDiagnostics;
+
+impl DiagnosticsProvider for ProxmoxDiagnostics {
+    fn name(&self) -> &str {
+        PROVIDER
+    }
+
+    fn diagnose(&self, args: DiagnoseArgs) -> BoxFuture<'_, anyhow::Result<Vec<Finding>>> {
+        Box::pin(async move { Ok(diagnose(args).await) })
+    }
+
+    fn repair(&self, args: RepairArgs) -> BoxFuture<'_, anyhow::Result<RepairOutcome>> {
+        Box::pin(async move { Ok(repair(args).await) })
+    }
+}
+
+/// Backend invoke prefix used by the legacy [`dispatch`] router (still exercised
+/// by this module's tests). The live plugin routes diagnostics through the typed
+/// [`ProxmoxDiagnostics`] facet on the `Plugin` builder instead.
 pub const DIAG_PREFIX: &str = "proxmox.__diagnostics";
 const PROVIDER: &str = "proxmox";
 
