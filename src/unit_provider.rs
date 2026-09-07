@@ -765,6 +765,72 @@ impl ProxmoxUnitProvider {
         Ok((guest.vmid, guest.node))
     }
 
+    /// Resolve the guest named `name` (kind-filtered) on `endpoint` to its full
+    /// summary, or `None` when absent. The name→guest resolution the generic
+    /// deploy-target `status`/`adopt` paths share: they observe rather than
+    /// transition, so they need the whole summary (including its `status`), not
+    /// just the `(vmid, node)` [`lifecycle_by_name`](Self::lifecycle_by_name) returns.
+    pub(crate) async fn find_guest_by_name(
+        &self,
+        endpoint: &str,
+        kind: GuestKind,
+        name: &str,
+    ) -> Result<Option<GuestSummary>> {
+        let client = crate::tools::make_client(endpoint).await?;
+        Ok(guests_for_endpoint(&client, endpoint)
+            .await?
+            .into_iter()
+            .find(|g| g.name == name && g.kind == kind_str(kind)))
+    }
+
+    /// Resolve a guest by its native `vmid` (kind-filtered) on `endpoint`. The
+    /// vmid-keyed counterpart of [`find_guest_by_name`](Self::find_guest_by_name)
+    /// for `adopt`, whose native id is a PVE vmid.
+    pub(crate) async fn find_guest_by_vmid(
+        &self,
+        endpoint: &str,
+        kind: GuestKind,
+        vmid: u64,
+    ) -> Result<Option<GuestSummary>> {
+        let client = crate::tools::make_client(endpoint).await?;
+        Ok(guests_for_endpoint(&client, endpoint)
+            .await?
+            .into_iter()
+            .find(|g| g.vmid == vmid && g.kind == kind_str(kind)))
+    }
+
+    /// Destroy the guest named `name` (kind-filtered) on `endpoint`: resolve
+    /// name→`(node, vmid)` then issue the PVE destroy. Fails loudly when absent —
+    /// the retire-half of a transfer must never silently no-op. Returns the
+    /// resolved `(vmid, node)`. Mirrors [`do_delete`](Self::do_delete)'s destroy
+    /// call, keyed by name instead of a `UnitId`.
+    pub(crate) async fn destroy_by_name(
+        &self,
+        endpoint: &str,
+        kind: GuestKind,
+        name: &str,
+    ) -> Result<(u64, String)> {
+        let client = crate::tools::make_client(endpoint).await?;
+        let guest = guests_for_endpoint(&client, endpoint)
+            .await?
+            .into_iter()
+            .find(|g| g.name == name && g.kind == kind_str(kind))
+            .ok_or_else(|| anyhow!("{} named '{name}' not found on {endpoint}", kind_str(kind)))?;
+        let v = guest.vmid as i64;
+        let res = match kind {
+            GuestKind::Qemu => client
+                .delete_destroy_vm_nodes_node_qemu_vmid(&guest.node, v, None, None, None)
+                .await
+                .map(|_| ()),
+            GuestKind::Lxc => client
+                .delete_destroy_vm_nodes_node_lxc_vmid(&guest.node, v, None, None, None)
+                .await
+                .map(|_| ()),
+        };
+        res.map_err(|e| anyhow!("destroy {} {}: {e}", kind_str(kind), guest.vmid))?;
+        Ok((guest.vmid, guest.node))
+    }
+
     /// Idempotent create-or-ensure for a guest keyed by vmid. Per the `Upsert`
     /// contract an upsert succeeds whether or not the item already exists. A
     /// running VM/LXC must never be silently destroyed to "replace" it, so the
