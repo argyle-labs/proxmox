@@ -26,8 +26,8 @@
 use plugin_toolkit::abi::{BackendDef, ColumnDef, DbOp, DbRow, DbValue, TableDef};
 use plugin_toolkit::backend_def::{deploy_backend_def, schemas_json as build_schemas_json};
 use plugin_toolkit::deploy_target::{
-    DeployCapability, DeployError, DeployOutcome, DeployTarget, ProvisioningConfig,
-    ProxmoxProvisioning, Runtime, TargetKind, WorkloadSpec, dispatch_op,
+    AdoptRequest, DeployCapability, DeployError, DeployOutcome, DeployTarget, ProvisioningConfig,
+    ProxmoxProvisioning, Runtime, TargetKind, TargetStatus, WorkloadSpec, dispatch_op,
 };
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::runtime::{ToDbValue, db_op, field_from_row};
@@ -315,43 +315,17 @@ impl ProxmoxDeployTarget {
             _ => GuestKind::Lxc,
         }
     }
-}
 
-#[async_trait]
-impl DeployTarget for ProxmoxDeployTarget {
-    fn host(&self) -> &str {
-        &self.row.node
-    }
-    fn runtime(&self) -> Runtime {
-        self.runtime
-    }
-    fn kind(&self) -> TargetKind {
-        TargetKind::Proxmox
-    }
-    fn capabilities(&self) -> Vec<DeployCapability> {
-        vec![
-            DeployCapability::Launch,
-            DeployCapability::Stop,
-            DeployCapability::Restart,
-        ]
-    }
-    fn endpoint(&self) -> String {
-        format!(
-            "proxmox:{}/{}/{}",
-            self.row.endpoint, self.row.node, self.row.kind
-        )
-    }
-    fn provisioning(&self) -> Option<ProvisioningConfig> {
-        Some(ProvisioningConfig::Proxmox(ProxmoxProvisioning {
-            node: self.row.node.clone(),
-            endpoint: self.row.endpoint.clone(),
-            storage: self.row.storage.clone(),
-            cores: self.row.cores,
-            memory_mb: self.row.memory_mb,
-        }))
-    }
-
-    async fn launch(&self, spec: &WorkloadSpec) -> std::result::Result<DeployOutcome, DeployError> {
+    /// Materialize the guest from `spec` fused with this target's placement +
+    /// sizing. Shared by [`launch`](DeployTarget::launch) and
+    /// [`provision`](DeployTarget::provision): both create the PVE guest through
+    /// the one `unit` provision path — `provision` names the create explicitly
+    /// (the transfer engine's create-half), `launch` keeps its historical
+    /// create-on-launch behavior. One implementation, two verbs.
+    async fn create_guest(
+        &self,
+        spec: &WorkloadSpec,
+    ) -> std::result::Result<DeployOutcome, DeployError> {
         // Fields a PVE guest has no generic mapping for — reject, never drop.
         if !spec.env.is_empty() {
             return Err(DeployError::Other(
@@ -417,6 +391,139 @@ impl DeployTarget for ProxmoxDeployTarget {
             id: Some(resp.vmid.to_string()),
             state: Some("provisioned".to_string()),
             detail: resp.upid,
+        })
+    }
+}
+
+#[async_trait]
+impl DeployTarget for ProxmoxDeployTarget {
+    fn host(&self) -> &str {
+        &self.row.node
+    }
+    fn runtime(&self) -> Runtime {
+        self.runtime
+    }
+    fn kind(&self) -> TargetKind {
+        TargetKind::Proxmox
+    }
+    fn capabilities(&self) -> Vec<DeployCapability> {
+        vec![
+            DeployCapability::Launch,
+            DeployCapability::Stop,
+            DeployCapability::Restart,
+            // Lifecycle primitives (#418): a Proxmox guest can be created,
+            // torn down, adopted, and observed — the full transfer surface.
+            DeployCapability::Provision,
+            DeployCapability::Destroy,
+            DeployCapability::Adopt,
+            DeployCapability::Status,
+        ]
+    }
+    fn endpoint(&self) -> String {
+        format!(
+            "proxmox:{}/{}/{}",
+            self.row.endpoint, self.row.node, self.row.kind
+        )
+    }
+    fn provisioning(&self) -> Option<ProvisioningConfig> {
+        Some(ProvisioningConfig::Proxmox(ProxmoxProvisioning {
+            node: self.row.node.clone(),
+            endpoint: self.row.endpoint.clone(),
+            storage: self.row.storage.clone(),
+            cores: self.row.cores,
+            memory_mb: self.row.memory_mb,
+        }))
+    }
+
+    async fn launch(&self, spec: &WorkloadSpec) -> std::result::Result<DeployOutcome, DeployError> {
+        self.create_guest(spec).await
+    }
+
+    /// The transfer engine's explicit create-half: materialize a new guest from
+    /// the spec + this target's placement/sizing. Same path as `launch`.
+    async fn provision(
+        &self,
+        spec: &WorkloadSpec,
+    ) -> std::result::Result<DeployOutcome, DeployError> {
+        self.create_guest(spec).await
+    }
+
+    /// Tear the named guest down (`pct`/`qm destroy`). The retire-half of a
+    /// transfer — run against the source once the destination verifies healthy.
+    async fn destroy(&self, workload: &str) -> std::result::Result<DeployOutcome, DeployError> {
+        let (vmid, node) = ProxmoxUnitProvider::new()
+            .destroy_by_name(&self.row.endpoint, self.guest_kind(), workload)
+            .await
+            .map_err(|e| DeployError::Other(e.to_string()))?;
+        Ok(DeployOutcome {
+            workload: workload.to_string(),
+            id: Some(vmid.to_string()),
+            state: Some("destroyed".to_string()),
+            detail: Some(format!("on {node}")),
+        })
+    }
+
+    /// Bring an existing, orca-unmanaged guest under management. `native_id` is a
+    /// PVE vmid; it falls back to a guest name so an operator can adopt by either
+    /// handle. Observe-only — the `(endpoint, kind)` target row already encodes
+    /// placement, so adoption resolves the live guest and reports it as managed,
+    /// never recreating it. Idempotent. This is how `freyr`/`baldur` are picked up.
+    async fn adopt(&self, req: &AdoptRequest) -> std::result::Result<DeployOutcome, DeployError> {
+        let provider = ProxmoxUnitProvider::new();
+        let kind = self.guest_kind();
+        let found = match req.native_id.parse::<u64>() {
+            Ok(vmid) => {
+                provider
+                    .find_guest_by_vmid(&self.row.endpoint, kind, vmid)
+                    .await
+            }
+            Err(_) => {
+                provider
+                    .find_guest_by_name(&self.row.endpoint, kind, &req.native_id)
+                    .await
+            }
+        }
+        .map_err(|e| DeployError::Other(e.to_string()))?;
+        let g = found.ok_or_else(|| {
+            DeployError::NotFound(format!(
+                "no {} '{}' on {} to adopt",
+                self.row.kind, req.native_id, self.row.endpoint
+            ))
+        })?;
+        Ok(DeployOutcome {
+            workload: req.name.clone().unwrap_or_else(|| g.name.clone()),
+            id: Some(g.vmid.to_string()),
+            state: g.status.clone().or_else(|| Some("adopted".to_string())),
+            detail: Some(format!(
+                "adopted {} {} on {}",
+                self.row.kind, g.vmid, g.node
+            )),
+        })
+    }
+
+    /// Observe the named guest's lifecycle state without mutating it. The
+    /// transfer engine's verify-half polls this against the destination before
+    /// retiring the source. Reports `exists: false` when no such guest is found.
+    async fn status(&self, workload: &str) -> std::result::Result<TargetStatus, DeployError> {
+        let found = ProxmoxUnitProvider::new()
+            .find_guest_by_name(&self.row.endpoint, self.guest_kind(), workload)
+            .await
+            .map_err(|e| DeployError::Other(e.to_string()))?;
+        Ok(match found {
+            Some(g) => TargetStatus {
+                workload: workload.to_string(),
+                id: Some(g.vmid.to_string()),
+                exists: true,
+                state: g.status.clone().unwrap_or_else(|| "unknown".to_string()),
+                detail: Some(format!("on {}", g.node)),
+            },
+            None => TargetStatus {
+                workload: workload.to_string(),
+                id: None,
+                exists: false,
+                state: "absent".to_string(),
+                detail: None,
+            },
         })
     }
 
@@ -521,4 +628,59 @@ pub fn dispatch(
 /// A backend-ABI error value (message-only errors are a plain JSON string).
 fn err_val(msg: impl Into<String>) -> plugin_toolkit::serde_json::Value {
     plugin_toolkit::serde_json::Value::String(msg.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(kind: &str) -> DeployTargetRow {
+        DeployTargetRow {
+            endpoint: "pve".into(),
+            kind: kind.into(),
+            node: "node-a".into(),
+            storage: "local-zfs".into(),
+            cores: 2,
+            memory_mb: 24_576,
+        }
+    }
+
+    #[test]
+    fn advertises_full_lifecycle_surface() {
+        // With slice-2 a Proxmox guest advertises the whole transfer surface:
+        // the original launch/stop/restart PLUS provision/destroy/adopt/status.
+        let t = ProxmoxDeployTarget::from_row(row("lxc")).expect("lxc row parses");
+        let caps = t.capabilities();
+        for c in [
+            DeployCapability::Launch,
+            DeployCapability::Stop,
+            DeployCapability::Restart,
+            DeployCapability::Provision,
+            DeployCapability::Destroy,
+            DeployCapability::Adopt,
+            DeployCapability::Status,
+        ] {
+            assert!(t.supports(c), "expected capability {c:?} advertised");
+            assert!(caps.contains(&c));
+        }
+    }
+
+    #[test]
+    fn from_row_maps_kind_to_runtime() {
+        assert_eq!(
+            ProxmoxDeployTarget::from_row(row("lxc")).unwrap().runtime(),
+            Runtime::Lxc
+        );
+        assert_eq!(
+            ProxmoxDeployTarget::from_row(row("vm")).unwrap().runtime(),
+            Runtime::Vm
+        );
+        assert_eq!(
+            ProxmoxDeployTarget::from_row(row("qemu"))
+                .unwrap()
+                .runtime(),
+            Runtime::Vm
+        );
+        assert!(ProxmoxDeployTarget::from_row(row("toaster")).is_err());
+    }
 }
