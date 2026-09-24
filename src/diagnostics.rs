@@ -149,6 +149,10 @@ pub async fn diagnose(args: DiagnoseArgs) -> Vec<Finding> {
     // Node-local: scans /proc for non-hypervisor workloads running on the host
     // itself (the PVE API exposes no process list). Empty off a PVE node.
     findings.extend(diagnose_host_workloads());
+    // Cluster-wide: memory/vCPU committed to running guests vs what each node
+    // physically has. Nothing else warns about over-allocation until a spike
+    // OOM-kills something.
+    findings.extend(crate::overallocation::diagnose_overallocation().await);
     findings
 }
 
