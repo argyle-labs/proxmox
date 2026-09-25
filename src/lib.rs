@@ -24,6 +24,7 @@ pub mod diagnostics;
 pub mod guest_exec;
 pub mod guest_mount;
 pub mod host_workloads;
+pub mod mount_scan;
 pub mod overallocation;
 pub mod responses;
 pub mod shm_trap;

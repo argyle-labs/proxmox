@@ -153,7 +153,101 @@ pub async fn diagnose(args: DiagnoseArgs) -> Vec<Finding> {
     // physically has. Nothing else warns about over-allocation until a spike
     // OOM-kills something.
     findings.extend(crate::overallocation::diagnose_overallocation().await);
+    // Node-local: reads the `mp` entries in /etc/pve/lxc/*.conf and compares each
+    // bind-mount source against the node root's device. Empty off a PVE node.
+    findings.extend(diagnose_guest_mounts());
     findings
+}
+
+/// Node-local sweep: classify every LXC mountpoint through orca's
+/// [`plugin_toolkit::mount_audit`].
+///
+/// The split is deliberate — this plugin gathers the FACTS (the `mp` lines, and a
+/// `stat` comparing each bind source's device to `/`), orca owns the JUDGEMENT
+/// (that an uncapped bind mount sharing a filesystem with the node root means a
+/// guest can fill the hypervisor). Keeping the severity rules in orca stops every
+/// plugin reimplementing them and drifting apart.
+///
+/// The root device is stat'ed ONCE per sweep rather than per mount. Empty off a
+/// PVE node, where /etc/pve/lxc does not exist.
+fn diagnose_guest_mounts() -> Vec<Finding> {
+    let dir = std::path::Path::new("/etc/pve/lxc");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new(); // not a PVE node
+    };
+    let node = local_node();
+    let root_dev = crate::mount_scan::root_device();
+    let mut findings = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("conf") {
+            continue;
+        }
+        let Some(vmid) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let Ok(conf) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let name = ct_name(&conf).unwrap_or_else(|| format!("ct-{vmid}"));
+        let specs = crate::mount_scan::specs_for_guest(vmid, &conf, root_dev);
+        for f in plugin_toolkit::mount_audit::audit(&specs) {
+            findings.push(finding_guest_mount(&node, vmid, &name, &f));
+        }
+    }
+    findings
+}
+
+/// Render one [`plugin_toolkit::mount_audit::MountFinding`] as a PVE finding.
+///
+/// Severity comes from the risk orca assigned, not from a local guess: filling
+/// the node root takes down every guest on it, where filling a dedicated
+/// filesystem takes down one workload.
+fn finding_guest_mount(
+    node: &str,
+    vmid: u64,
+    name: &str,
+    f: &plugin_toolkit::mount_audit::MountFinding,
+) -> Finding {
+    use plugin_toolkit::mount_audit::Risk;
+    let severity = match f.risk {
+        Risk::UnboundedOnHostRootFs => Severity::Crit,
+        Risk::UnboundedScratch => Severity::Warn,
+        Risk::UnusedProvisioned => Severity::Info,
+    };
+    let headline = match f.risk {
+        Risk::UnboundedOnHostRootFs => format!(
+            "CT {vmid} ('{name}') can fill PVE node '{node}' — uncapped bind mount on the node root"
+        ),
+        Risk::UnboundedScratch => {
+            format!("CT {vmid} ('{name}') has an uncapped bind mount")
+        }
+        Risk::UnusedProvisioned => {
+            format!("CT {vmid} ('{name}') has a provisioned mount nothing uses")
+        }
+    };
+    Finding {
+        id: format!("guest-mount::{node}::{}", f.id),
+        provider: PROVIDER.to_string(),
+        severity,
+        title: headline,
+        detail: format!(
+            "{}\n\nNode '{node}', CT {vmid} ('{name}'). A bind mount cannot be quota'd by the \
+             hypervisor, so the only way to bound it is to move the source onto a dedicated \
+             volume (`pct set {vmid} -mpN <storage>:<size>,mp=<target>`) or to cap the writer. \
+             Note that a scratch directory measures 0 bytes at rest, so a level-based check \
+             never sees this — only the configuration does.",
+            f.detail
+        ),
+        // No automatic repair: replacing a mountpoint rewrites the CT config and
+        // needs a restart, and choosing the replacement storage + size is an
+        // operator decision orca must not make unattended.
+        repair: None,
+    }
 }
 
 /// Node-local sweep: flag any non-hypervisor workload (e.g. `minio`,
