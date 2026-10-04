@@ -18,3 +18,4 @@ jobs:
     with:
       build-jobs: '1'
       debuginfo: '0'
+      runs-on: ci-large
