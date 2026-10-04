@@ -1,93 +1,19 @@
 name: CI
 
-# Inlined plugin CI gate: test + lint ONLY (no binary builds — those live in
-# release.yml). Previously this delegated to the org reusable
-# argyle-labs/.github → plugin-ci.yml via a job-level `uses:`. Forgejo renders a
-# reusable-workflow call as TWO status rows (the wrapper `ci` job + the reusable
-# `test` job), which reads as "CI running twice" even though cargo runs once.
-# Inlining the steps here yields a SINGLE required check. Keep in sync with the
-# org reusable if that ever changes (the steps are a verbatim copy).
-
 on:
   pull_request:
     branches: [main]
-  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-  # Shared sccache → MinIO S3 (endpoint in the repo Actions variable
-  # SCCACHE_ENDPOINT — a real fleet IP, kept out of this public-mirrored file).
-  # CARGO_INCREMENTAL=0 is mandatory — sccache and incremental are mutually exclusive.
-  CARGO_INCREMENTAL: "0"
-  # This crate is huge — 517 generated tool surfaces + 1261 JsonSchema types —
-  # so a full-debuginfo clippy-driver on the lib peaked past the runner's RAM
-  # and got OOM-killed (signal 9). Debuginfo is useless for fmt/clippy/test, so
-  # drop it, and cap parallel jobs so several heavy crates don't compile at once
-  # and stack their peaks. Both cut peak memory; neither changes what's checked.
-  CARGO_PROFILE_DEV_DEBUG: "0"
-  # jobs=1: the OOM is a SINGLE giant rustc process (proxmox lib / lib-test,
-  # type-checking 1261 schemars types), so serialize the build — nothing else
-  # compiles alongside it and it gets the whole runner's RAM. If this still gets
-  # signal-9'd, the crate genuinely needs more memory than the runner has and the
-  # durable fix is more RAM on the act_runner host (not a code/CI change).
-  CARGO_BUILD_JOBS: "1"
-  RUSTC_WRAPPER: sccache
-  SCCACHE_BUCKET: sccache
-  SCCACHE_ENDPOINT: ${{ vars.SCCACHE_ENDPOINT }}
-  SCCACHE_S3_USE_SSL: "false"
-  SCCACHE_REGION: us-east-1
-  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
-
 jobs:
-  # Unit/integration tests + lint. The single required check.
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: test
-
-      - name: Install sccache
-        run: |
-          set -euo pipefail
-          ver=v0.8.2
-          curl -fsSL "https://github.com/mozilla/sccache/releases/download/${ver}/sccache-${ver}-x86_64-unknown-linux-musl.tar.gz" \
-            | tar -xz --strip-components=1 -C /usr/local/bin --wildcards '*/sccache'
-          chmod +x /usr/local/bin/sccache
-          sccache --version
-
-      - name: Drop local-dev cargo patch
-        run: rm -f .cargo/config.toml
-
-      - name: Authenticate private orca git dependency (Gitea)
-        env:
-          ORCA_FETCH_TOKEN: ${{ secrets.ORCA_FETCH_TOKEN }}
-        run: |
-          base="${GITHUB_SERVER_URL:-https://gitea.scottkey.me}"
-          auth="${base/:\/\//://x-access-token:${ORCA_FETCH_TOKEN}@}"
-          git config --global url."${auth}/".insteadOf "https://github.com/"
-
-      - name: Format check
-        run: cargo fmt --all --check
-
-      - name: Clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-
-      - name: Test
-        run: cargo test --locked --all-features --workspace
-
-      - name: sccache stats
-        if: always()
-        run: sccache --show-stats
+  ci:
+    uses: argyle-labs/.github/.github/workflows/plugin-ci.yml@main
+    secrets: inherit
+    # One giant rustc (517 generated tool surfaces + 1261 JsonSchema types) OOMs
+    # the runner unless the build is serialized and debuginfo dropped.
+    with:
+      build-jobs: '1'
+      debuginfo: '0'
