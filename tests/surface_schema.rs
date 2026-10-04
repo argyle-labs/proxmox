@@ -66,29 +66,57 @@ fn every_tool_has_unique_name() {
     eprintln!("proxmox tools registered: {}", tools.len());
 }
 
+/// Fan-out verbs that default to every enabled endpoint when `endpoint` is
+/// omitted. Any other tool advertising an optional endpoint is a mistake.
+const OPTIONAL_ENDPOINT: &[&str] = &["proxmox.thin.audit"];
+
+/// Hand-written tools whose names collide with the generated verb prefixes.
+const HAND_WRITTEN_PREFIXED: &[&str] = &["proxmox.get_facts"];
+
+fn is_generated_verb(name: &str) -> bool {
+    !HAND_WRITTEN_PREFIXED.contains(&name)
+        && name.strip_prefix("proxmox.").is_some_and(|v| {
+            ["get_", "post_", "put_", "delete_"]
+                .iter()
+                .any(|p| v.starts_with(p))
+        })
+}
+
 #[test]
 fn every_tool_input_schema_takes_endpoint() {
+    let mut generated = 0;
     for t in proxmox_tools() {
         let name = t["name"].as_str().unwrap();
         let input = &t["input_schema"];
         assert!(input.is_object(), "{name}: input_schema not an object");
-        // Every surface wrapper carries `endpoint: String`; endpoint-CRUD tools
-        // (list/detail/…) may not, so only assert on the generated surface verbs.
         let props = input.get("properties").and_then(|p| p.as_object());
-        if let Some(props) = props {
-            // If it has an endpoint field, it must be a string. An optional one
-            // (fan-out verbs default to every enabled endpoint) is `["string","null"]`.
-            if let Some(ep) = props.get("endpoint") {
-                let ty = &ep["type"];
-                let is_string = ty == "string"
-                    || ty.as_array().is_some_and(|a| {
-                        a.iter().any(|v| v == "string")
-                            && a.iter().all(|v| v == "string" || v == "null")
-                    });
-                assert!(is_string, "{name}: endpoint field is not a string: {ty}");
+        let required = input
+            .get("required")
+            .and_then(|r| r.as_array())
+            .is_some_and(|r| r.iter().any(|v| v == "endpoint"));
+        if is_generated_verb(name) {
+            generated += 1;
+            assert!(required, "{name}: generated verb does not require endpoint");
+        }
+        if let Some(ep) = props.and_then(|p| p.get("endpoint")) {
+            let ty = &ep["type"];
+            let nullable = ty.as_array().is_some_and(|a| {
+                a.iter().any(|v| v == "string") && a.iter().all(|v| v == "string" || v == "null")
+            });
+            if OPTIONAL_ENDPOINT.contains(&name) {
+                assert!(
+                    nullable && !required,
+                    "{name}: endpoint should be optional: {ty}"
+                );
+            } else {
+                assert!(
+                    ty == "string",
+                    "{name}: endpoint must be a plain string: {ty}"
+                );
             }
         }
     }
+    assert!(generated > 0, "no generated verbs matched");
 }
 
 #[test]
@@ -138,4 +166,78 @@ fn is_execute_gated(name: &str) -> bool {
 fn thin_audit_reads_and_enable_discard_is_dry_run_by_default() {
     assert!(!is_execute_gated("proxmox.thin.audit"));
     assert!(is_execute_gated("proxmox.thin.enable_discard"));
+}
+
+/// Hand-written reads plan nothing, so they must run without `execute` and be
+/// callable below admin.
+#[test]
+fn hand_written_reads_are_not_execute_gated() {
+    for name in [
+        "proxmox.nodes",
+        "proxmox.node_detail",
+        "proxmox.deploy_target_list",
+        "proxmox.host_logs",
+        "proxmox.cluster_status",
+        "proxmox.cluster_list",
+        "proxmox.list_clusters",
+        "proxmox.collect_claims",
+        "proxmox.get_facts",
+    ] {
+        assert!(!is_execute_gated(name), "{name} is execute-gated");
+        assert_eq!(
+            plugin_toolkit::dispatch::required_role(name),
+            Some("read"),
+            "{name}"
+        );
+    }
+}
+
+fn test_ctx() -> plugin_toolkit::contract::ToolCtx {
+    use plugin_toolkit::contract::config::{Config, Model, Ports};
+    let dir = std::env::temp_dir().join(format!("proxmox-surface-{}", std::process::id()));
+    plugin_toolkit::contract::ToolCtx::new(std::sync::Arc::new(Config {
+        anthropic_api_key: None,
+        lmstudio_url: String::new(),
+        ollama_url: String::new(),
+        default_model: Model::LMStudio {
+            id: String::new(),
+            url: String::new(),
+        },
+        app_dir: dir.clone(),
+        memory_root: dir.clone(),
+        db_path: dir.join("test.db"),
+        ports: Ports::default(),
+    }))
+}
+
+/// Without `execute` the gate answers with a plan before the verb body runs, so
+/// no capability (HTTP, secrets, db) is ever reached.
+#[test]
+fn enable_discard_dispatch_without_execute_returns_a_plan() {
+    let args = serde_json::json!({
+        "endpoint": "pve",
+        "node": "hyp1",
+        "ctid": 101,
+    });
+    let out = plugin_toolkit::capsink::with_cap_sink(
+        Box::new(|cap: &str, raw: &str| panic!("dry run reached capability {cap}: {raw}")),
+        || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(plugin_toolkit::dispatch::dispatch(
+                    "proxmox.thin.enable_discard",
+                    args,
+                    &test_ctx(),
+                ))
+        },
+    )
+    .expect("a dry run is not an error");
+    assert_eq!(out["dryRun"], serde_json::json!(true), "{out}");
+    assert_eq!(
+        out["tool"],
+        serde_json::json!("proxmox.thin.enable_discard")
+    );
+    assert_eq!(out["inputs"]["ctid"], serde_json::json!(101));
 }

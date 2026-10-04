@@ -3,6 +3,7 @@ name: CI
 on:
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -12,8 +13,8 @@ jobs:
   ci:
     uses: argyle-labs/.github/.github/workflows/plugin-ci.yml@main
     secrets: inherit
-    # One giant rustc (517 generated tool surfaces + 1261 JsonSchema types) OOMs
-    # the runner unless the build is serialized and debuginfo dropped.
+    # The generated client and tool surface compile as one giant rustc that
+    # OOMs the runner unless the build is serialized and debuginfo dropped.
     with:
       build-jobs: '1'
       debuginfo: '0'
