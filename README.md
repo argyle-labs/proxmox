@@ -64,6 +64,8 @@ Every VM and LXC across every enabled endpoint is a **unit** (`kind = vm` or `lx
 | `proxmox.action` | lifecycle action (`start`/`stop`/`shutdown`/`reboot`) on a VM or LXC *(role: admin)* |
 | `proxmox.host_logs` | fetch a node's systemd journal over HTTPS (mirrors `journalctl`) |
 | `proxmox.access_bootstrap` | mint/rotate a least-privilege `orca@pve!orca` token via the PVE `/access` API + store it in the secrets domain (see [docs/tokens.md](docs/tokens.md)) |
+| `proxmox.thin.audit` | per guest disk on LVM-thin storage: discard active / staged for next start / missing (with the exact value the fix writes), and thin allocation vs in-guest usage for running LXC root filesystems |
+| `proxmox.thin.enable_discard` | set `mountoptions=discard` (LXC) / `discard=on` (VM disk) on a guest's thin disks *(role: admin; dry-run unless `execute: true`; staged until the guest's next start)* |
 
 > `proxmox.action` overlaps with the unit `update` verb — both power-manage a guest. Use the unit surface for orca-managed fleet lifecycle; `proxmox.action` is the direct tool form.
 
@@ -78,6 +80,7 @@ The plugin authenticates with a PVE API token. [docs/tokens.md](docs/tokens.md) 
 - `src/lib.rs` — config, error types, PVE fetch helpers.
 - `src/tools.rs` — endpoint registry (`endpoint_resource!`) + node/cluster inspection + `proxmox.action` + `host_logs`.
 - `src/access.rs` — `proxmox.access_bootstrap`: least-privilege identity via the `/access` REST API.
+- `src/thin_discard.rs` — `proxmox.thin.{audit,enable_discard}`: LVM-thin discard drift + allocation divergence.
 - `src/unit_provider.rs` — the five-verb `vm` + `lxc` surface.
 - `src/registration.rs`, `src/cluster_roster_impl.rs`, `src/topology.rs` — the three domain-backend registrations + impls.
 - `specs/`, `spec-tools/`, `examples/pve_to_openapi.rs` — convert Proxmox's `apidoc.js` into the vendored OpenAPI spec (`build.rs` codegens the typed client).

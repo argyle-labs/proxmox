@@ -76,13 +76,16 @@ fn every_tool_input_schema_takes_endpoint() {
         // (list/detail/…) may not, so only assert on the generated surface verbs.
         let props = input.get("properties").and_then(|p| p.as_object());
         if let Some(props) = props {
-            // If it has an endpoint field, it must be a string.
+            // If it has an endpoint field, it must be a string. An optional one
+            // (fan-out verbs default to every enabled endpoint) is `["string","null"]`.
             if let Some(ep) = props.get("endpoint") {
-                assert_eq!(
-                    ep.get("type").and_then(|v| v.as_str()),
-                    Some("string"),
-                    "{name}: endpoint field is not a string"
-                );
+                let ty = &ep["type"];
+                let is_string = ty == "string"
+                    || ty.as_array().is_some_and(|a| {
+                        a.iter().any(|v| v == "string")
+                            && a.iter().all(|v| v == "string" || v == "null")
+                    });
+                assert!(is_string, "{name}: endpoint field is not a string: {ty}");
             }
         }
     }
@@ -118,4 +121,21 @@ fn resolve_ref(schema: &Value, root: &Value) -> Value {
         return def.clone();
     }
     schema.clone()
+}
+
+/// Gate presence is read off the advertised input schema: the central execute
+/// gate injects `execute` into every gated verb.
+fn is_execute_gated(name: &str) -> bool {
+    proxmox_tools()
+        .into_iter()
+        .find(|t| t["name"] == name)
+        .unwrap_or_else(|| panic!("{name} not registered"))["input_schema"]["properties"]
+        .get("execute")
+        .is_some()
+}
+
+#[test]
+fn thin_audit_reads_and_enable_discard_is_dry_run_by_default() {
+    assert!(!is_execute_gated("proxmox.thin.audit"));
+    assert!(is_execute_gated("proxmox.thin.enable_discard"));
 }
