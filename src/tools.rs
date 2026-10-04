@@ -95,48 +95,90 @@ pub(crate) async fn make_client(name: &str) -> Result<generated::Client> {
     Ok(resolve_config(name).await?.build_generated_client()?)
 }
 
+/// An enabled endpoint the fan-out could not read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct EndpointFailure {
+    /// `None` when the endpoint registry itself could not be listed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    pub error: String,
+}
+
+/// Flattened results of a fan-out plus every endpoint that failed.
+pub(crate) struct FanOut<T> {
+    pub items: Vec<T>,
+    pub failures: Vec<EndpointFailure>,
+    /// Enabled endpoints the fan-out tried, failed or not.
+    pub attempted: usize,
+}
+
 /// Fan an async operation out across every **enabled** endpoint, resolving each
 /// endpoint's [`Config`] through [`resolve_config`] (reachable address +
 /// secure-first token) and flattening the per-endpoint results. A failing
 /// endpoint — whether the resolve or `work` itself errors — is logged with
-/// `warn!` and skipped: one flaky host must never blank the fleet-wide view.
-/// This is the single home for that resilient fan-out; `cluster_list`, the
-/// cluster-roster + topology backends, and the unit provider all route through
-/// it instead of re-copying the list/enabled/resolve/warn loop.
+/// `warn!`, recorded in [`FanOut::failures`], and skipped: one flaky host must
+/// never blank the fleet-wide view.
 ///
 /// `work` receives a ready `Config` (call `build_generated_client()` for the
 /// typed client, or `build_reqwest_client()` for the raw path) plus the
 /// endpoint row. `op` is a short label for the log lines.
-pub(crate) async fn for_each_enabled_endpoint<T, F, Fut>(op: &str, work: F) -> Vec<T>
+pub(crate) async fn fan_out_enabled_endpoints<T, F, Fut>(op: &str, work: F) -> FanOut<T>
 where
     F: Fn(Config, ProxmoxEndpoint) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<T>>>,
 {
+    let mut out = FanOut {
+        items: Vec::new(),
+        failures: Vec::new(),
+        attempted: 0,
+    };
     let endpoints = match endpoint_db::list() {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(op, error = %e, "proxmox fan-out: endpoint list failed");
-            return Vec::new();
+            out.failures.push(EndpointFailure {
+                endpoint: None,
+                error: format!("endpoint list: {e:#}"),
+            });
+            return out;
         }
     };
-    let mut out = Vec::new();
     for ep in endpoints.into_iter().filter(|e| e.enabled) {
+        out.attempted += 1;
         let name = ep.name.clone();
         let cfg = match resolve_config(&name).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(op, endpoint = %name, error = %e, "proxmox fan-out: endpoint resolve failed");
+                out.failures.push(EndpointFailure {
+                    endpoint: Some(name),
+                    error: format!("resolve: {e:#}"),
+                });
                 continue;
             }
         };
         match work(cfg, ep).await {
-            Ok(items) => out.extend(items),
+            Ok(items) => out.items.extend(items),
             Err(e) => {
-                tracing::warn!(op, endpoint = %name, error = %e, "proxmox fan-out: op failed")
+                tracing::warn!(op, endpoint = %name, error = %e, "proxmox fan-out: op failed");
+                out.failures.push(EndpointFailure {
+                    endpoint: Some(name),
+                    error: format!("{e:#}"),
+                });
             }
         }
     }
     out
+}
+
+/// [`fan_out_enabled_endpoints`] for callers that only want the results; the
+/// failures are already logged.
+pub(crate) async fn for_each_enabled_endpoint<T, F, Fut>(op: &str, work: F) -> Vec<T>
+where
+    F: Fn(Config, ProxmoxEndpoint) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<T>>>,
+{
+    fan_out_enabled_endpoints(op, work).await.items
 }
 
 /// Resolve an endpoint's token secret secure-first: prefer the abstract secrets
@@ -196,7 +238,12 @@ pub struct ProxmoxNodeRow {
 }
 
 /// List Proxmox cluster nodes for a registered endpoint.
-#[orca_tool(domain = "proxmox", verb = "nodes")]
+#[orca_tool(
+    domain = "proxmox",
+    verb = "nodes",
+    execute_gated = false,
+    role = "read"
+)]
 async fn proxmox_nodes(args: ProxmoxNodesArgs, _ctx: &ToolCtx) -> Result<Vec<ProxmoxNodeRow>> {
     let client = make_client(&args.endpoint).await?;
     let items = client
@@ -247,7 +294,12 @@ pub struct ProxmoxNodeDetailOutput {
 }
 
 /// List VMs + containers on one node of a registered Proxmox endpoint.
-#[orca_tool(domain = "proxmox", verb = "node_detail")]
+#[orca_tool(
+    domain = "proxmox",
+    verb = "node_detail",
+    execute_gated = false,
+    role = "read"
+)]
 async fn proxmox_node_detail(
     args: ProxmoxNodeDetailArgs,
     _ctx: &ToolCtx,
@@ -427,7 +479,12 @@ pub struct ProxmoxHostLogsArgs {
 /// Pull the systemd journal for one Proxmox node. Mirrors `journalctl`
 /// over the HTTPS API — no SSH, no on-host shell. Used by operators
 /// today and by the LXC breaker once the API adapter takes over.
-#[orca_tool(domain = "proxmox", verb = "host_logs")]
+#[orca_tool(
+    domain = "proxmox",
+    verb = "host_logs",
+    execute_gated = false,
+    role = "read"
+)]
 async fn proxmox_host_logs(
     args: ProxmoxHostLogsArgs,
     _ctx: &ToolCtx,
@@ -498,7 +555,12 @@ pub struct ProxmoxClusterStatusArgs {
 
 /// Report cluster name, quorum, and node membership for one registered
 /// Proxmox endpoint. Returns `name: null` for standalone hosts.
-#[orca_tool(domain = "proxmox", verb = "cluster_status")]
+#[orca_tool(
+    domain = "proxmox",
+    verb = "cluster_status",
+    execute_gated = false,
+    role = "read"
+)]
 async fn proxmox_cluster_status(
     args: ProxmoxClusterStatusArgs,
     _ctx: &ToolCtx,
@@ -521,7 +583,12 @@ pub struct ProxmoxClusterListEntry {
 /// Endpoints that fail to fetch are skipped with a `warn!` log, mirroring
 /// the resilience pattern used by `topology::collect_claims` — a single
 /// flaky endpoint must not blank the fleet view.
-#[orca_tool(domain = "proxmox", verb = "cluster_list")]
+#[orca_tool(
+    domain = "proxmox",
+    verb = "cluster_list",
+    execute_gated = false,
+    role = "read"
+)]
 async fn proxmox_cluster_list(
     _args: ProxmoxClusterListArgs,
     _ctx: &ToolCtx,
@@ -555,7 +622,12 @@ pub struct ProxmoxListClustersArgs {}
 /// cluster into the plugin-neutral `ClusterEntry` shape `AggregateClusterRoster`
 /// concatenates. Reuses `ProxmoxClusterRoster` so the roster logic lives in one
 /// place.
-#[orca_tool(domain = "proxmox", verb = "list_clusters")]
+#[orca_tool(
+    domain = "proxmox",
+    verb = "list_clusters",
+    execute_gated = false,
+    role = "read"
+)]
 async fn proxmox_list_clusters(
     _args: ProxmoxListClustersArgs,
     _ctx: &ToolCtx,
@@ -572,7 +644,12 @@ pub struct ProxmoxCollectClaimsArgs {}
 /// Topology-collector backend op. Walks every enabled endpoint's guests and
 /// emits a `TopologyClaim` per VM/container, which orca's inference layer
 /// matches by MAC to nest guests under their host.
-#[orca_tool(domain = "proxmox", verb = "collect_claims")]
+#[orca_tool(
+    domain = "proxmox",
+    verb = "collect_claims",
+    execute_gated = false,
+    role = "read"
+)]
 async fn proxmox_collect_claims(
     _args: ProxmoxCollectClaimsArgs,
     _ctx: &ToolCtx,
@@ -589,7 +666,12 @@ pub struct ProxmoxGetFactsArgs {}
 /// vantage group PVE peers by cluster without the proxmox plugin loaded there.
 /// Takes the first cluster with a name across enabled endpoints (the fleet runs
 /// one cluster); `None` when standalone.
-#[orca_tool(domain = "proxmox", verb = "get_facts")]
+#[orca_tool(
+    domain = "proxmox",
+    verb = "get_facts",
+    execute_gated = false,
+    role = "read"
+)]
 async fn proxmox_get_facts(
     _args: ProxmoxGetFactsArgs,
     _ctx: &ToolCtx,

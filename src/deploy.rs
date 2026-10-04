@@ -251,7 +251,12 @@ pub struct DeployTargetListResult {
 }
 
 /// List every configured Proxmox deploy target.
-#[orca_tool(domain = "proxmox", verb = "deploy_target_list")]
+#[orca_tool(
+    domain = "proxmox",
+    verb = "deploy_target_list",
+    execute_gated = false,
+    role = "read"
+)]
 async fn deploy_target_list(
     _args: DeployTargetListArgs,
     _ctx: &ToolCtx,

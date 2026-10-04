@@ -1,10 +1,9 @@
-//! LVM-thin discard drift and allocation divergence (proxmox#72).
+//! LVM-thin discard drift and allocation divergence.
 //!
 //! A thin volume only returns blocks to its pool when the guest's deletes reach
 //! it as discards. Without `mountoptions=discard` (LXC) or `discard=on` (QEMU
-//! disk), thin allocation only ever grows: frigg CT117 read 97.94% allocated at
-//! the LVM layer while its filesystem was 39% used, and the pool — not the
-//! filesystem — is what filled up and broke CI.
+//! disk), thin allocation only ever grows, so the pool can fill while every
+//! guest filesystem on it still reports free space.
 //!
 //! Two verbs:
 //!
@@ -27,13 +26,12 @@ use plugin_toolkit::serde_json::Value;
 use crate::backup::{enc, put_form, raw_get_data};
 use crate::generated::{self, types as gtypes};
 use crate::responses::{ConfigField, GuestConfigData};
-use crate::tools::{for_each_enabled_endpoint, resolve_config};
+use crate::tools::{EndpointFailure, fan_out_enabled_endpoints, resolve_config};
 use crate::{Config, GuestKind, fetch_guest_config};
 
 /// Thin allocation exceeding in-guest usage by this many percentage points of
-/// the volume size is flagged. Calibrated on frigg (2026-09-24): CT114 at 68%
-/// fs / 87% thin was carrying ~24 GiB of dead blocks; CT113 at 80% / 80% was
-/// healthy.
+/// the volume size is flagged. A volume with working discard tracks its
+/// filesystem within a few points.
 pub const DIVERGENCE_WARN_PCT: f64 = 15.0;
 
 const THIN_PLUGIN: &str = "lvmthin";
@@ -86,6 +84,31 @@ pub struct ThinGuestAudit {
     pub name: Option<String>,
     pub running: bool,
     pub volumes: Vec<ThinVolumeAudit>,
+}
+
+/// Something the audit could not read. Guests or volumes behind it are absent
+/// from (or incomplete in) the report rather than clean.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ThinAuditError {
+    /// `None` when the endpoint registry itself could not be listed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// Set when a storage content listing failed: allocation is unknown for
+    /// every volume on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage: Option<String>,
+    /// Set when a guest's config could not be read: the guest is not audited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vmid: Option<u64>,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ThinAuditReport {
+    pub guests: Vec<ThinGuestAudit>,
+    pub errors: Vec<ThinAuditError>,
 }
 
 /// One config key as `/nodes/{node}/{kind}/{vmid}/pending` reports it.
@@ -249,8 +272,8 @@ pub fn divergence_pct(size: u64, allocated: u64, fs_used: u64) -> Option<f64> {
 /// carries both the active and the staged value of every key).
 ///
 /// `thin` is the set of `lvmthin` storage ids on the guest's node; `usage` maps
-/// volid to pool allocation; `rootfs_used` is the in-guest root filesystem
-/// usage of a running container.
+/// volid to pool allocation on that same node (volids repeat across nodes);
+/// `rootfs_used` is the in-guest root filesystem usage of a running container.
 pub fn audit_volumes(
     kind: GuestKind,
     pending: &[PendingEntry],
@@ -313,12 +336,14 @@ struct GuestRef {
     disk: Option<u64>,
 }
 
-/// Audit every non-template guest on one endpoint (optionally one node).
+/// Audit every non-template guest on one endpoint (optionally one node). Fails
+/// only when the guest inventory itself is unreadable; anything narrower is
+/// recorded in [`ThinAuditReport::errors`].
 pub async fn audit_endpoint(
     cfg: &Config,
     endpoint: &str,
     node: Option<&str>,
-) -> Result<Vec<ThinGuestAudit>> {
+) -> Result<ThinAuditReport> {
     use gtypes::GetResourcesClusterResourcesResponseItemType as Kind;
 
     let http = cfg.build_reqwest_client()?;
@@ -368,22 +393,33 @@ pub async fn audit_endpoint(
         });
     }
 
-    let mut usage: HashMap<String, VolumeUsage> = HashMap::new();
+    let mut report = ThinAuditReport::default();
+    let mut usage: HashMap<String, HashMap<String, VolumeUsage>> = HashMap::new();
     for (n, stores) in &thin {
         for s in stores {
             let path = format!("nodes/{}/storage/{}/content", enc(n), enc(s));
             match raw_get_data(&http, &cfg.base_url, &path).await {
-                Ok(data) => usage.extend(parse_content(&data)),
+                Ok(data) => usage
+                    .entry(n.clone())
+                    .or_default()
+                    .extend(parse_content(&data)),
                 Err(e) => {
                     tracing::warn!(endpoint, node = %n, storage = %s, error = %e,
                         "thin audit: storage content listing failed");
+                    report.errors.push(ThinAuditError {
+                        endpoint: Some(endpoint.to_string()),
+                        node: Some(n.clone()),
+                        storage: Some(s.clone()),
+                        vmid: None,
+                        error: format!("storage content listing: {e:#}"),
+                    });
                 }
             }
         }
     }
 
     let empty = HashSet::new();
-    let mut out = Vec::new();
+    let no_usage = HashMap::new();
     for g in guests {
         let node_thin = thin.get(&g.node).unwrap_or(&empty);
         if node_thin.is_empty() {
@@ -399,15 +435,23 @@ pub async fn audit_endpoint(
             Ok(data) => parse_pending(&data),
             Err(e) => {
                 tracing::warn!(endpoint, node = %g.node, vmid = g.vmid, error = %e,
-                    "thin audit: pending config read failed (guest may have been deleted)");
+                    "thin audit: pending config read failed");
+                report.errors.push(ThinAuditError {
+                    endpoint: Some(endpoint.to_string()),
+                    node: Some(g.node.clone()),
+                    storage: None,
+                    vmid: Some(g.vmid),
+                    error: format!("pending config read: {e:#}"),
+                });
                 continue;
             }
         };
-        let volumes = audit_volumes(g.kind, &pending, node_thin, &usage, g.disk);
+        let node_usage = usage.get(&g.node).unwrap_or(&no_usage);
+        let volumes = audit_volumes(g.kind, &pending, node_thin, node_usage, g.disk);
         if volumes.is_empty() {
             continue;
         }
-        out.push(ThinGuestAudit {
+        report.guests.push(ThinGuestAudit {
             endpoint: endpoint.to_string(),
             node: g.node,
             vmid: g.vmid,
@@ -417,7 +461,7 @@ pub async fn audit_endpoint(
             volumes,
         });
     }
-    Ok(out)
+    Ok(report)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -495,6 +539,9 @@ pub struct ThinDiscardOutcome {
     pub changes: Vec<DiscardChange>,
     /// At least one change is staged until the guest's next start.
     pub restart_required: bool,
+    /// The write landed but something after it could not be confirmed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Write discard onto every thin disk of one guest that lacks it.
@@ -515,17 +562,29 @@ pub async fn enable_discard(
     .await?;
     let thin = parse_thin_storages(&storages);
     let config = fetch_guest_config(&http, &cfg.base_url, node, kind, vmid).await?;
+    if config.data.get_int("template").unwrap_or(0) != 0 {
+        bail!(
+            "{} {vmid} is a template; change discard on the guests cloned from it",
+            kind.as_str()
+        );
+    }
     let mut changes = plan_discard(kind, &config.data, &thin, only)?;
+    let mut warnings = Vec::new();
 
     if !changes.is_empty() {
         let mut pairs: Vec<(String, String)> = changes
             .iter()
             .map(|c| (c.key.clone(), c.after.clone()))
             .collect();
-        // Rejects the write if the config changed since it was read.
-        if let Some(ConfigField::Str(d)) = config.data.fields.get("digest") {
-            pairs.push(("digest".to_string(), d.clone()));
-        }
+        // PVE rejects the write if the config changed since it was read; without
+        // the digest the PUT could clobber a concurrent edit.
+        let Some(ConfigField::Str(digest)) = config.data.fields.get("digest") else {
+            bail!(
+                "{} {vmid} config read returned no digest; refusing an unguarded write",
+                kind.as_str()
+            );
+        };
+        pairs.push(("digest".to_string(), digest.clone()));
         let url = format!(
             "{}/nodes/{}/{}/{}/config",
             cfg.base_url.trim_end_matches('/'),
@@ -536,17 +595,24 @@ pub async fn enable_discard(
         put_form(&http, &url, &pairs).await?;
 
         let path = format!("nodes/{}/{}/{}/pending", enc(node), kind.as_str(), vmid);
-        let pending = parse_pending(&raw_get_data(&http, &cfg.base_url, &path).await?);
-        for c in &mut changes {
-            c.state = pending.iter().find(|e| e.key == c.key).map(|e| {
-                if e.value.as_deref().is_some_and(|v| has_discard(kind, v)) {
-                    DiscardState::Enabled
-                } else if e.pending.as_deref().is_some_and(|v| has_discard(kind, v)) {
-                    DiscardState::PendingRestart
-                } else {
-                    DiscardState::Missing
+        match raw_get_data(&http, &cfg.base_url, &path).await {
+            Ok(data) => {
+                let pending = parse_pending(&data);
+                for c in &mut changes {
+                    c.state = pending.iter().find(|e| e.key == c.key).map(|e| {
+                        if e.value.as_deref().is_some_and(|v| has_discard(kind, v)) {
+                            DiscardState::Enabled
+                        } else if e.pending.as_deref().is_some_and(|v| has_discard(kind, v)) {
+                            DiscardState::PendingRestart
+                        } else {
+                            DiscardState::Missing
+                        }
+                    });
                 }
-            });
+            }
+            Err(e) => warnings.push(format!(
+                "config written, but re-reading the pending config failed so each change's state is unknown: {e:#}"
+            )),
         }
     }
 
@@ -559,6 +625,7 @@ pub async fn enable_discard(
             .iter()
             .any(|c| c.state == Some(DiscardState::PendingRestart)),
         changes,
+        warnings,
     })
 }
 
@@ -580,19 +647,58 @@ pub struct ThinAuditArgs {
 
 /// Audit every guest disk on LVM-thin storage: discard active / staged /
 /// missing (with the value `proxmox.thin.enable_discard` would write), and thin
-/// allocation vs in-guest usage for running LXC root filesystems.
+/// allocation vs in-guest usage for running LXC root filesystems. Anything that
+/// could not be read is listed in `errors`; the audit fails outright when no
+/// endpoint could be read at all.
 #[orca_tool(domain = "proxmox", verb = "thin.audit")]
-async fn proxmox_thin_audit(args: ThinAuditArgs, _ctx: &ToolCtx) -> Result<Vec<ThinGuestAudit>> {
+async fn proxmox_thin_audit(args: ThinAuditArgs, _ctx: &ToolCtx) -> Result<ThinAuditReport> {
     let node = args.node.clone();
     if let Some(name) = &args.endpoint {
         let cfg = resolve_config(name).await?;
         return audit_endpoint(&cfg, name, node.as_deref()).await;
     }
-    Ok(for_each_enabled_endpoint("thin.audit", |cfg, ep| {
+    let fan = fan_out_enabled_endpoints("thin.audit", |cfg, ep| {
         let node = node.clone();
-        async move { audit_endpoint(&cfg, &ep.name, node.as_deref()).await }
+        async move { Ok(vec![audit_endpoint(&cfg, &ep.name, node.as_deref()).await?]) }
     })
-    .await)
+    .await;
+    merge_fan_out(fan.items, fan.failures, fan.attempted)
+}
+
+/// Fold per-endpoint reports and endpoint-level failures into one report.
+/// Nothing read is an error, never an empty report that reads as all-clean.
+fn merge_fan_out(
+    reports: Vec<ThinAuditReport>,
+    failures: Vec<EndpointFailure>,
+    attempted: usize,
+) -> Result<ThinAuditReport> {
+    if reports.is_empty() {
+        if attempted == 0 && failures.is_empty() {
+            bail!("no enabled proxmox endpoints to audit");
+        }
+        let detail: Vec<String> = failures
+            .iter()
+            .map(|f| match &f.endpoint {
+                Some(ep) => format!("{ep}: {}", f.error),
+                None => f.error.clone(),
+            })
+            .collect();
+        bail!("thin audit read no endpoint: {}", detail.join("; "));
+    }
+    let mut out = ThinAuditReport::default();
+    for r in reports {
+        out.guests.extend(r.guests);
+        out.errors.extend(r.errors);
+    }
+    out.errors
+        .extend(failures.into_iter().map(|f| ThinAuditError {
+            endpoint: f.endpoint,
+            node: None,
+            storage: None,
+            vmid: None,
+            error: f.error,
+        }));
+    Ok(out)
 }
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
@@ -729,12 +835,10 @@ mod tests {
         assert!(!is_disk_key(GuestKind::Qemu, "tpmstate0"));
     }
 
-    /// The measured incident (frigg, 2026-09-24): gitea CT117 at 39% fs and
-    /// 97.94% thin, no discard anywhere.
     #[test]
-    fn gitea_shape_is_missing_discard_and_diverged() {
+    fn full_pool_with_low_fs_usage_is_missing_discard_and_diverged() {
         let pending = parse_pending(&json!([
-            {"key": "hostname", "value": "gitea"},
+            {"key": "hostname", "value": "ct"},
             {"key": "rootfs", "value": "local-lvm:vm-117-disk-0,size=98G"},
             {"key": "mp0", "value": "/mnt/share,mp=/share"},
         ]));
@@ -932,7 +1036,7 @@ mod tests {
                         {"id": "storage/hyp1/local", "type": "storage", "node": "hyp1",
                          "storage": "local", "plugintype": "dir"},
                         {"id": "lxc/117", "type": "lxc", "node": "hyp1", "vmid": 117,
-                         "name": "gitea", "status": "running", "disk": 36 * GIB,
+                         "name": "ct", "status": "running", "disk": 36 * GIB,
                          "maxdisk": 98 * GIB},
                         {"id": "qemu/900", "type": "qemu", "node": "hyp1", "vmid": 900,
                          "name": "tmpl", "status": "stopped", "template": true},
@@ -960,7 +1064,9 @@ mod tests {
         let (res, seen) = run_against(routes, async || {
             audit_endpoint(&test_config(), "pve", None).await
         });
-        let audit = res.unwrap();
+        let report = res.unwrap();
+        assert!(report.errors.is_empty(), "{:#?}", report.errors);
+        let audit = report.guests;
         assert_eq!(audit.len(), 1, "template skipped: {audit:#?}");
         let g = &audit[0];
         assert_eq!((g.vmid, g.kind.as_str(), g.running), (117, "lxc", true));
@@ -1047,5 +1153,206 @@ mod tests {
         assert!(out.changes.is_empty());
         assert!(!out.restart_required);
         assert!(seen.iter().all(|r| r["method"] == "GET"));
+    }
+
+    #[test]
+    fn qemu_discard_ignore_is_missing_and_proposes_on() {
+        let pending = parse_pending(&json!([
+            {"key": "scsi0", "value": "local-lvm:vm-106-disk-0,discard=ignore,size=32G"},
+        ]));
+        let v = audit_volumes(
+            GuestKind::Qemu,
+            &pending,
+            &thin(&["local-lvm"]),
+            &HashMap::new(),
+            None,
+        );
+        assert_eq!(v[0].discard, DiscardState::Missing);
+        assert_eq!(
+            v[0].proposed.as_deref(),
+            Some("local-lvm:vm-106-disk-0,discard=on,size=32G")
+        );
+    }
+
+    #[test]
+    fn empty_mountoptions_is_missing_and_filled_in_place() {
+        let v = "local-lvm:vm-101-disk-0,mountoptions=,size=8G";
+        assert!(!has_discard(GuestKind::Lxc, v));
+        assert_eq!(
+            with_discard(GuestKind::Lxc, v),
+            "local-lvm:vm-101-disk-0,mountoptions=discard,size=8G"
+        );
+    }
+
+    fn two_node_routes(content_hyp2: String) -> Vec<(&'static str, &'static str, String)> {
+        vec![
+            (
+                "GET",
+                "/cluster/resources",
+                reply(
+                    200,
+                    json!([
+                        {"id": "storage/hyp1/local-lvm", "type": "storage", "node": "hyp1",
+                         "storage": "local-lvm", "plugintype": "lvmthin"},
+                        {"id": "storage/hyp2/local-lvm", "type": "storage", "node": "hyp2",
+                         "storage": "local-lvm", "plugintype": "lvmthin"},
+                        {"id": "lxc/100", "type": "lxc", "node": "hyp1", "vmid": 100,
+                         "status": "running", "disk": 2 * GIB},
+                        {"id": "lxc/200", "type": "lxc", "node": "hyp2", "vmid": 200,
+                         "status": "running", "disk": 7 * GIB},
+                    ]),
+                ),
+            ),
+            (
+                "GET",
+                "/nodes/hyp1/storage/local-lvm/content",
+                reply(
+                    200,
+                    json!([{"volid": "local-lvm:vm-100-disk-0", "size": 8 * GIB, "used": 2 * GIB}]),
+                ),
+            ),
+            ("GET", "/nodes/hyp2/storage/local-lvm/content", content_hyp2),
+            (
+                "GET",
+                "/nodes/hyp1/lxc/100/pending",
+                reply(
+                    200,
+                    json!([{"key": "rootfs", "value": "local-lvm:vm-100-disk-0,size=8G"}]),
+                ),
+            ),
+            (
+                "GET",
+                "/nodes/hyp2/lxc/200/pending",
+                reply(
+                    200,
+                    json!([{"key": "rootfs", "value": "local-lvm:vm-100-disk-0,size=8G"}]),
+                ),
+            ),
+        ]
+    }
+
+    /// Node-local `local-lvm` reuses volids across nodes; each guest must read
+    /// its own node's allocation.
+    #[test]
+    fn same_volid_on_two_nodes_is_keyed_per_node() {
+        let content = reply(
+            200,
+            json!([{"volid": "local-lvm:vm-100-disk-0", "size": 8 * GIB, "used": 7 * GIB}]),
+        );
+        let (res, _) = run_against(two_node_routes(content), async || {
+            audit_endpoint(&test_config(), "pve", None).await
+        });
+        let report = res.unwrap();
+        let alloc = |node: &str| {
+            report
+                .guests
+                .iter()
+                .find(|g| g.node == node)
+                .unwrap()
+                .volumes[0]
+                .allocated_bytes
+        };
+        assert_eq!(alloc("hyp1"), Some(2 * GIB));
+        assert_eq!(alloc("hyp2"), Some(7 * GIB));
+    }
+
+    #[test]
+    fn unreadable_content_and_pending_are_reported_not_dropped() {
+        let mut routes = two_node_routes(reply(500, Value::Null));
+        routes.retain(|(_, path, _)| *path != "/nodes/hyp1/lxc/100/pending");
+        routes.push((
+            "GET",
+            "/nodes/hyp1/lxc/100/pending",
+            reply(500, Value::Null),
+        ));
+        let (res, _) = run_against(routes, async || {
+            audit_endpoint(&test_config(), "pve", None).await
+        });
+        let report = res.unwrap();
+        assert_eq!(report.guests.len(), 1, "{report:#?}");
+        assert_eq!(report.guests[0].vmid, 200);
+        assert_eq!(report.guests[0].volumes[0].allocated_bytes, None);
+        assert!(report.errors.iter().any(
+            |e| e.node.as_deref() == Some("hyp2") && e.storage.as_deref() == Some("local-lvm")
+        ));
+        assert!(report.errors.iter().any(|e| e.vmid == Some(100)));
+    }
+
+    fn failure(ep: &str) -> EndpointFailure {
+        EndpointFailure {
+            endpoint: Some(ep.into()),
+            error: "unreachable".into(),
+        }
+    }
+
+    #[test]
+    fn every_endpoint_failing_is_an_error_not_an_empty_report() {
+        let err = merge_fan_out(vec![], vec![failure("a"), failure("b")], 2).unwrap_err();
+        assert!(err.to_string().contains("a: unreachable"), "{err}");
+        assert!(merge_fan_out(vec![], vec![], 0).is_err());
+    }
+
+    #[test]
+    fn a_failed_endpoint_beside_a_good_one_is_listed() {
+        let ok = ThinAuditReport::default();
+        let out = merge_fan_out(vec![ok], vec![failure("b")], 2).unwrap();
+        assert_eq!(out.errors.len(), 1);
+        assert_eq!(out.errors[0].endpoint.as_deref(), Some("b"));
+    }
+
+    fn enable_routes(config: Value, pending: String) -> Vec<(&'static str, &'static str, String)> {
+        vec![
+            (
+                "GET",
+                "/nodes/hyp1/storage",
+                reply(200, json!([{"storage": "local-lvm", "type": "lvmthin"}])),
+            ),
+            ("GET", "/nodes/hyp1/lxc/117/config", reply(200, config)),
+            ("PUT", "/nodes/hyp1/lxc/117/config", reply(200, Value::Null)),
+            ("GET", "/nodes/hyp1/lxc/117/pending", pending),
+        ]
+    }
+
+    #[test]
+    fn enable_discard_without_digest_never_writes() {
+        let routes = enable_routes(
+            json!({"rootfs": "local-lvm:vm-117-disk-0,size=98G"}),
+            reply(200, json!([])),
+        );
+        let (res, seen) = run_against(routes, async || {
+            enable_discard(&test_config(), "pve", "hyp1", GuestKind::Lxc, 117, &[]).await
+        });
+        assert!(res.unwrap_err().to_string().contains("no digest"));
+        assert!(seen.iter().all(|r| r["method"] == "GET"));
+    }
+
+    #[test]
+    fn enable_discard_refuses_templates() {
+        let routes = enable_routes(
+            json!({"rootfs": "local-lvm:vm-117-disk-0,size=98G", "template": 1, "digest": "d"}),
+            reply(200, json!([])),
+        );
+        let (res, seen) = run_against(routes, async || {
+            enable_discard(&test_config(), "pve", "hyp1", GuestKind::Lxc, 117, &[]).await
+        });
+        assert!(res.unwrap_err().to_string().contains("template"));
+        assert!(seen.iter().all(|r| r["method"] == "GET"));
+    }
+
+    #[test]
+    fn enable_discard_reread_failure_after_write_is_a_warning() {
+        let routes = enable_routes(
+            json!({"rootfs": "local-lvm:vm-117-disk-0,size=98G", "digest": "d"}),
+            reply(500, Value::Null),
+        );
+        let (res, seen) = run_against(routes, async || {
+            enable_discard(&test_config(), "pve", "hyp1", GuestKind::Lxc, 117, &[]).await
+        });
+        let out = res.unwrap();
+        assert!(seen.iter().any(|r| r["method"] == "PUT"));
+        assert_eq!(out.changes.len(), 1);
+        assert_eq!(out.changes[0].state, None);
+        assert!(!out.restart_required);
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
     }
 }
