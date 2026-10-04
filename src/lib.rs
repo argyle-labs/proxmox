@@ -16,14 +16,17 @@
 
 pub mod access;
 pub mod backup;
+pub mod backup_jobs;
 pub mod cluster;
 pub mod cluster_roster_impl;
 pub mod containers_adapter;
 pub mod deploy;
 pub mod diagnostics;
+pub mod execute;
 pub mod guest_exec;
 pub mod guest_mount;
 pub mod host_workloads;
+pub mod lxc_guest;
 pub mod mount_scan;
 pub mod overallocation;
 pub mod responses;

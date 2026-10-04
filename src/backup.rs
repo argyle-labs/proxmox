@@ -361,11 +361,29 @@ fn form_pairs(obj: &serde_json::Map<String, Value>, skip: &[&str]) -> Vec<(Strin
     pairs
 }
 
-/// PUT a form-urlencoded body of `pairs` and fail on a non-2xx status. Uses the
-/// delegated-http shim's `form_urlencoded` (over `QueryParam`), which sets the
-/// `application/x-www-form-urlencoded` content-type.
+/// PUT a form-urlencoded body of `pairs` and fail on a non-2xx status.
 pub(crate) async fn put_form(
     http: &reqwest::Client,
+    url: &str,
+    pairs: &[(String, String)],
+) -> Result<()> {
+    send_form(http.put(url), "PUT", url, pairs).await
+}
+
+/// POST a form-urlencoded body of `pairs` and fail on a non-2xx status.
+pub(crate) async fn post_form(
+    http: &reqwest::Client,
+    url: &str,
+    pairs: &[(String, String)],
+) -> Result<()> {
+    send_form(http.post(url), "POST", url, pairs).await
+}
+
+/// Uses the delegated-http shim's `form_urlencoded` (over `QueryParam`), which
+/// sets the `application/x-www-form-urlencoded` content-type.
+async fn send_form(
+    req: reqwest::RequestBuilder,
+    method: &str,
     url: &str,
     pairs: &[(String, String)],
 ) -> Result<()> {
@@ -380,8 +398,7 @@ pub(crate) async fn put_form(
         .as_slice()
         .to_query_string()
         .map_err(|e| anyhow!("form encode: {e}"))?;
-    let resp = http
-        .put(url)
+    let resp = req
         .header(
             "content-type",
             HeaderValue::from_static("application/x-www-form-urlencoded"),
@@ -389,11 +406,11 @@ pub(crate) async fn put_form(
         .body(body.into_bytes())
         .send()
         .await
-        .map_err(|e| anyhow!("PUT {url}: {e}"))?;
+        .map_err(|e| anyhow!("{method} {url}: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("PUT {url}: HTTP {}: {body}", status.as_u16()));
+        return Err(anyhow!("{method} {url}: HTTP {}: {body}", status.as_u16()));
     }
     Ok(())
 }

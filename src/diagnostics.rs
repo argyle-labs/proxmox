@@ -156,6 +156,9 @@ pub async fn diagnose(args: DiagnoseArgs) -> Vec<Finding> {
     // Node-local: reads the `mp` entries in /etc/pve/lxc/*.conf and compares each
     // bind-mount source against the node root's device. Empty off a PVE node.
     findings.extend(diagnose_guest_mounts());
+    // Cluster-wide: running guests no enabled vzdump job covers, and jobs that
+    // queue behind each other on one node.
+    findings.extend(crate::backup_jobs::diagnose_backup_jobs().await);
     findings
 }
 
@@ -364,7 +367,7 @@ async fn diagnose_qemu_agents(_args: DiagnoseArgs) -> Vec<Finding> {
 
 /// This node's name (PVE node == hostname). Falls back to `"local"` so a
 /// finding id stays stable-ish even if the hostname can't be read.
-fn local_node() -> String {
+pub(crate) fn local_node() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .or_else(|_| std::fs::read_to_string("/etc/hostname"))
         .ok()

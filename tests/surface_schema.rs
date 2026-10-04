@@ -241,3 +241,67 @@ fn enable_discard_dispatch_without_execute_returns_a_plan() {
     );
     assert_eq!(out["inputs"]["ctid"], serde_json::json!(101));
 }
+
+/// Verbs that own their `execute` opt-in: not centrally gated, admin-only, and
+/// an execute call with no caller identity is refused before any capability.
+const SELF_GATED: &[&str] = &[
+    "proxmox.backup_job.upsert",
+    "proxmox.backup_job.delete",
+    "proxmox.guest.pxarexclude",
+];
+
+#[test]
+fn self_gated_verbs_take_their_own_execute_and_need_admin() {
+    for name in SELF_GATED {
+        let tool = proxmox_tools()
+            .into_iter()
+            .find(|t| t["name"] == *name)
+            .unwrap_or_else(|| panic!("{name} not registered"));
+        assert!(
+            tool["input_schema"]["properties"].get("execute").is_some(),
+            "{name} takes execute"
+        );
+        assert_eq!(
+            plugin_toolkit::dispatch::required_role(name),
+            Some("admin"),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        plugin_toolkit::dispatch::required_role("proxmox.backup_job.list"),
+        Some("read")
+    );
+    assert!(!is_execute_gated("proxmox.backup_job.list"));
+}
+
+#[test]
+fn self_gated_execute_without_a_caller_is_refused_before_anything_runs() {
+    for (name, args) in [
+        (
+            "proxmox.backup_job.upsert",
+            serde_json::json!({"endpoint": "pve", "id": "j", "execute": true}),
+        ),
+        (
+            "proxmox.backup_job.delete",
+            serde_json::json!({"endpoint": "pve", "id": "j", "execute": true}),
+        ),
+        (
+            "proxmox.guest.pxarexclude",
+            serde_json::json!({"endpoint": "pve", "ctid": 1, "patterns": ["/data"], "execute": true}),
+        ),
+    ] {
+        let err = plugin_toolkit::capsink::with_cap_sink(
+            Box::new(|cap: &str, raw: &str| panic!("reached capability {cap}: {raw}")),
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(plugin_toolkit::dispatch::dispatch(name, args, &test_ctx()))
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no caller identity"), "{name}: {err}");
+    }
+}
