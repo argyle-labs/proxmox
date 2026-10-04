@@ -43,16 +43,15 @@ path = "src/main.rs"
 # api_client / http / urlencoding / futures_util / reqwest / tokio) is
 # re-exported by the toolkit + its prelude.
 #
-# The committed `[patch]` in `.cargo/config.toml` overrides this to the local
-# in-tree toolkit for development; the git branch is what an external checkout
-# without the orca repo resolves against.
+# Tracks orca `main` via the public GitHub git source; the committed Cargo.lock
+# pins the resolved commit and CI builds `--locked`.
 # Thin profile: `delegated-http` retargets the progenitor-generated client onto
 # orca's `http.request` capability, so this plugin links NO reqwest/rustls/hyper/
 # progenitor-client. `default-features = false` drops the real `http`/`openapi`
 # stacks; `tools` (orca_tool anchors) + `db` (thin endpoint_resource CRUD over
 # db_op) + `containers` (the domain proxmox registers) + `delegated-http` are all
 # it needs. `secrets`/`serve`/`storage` are always-on. See [[plugins-stay-thin]].
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.2.1-rc.5", default-features = false, features = ["tools", "db", "containers", "delegated-http"] }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "containers", "delegated-http"] }
 
 # Light, genuinely-external deps the plugin's own source + generated client still
 # name at the crate root. The toolkit-build codegen (`rewrite_codegen_paths`)
@@ -91,7 +90,7 @@ indexmap  = "2"
 anyhow    = "1"
 
 [build-dependencies]
-plugin-toolkit-build = { git = "https://github.com/argyle-labs/orca", tag = "v0.2.1-rc.5" }
+plugin-toolkit-build = { git = "https://github.com/argyle-labs/orca", branch = "main" }
 
 # Prototype spec→orca-surface generator (build/surface.rs). Reads the emitted
 # `<flavor>_codegen.rs`, pairs each generated client method back to its spec
