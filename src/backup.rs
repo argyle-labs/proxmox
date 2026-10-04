@@ -338,7 +338,7 @@ async fn pveconfig_restore(dir: &str) -> Result<String> {
 
 // ── shared helpers ──────────────────────────────────────────────────────────
 
-fn enc(s: &str) -> String {
+pub(crate) fn enc(s: &str) -> String {
     plugin_toolkit::progenitor_client::encode_path(s)
 }
 
@@ -364,7 +364,11 @@ fn form_pairs(obj: &serde_json::Map<String, Value>, skip: &[&str]) -> Vec<(Strin
 /// PUT a form-urlencoded body of `pairs` and fail on a non-2xx status. Uses the
 /// delegated-http shim's `form_urlencoded` (over `QueryParam`), which sets the
 /// `application/x-www-form-urlencoded` content-type.
-async fn put_form(http: &reqwest::Client, url: &str, pairs: &[(String, String)]) -> Result<()> {
+pub(crate) async fn put_form(
+    http: &reqwest::Client,
+    url: &str,
+    pairs: &[(String, String)],
+) -> Result<()> {
     use plugin_toolkit::delegated_http::header::HeaderValue;
     use plugin_toolkit::delegated_http::serialize::ToQuery;
     use plugin_toolkit::progenitor_client::QueryParam;
@@ -451,7 +455,11 @@ async fn first_enabled_config() -> Result<Config> {
 /// Raw GET against the PVE REST API, peeling the `{"data": …}` envelope every
 /// endpoint wraps its payload in. `path` is joined onto the API root
 /// (`Config::base_url`, e.g. `https://host:8006/api2/json`).
-async fn raw_get_data(http: &reqwest::Client, base_url: &str, path: &str) -> Result<Value> {
+pub(crate) async fn raw_get_data(
+    http: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+) -> Result<Value> {
     let url = format!("{}/{}", base_url.trim_end_matches('/'), path);
     let resp = http
         .get(&url)
