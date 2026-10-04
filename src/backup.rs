@@ -8,7 +8,7 @@
 //! runs on the same host as the engine, so we write bytes directly rather than
 //! streaming them over the socket).
 //!
-//! Three KINDs are registered, each with a distinct bridge invoke-prefix:
+//! Four KINDs are registered, each with a distinct bridge invoke-prefix:
 //!
 //! - `pve-config` (`proxmox.__backup_pveconfig`) — one logical instance
 //!   (`default`). Captures cluster/host config the API exposes: storage config
@@ -23,6 +23,9 @@
 //!   `/nodes/{node}/qemu/{vmid}/config`.
 //! - `lxc` (`proxmox.__backup_lxc`) — every cluster container as
 //!   `"<node>/<vmid>"`; same as `vm` against `/nodes/{node}/lxc/{vmid}/config`.
+//! - `lxc-bind` (`proxmox.__backup_lxcbind`) — containers on THIS node whose
+//!   app state lives in a bind mount, which vzdump never includes. Copies the
+//!   host side of those paths; see [`crate::bind_mounts`].
 //!
 //! The host calls, per kind, `{prefix}.{op}` for op in
 //! instances|layout|backup|restore over the subprocess socket with BARE JSON
@@ -43,6 +46,7 @@ use crate::{Config, GuestKind};
 pub const PVECONFIG_PREFIX: &str = "proxmox.__backup_pveconfig";
 pub const VM_PREFIX: &str = "proxmox.__backup_vm";
 pub const LXC_PREFIX: &str = "proxmox.__backup_lxc";
+pub const LXC_BIND_PREFIX: &str = "proxmox.__backup_lxcbind";
 
 /// The three `backup_kind` backend descriptors this plugin advertises, one per
 /// KIND with its own invoke-prefix. `backup_kind_backend_def` enforces
@@ -53,6 +57,7 @@ pub fn backend_defs() -> Vec<BackendDef> {
         backup_kind_backend_def("pve-config", PVECONFIG_PREFIX),
         backup_kind_backend_def("vm", VM_PREFIX),
         backup_kind_backend_def("lxc", LXC_PREFIX),
+        backup_kind_backend_def("lxc-bind", LXC_BIND_PREFIX),
     ]
 }
 
@@ -84,6 +89,7 @@ enum Kind {
     PveConfig,
     Vm,
     Lxc,
+    LxcBind,
 }
 
 /// Split a bridge tool name into `(kind, op)` if it targets one of our backup
@@ -93,6 +99,7 @@ fn match_prefix(name: &str) -> Option<(Kind, &str)> {
         (PVECONFIG_PREFIX, Kind::PveConfig),
         (VM_PREFIX, Kind::Vm),
         (LXC_PREFIX, Kind::Lxc),
+        (LXC_BIND_PREFIX, Kind::LxcBind),
     ] {
         if let Some(op) = name.strip_prefix(prefix).and_then(|s| s.strip_prefix('.')) {
             return Some((kind, op));
@@ -132,6 +139,39 @@ async fn run(kind: Kind, op: &str, args_json: &str) -> Result<String> {
         (Kind::Vm | Kind::Lxc, "restore") => {
             let (dir, instance) = decode_backup(args_json)?;
             guest_restore(guest_kind(kind), &instance, &dir).await
+        }
+
+        // ── lxc-bind ────────────────────────────────────────────────────────
+        (Kind::LxcBind, "instances") => Ok(serde_json::to_string(
+            &crate::bind_mounts::kind_instances(&crate::bind_mounts::local_plans()),
+        )?),
+        (Kind::LxcBind, "layout") => {
+            let instance = decode_instance(args_json)?;
+            Ok(json!(["guests", "proxmox-lxc-bind", instance]).to_string())
+        }
+        (Kind::LxcBind, "backup") => {
+            let (dir, instance) = decode_backup(args_json)?;
+            let plan = crate::bind_mounts::local_plan(&instance)?;
+            let n = crate::bind_mounts::capture(
+                &crate::bind_mounts::UnprivilegedTree,
+                &plan,
+                Path::new(&dir),
+            )?;
+            Ok(json!({
+                "checksum": Value::Null,
+                "note": format!("copied {n} file(s) of bind-mount app state for {instance}"),
+            })
+            .to_string())
+        }
+        (Kind::LxcBind, "restore") => {
+            let (dir, instance) = decode_backup(args_json)?;
+            let plan = crate::bind_mounts::local_plan(&instance)?;
+            crate::bind_mounts::restore(
+                &crate::bind_mounts::UnprivilegedTree,
+                &plan,
+                Path::new(&dir),
+            )?;
+            Ok(Value::Null.to_string())
         }
 
         (_, other) => Err(anyhow!("proxmox backup: unknown op '{other}'")),
@@ -511,4 +551,23 @@ fn read_json(dir: &str, file: &str) -> Result<Value> {
     let bytes =
         std::fs::read(&path).with_context(|| format!("restore: read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("restore: parse {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lxc_bind_prefix_is_not_taken_by_the_lxc_kind() {
+        assert!(matches!(
+            match_prefix("proxmox.__backup_lxcbind.instances"),
+            Some((Kind::LxcBind, "instances"))
+        ));
+        assert!(matches!(
+            match_prefix("proxmox.__backup_lxc.backup"),
+            Some((Kind::Lxc, "backup"))
+        ));
+        let names: Vec<String> = backend_defs().into_iter().map(|d| d.name).collect();
+        assert!(names.contains(&"lxc-bind".to_string()), "{names:?}");
+    }
 }

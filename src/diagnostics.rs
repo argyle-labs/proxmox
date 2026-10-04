@@ -159,6 +159,8 @@ pub async fn diagnose(args: DiagnoseArgs) -> Vec<Finding> {
     // Cluster-wide: running guests no enabled vzdump job covers, and jobs that
     // queue behind each other on one node.
     findings.extend(crate::backup_jobs::diagnose_backup_jobs().await);
+    // Node-local: app state in LXC bind mounts, which vzdump never includes.
+    findings.extend(crate::bind_mounts::diagnose_bind_mounts());
     findings
 }
 

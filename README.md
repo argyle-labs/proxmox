@@ -70,6 +70,7 @@ Every VM and LXC across every enabled endpoint is a **unit** (`kind = vm` or `lx
 | `proxmox.backup_job.upsert` | create or update a vzdump job; `prune_backups` defaults to `keep-last=10` *(role: admin; returns the diff against the current job unless `execute: true`)* |
 | `proxmox.backup_job.delete` | delete a vzdump job *(role: admin; dry-run unless `execute: true`)* |
 | `proxmox.guest.pxarexclude` | replace an LXC's `/.pxarexclude` through orca's lxc-push seam; the CT must run on this plugin's node *(role: admin; dry-run unless `execute: true`)* |
+| `proxmox.lxc_data.plan` | per LXC on this node: its mounts, the app's data paths (per-app table), where each lives (rootfs / volume / bind) and how it is backed up (vzdump / `lxc-bind` host capture / uncovered) |
 
 > `proxmox.action` overlaps with the unit `update` verb — both power-manage a guest. Use the unit surface for orca-managed fleet lifecycle; `proxmox.action` is the direct tool form.
 

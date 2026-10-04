@@ -35,6 +35,9 @@ pub struct RawMount {
     pub size_bytes: Option<u64>,
     /// `ro=1`.
     pub read_only: bool,
+    /// `backup=1`: vzdump includes the volume. Never set on a bind mount, which
+    /// vzdump cannot include.
+    pub backup: bool,
 }
 
 /// Parse a Proxmox size suffix (`32G`, `512M`, `1T`, bare bytes) into bytes.
@@ -89,6 +92,7 @@ pub fn parse_mountpoints(conf: &str) -> Vec<RawMount> {
         let mut target = String::new();
         let mut size_bytes = None;
         let mut read_only = false;
+        let mut backup = false;
         for opt in parts {
             let Some((k, v)) = opt.split_once('=') else {
                 continue;
@@ -97,6 +101,7 @@ pub fn parse_mountpoints(conf: &str) -> Vec<RawMount> {
                 "mp" => target = v.trim().to_string(),
                 "size" => size_bytes = parse_size(v),
                 "ro" => read_only = v.trim() == "1",
+                "backup" => backup = v.trim() == "1",
                 _ => {}
             }
         }
@@ -110,6 +115,7 @@ pub fn parse_mountpoints(conf: &str) -> Vec<RawMount> {
             target,
             size_bytes,
             read_only,
+            backup,
         });
     }
     out
@@ -248,6 +254,14 @@ rootfs: local-lvm:vm-113-disk-0,size=64G,mountoptions=discard
         assert_eq!(got[0].size_bytes, None);
         assert!(!got[1].read_only);
         assert_eq!(got[1].size_bytes, Some(512 << 20));
+    }
+
+    #[test]
+    fn backup_flag_is_parsed() {
+        let conf = "mp0: local-lvm:vm-1-disk-1,mp=/d,backup=1,size=8G\nmp1: local-lvm:vm-1-disk-2,mp=/e,size=8G\n";
+        let got = parse_mountpoints(conf);
+        assert!(got[0].backup);
+        assert!(!got[1].backup);
     }
 
     #[test]
