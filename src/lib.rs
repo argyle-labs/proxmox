@@ -17,6 +17,7 @@
 pub mod access;
 pub mod backup;
 pub mod backup_jobs;
+pub mod bind_mounts;
 pub mod cluster;
 pub mod cluster_roster_impl;
 pub mod containers_adapter;

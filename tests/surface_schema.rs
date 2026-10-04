@@ -182,6 +182,7 @@ fn hand_written_reads_are_not_execute_gated() {
         "proxmox.list_clusters",
         "proxmox.collect_claims",
         "proxmox.get_facts",
+        "proxmox.lxc_data.plan",
     ] {
         assert!(!is_execute_gated(name), "{name} is execute-gated");
         assert_eq!(
