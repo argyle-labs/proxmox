@@ -52,7 +52,7 @@ Every VM and LXC across every enabled endpoint is a **unit** (`kind = vm` or `lx
 | `update` | `reboot` | reboot the guest |
 | `update` | `backup` | vzdump the guest to backup storage, waited on; returns a `BackupRef` |
 | `update` | `restore` | restore the guest in place from a `BackupRef` |
-| `update` | `update` | LXC only: back up, then run the in-container updater (see [docs/guest-standard.md](docs/guest-standard.md)) |
+| `update` | `update` | LXC only: back up, then run the in-container updater; a plan unless the payload sets `"execute": true` (see [docs/guest-standard.md](docs/guest-standard.md)) |
 | `create` | `provision` | provision a new VM/LXC (needs a typed payload; LXC needs `ostemplate`) |
 | `delete` | — | destroy the guest |
 

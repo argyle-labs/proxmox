@@ -9,9 +9,18 @@ Every LXC is held to two things beyond its resource floor:
 `unit.detail` probes a running LXC on the plugin's own node and fills the guard's
 `has_root_console` / `has_update_command` facts. A probed LXC is then held to
 `require_root_console` and `require_update_command`, and a missing piece shows
-in `guard_violations`. An unprobed guest (a VM, a stopped or remote LXC, or a
-`list` row) is held to the resource floor only, so facts nobody read never fail
-closed.
+in `guard_violations`. If the probe itself fails or times out, that shows as a
+`guest standard probe failed: …` violation, never as a pass. An unprobed guest
+(a VM, a stopped or remote LXC, or a `list` row) is held to the resource floor
+only, so facts nobody read never fail closed.
+
+## Security notes
+
+- With autologin, PVE's `VM.Console` privilege on a container **equals root in
+  that container**. Grant console access accordingly.
+- The `update` gate is a **safety interlock**, not a security control. It stops
+  an operator from updating without a fresh restore point. Root in the
+  container can always run the updater directly.
 
 ## Verbs
 
@@ -20,30 +29,40 @@ closed.
 | `proxmox.guest.standard.audit` | read | probe one LXC and report its facts, guard violations and drift |
 | `proxmox.guest.standard.apply` | admin | install autologin and the `update` gate; dry-run unless `execute: true` |
 | `proxmox.guest.update` | admin | back up through the PVE API, then run the updater; dry-run unless `execute: true` |
-| `unit.update action=update` (lxc) | admin | the same backup-then-update, as a unit action |
+| `unit.update action=update` (lxc) | admin | the same backup-then-update; returns a plan unless the payload sets `"execute": true` |
+
+The unit action's dry run touches nothing, not even a read in the container, so
+it names how the updater is chosen rather than the exact commands.
+`proxmox.guest.update`'s dry run probes first and lists the exact steps.
 
 All of them run in-container work through `pct` on the node that runs the
-container, so they run on the orca instance on that node.
+container. Before any exec they check that the node name matches and that
+`/etc/pve/lxc/<vmid>.conf` exists locally, because pmxcfs lists only this node's
+containers there.
 
 ## Probe (read-only)
 
-The probe only uses `cat` and `ls -d`, both already on the allowlist. `test -e`
-would need its own allowlist entry, and `ls -d` gives the same answer.
+The probe uses only `head -c 65536 --`, `ls -d` and `systemctl cat`, all already
+on the allowlist. It is bounded to 10 s. Reads are capped because the paths are
+inside the container, and a guest could point one at `/dev/zero`. A file at the
+cap is an error, never a truncated read. `test -e` would need its own allowlist
+entry, and `ls -d` gives the same answer.
 
 | fact | read |
 | --- | --- |
-| OS | `cat /etc/os-release` (`ID` / `ID_LIKE`: debian, ubuntu, alpine) |
-| root console, Debian | `cat /etc/systemd/system/container-getty@.service.d/autologin.conf` contains `--autologin root` |
-| root console, Alpine | a live `getty` line in `/etc/inittab` uses `-l /usr/local/sbin/autologin`, and that wrapper contains `login -f root` |
-| `update` gate | `cat /usr/local/bin/update` carries the `# orca-update-gate v1` marker |
+| OS | `/etc/os-release` (`ID` / `ID_LIKE`: debian, ubuntu, alpine) |
+| root console, Debian | `systemctl cat container-getty@1.service` has a live line with `--autologin root`. This covers orca's `container-getty@.service.d/autologin.conf` and community-scripts' `container-getty@1.service.d/*.conf`. |
+| root console, Alpine | the live `tty1` line in `/etc/inittab` uses `-l /usr/local/sbin/autologin`, that wrapper contains `login -f root`, and `/etc/.pve-ignore.inittab` exists |
+| `update` gate | `/usr/local/bin/update` carries the `# orca-update-gate v1` marker |
+| foreign gate | `/usr/local/bin/update` exists without the marker (reported as drift) |
 | app updater | `ls -d /usr/bin/update` |
 | legacy backup key | `ls -d /root/.orca/host_backup_key` (reported as drift) |
 
 ## Apply
 
-Apply is idempotent: it writes a file only when its trimmed contents differ, and
-it reloads only after a write. The dry run lists each file (`create` or
-`overwrite`, with its mode) and each command.
+Apply is idempotent. It writes a file only when its trimmed contents differ, and
+it skips the console steps when autologin is already in effect. The dry run
+lists each file (`create`, or `overwrite` with a line diff) and each command.
 
 Debian / Ubuntu:
 
@@ -55,35 +74,76 @@ Debian / Ubuntu:
 
 Alpine:
 
-1. Write `/usr/local/sbin/autologin` (`exec login -f root`, mode 0755).
-2. Rewrite every live `/sbin/getty` line in `/etc/inittab` to
-   `/sbin/getty -n -l /usr/local/sbin/autologin ...`. Commented lines are left
-   alone.
-3. Run `kill -HUP 1`, because busybox init re-reads inittab only on SIGHUP. Until
+1. Write an empty `/etc/.pve-ignore.inittab`. On every container start, PVE's
+   Alpine setup drops each inittab line matching `^\s*tty\d+:\d*:[^:]*:.*getty`
+   and writes fresh `ttyN::respawn:/sbin/getty 38400 ttyN` lines, unless this
+   file exists. Without it, the autologin would be wiped before init read it.
+2. Write `/usr/local/sbin/autologin` (`exec login -f root`, mode 0755).
+3. Rewrite the live `ttyN` and `console` getty lines in `/etc/inittab` to
+   `/sbin/getty -n -l /usr/local/sbin/autologin ...`. Other ids (such as
+   `ttyS0`) and commented lines are left alone. A line that already passes
+   `-l <program>` is also left alone and reported as drift.
+4. Run `kill -HUP 1`, because busybox init re-reads inittab only on SIGHUP. Until
    orca allowlists `kill`, this step is **deferred**: the plan and the result
    mark it `deferred`, and autologin takes effect at the container's next start.
 
-Both:
+The `update` gate:
 
-- Write the gate to `/usr/local/bin/update` (mode 0755). It shadows
-  `/usr/bin/update` on `PATH`, and community-scripts regenerates that file after
-  every successful update, so the gate does not live there. The gate runs the
-  updater only while `/run/orca-update-backup.json` is less than an hour old.
-  Otherwise it refuses and tells the operator to run `proxmox.guest.update`.
+- **The gate is refused if its updater cannot run.** That is the case when the
+  updater `auto` resolves to (`/usr/bin/update` or `apk`) is not allowlisted, or
+  the OS has no updater. A gate nothing could open would only break `update`.
+- **An existing `/usr/local/bin/update` without the orca marker** (such as the
+  hand-rolled ssh gate) is refused unless `replace_gate: true` is passed. With
+  it, the old script is kept as `/usr/local/bin/update.orca-replaced`, and the
+  plan shows the diff.
+- **What gets written.** Otherwise the gate is written to
+  `/usr/local/bin/update` (mode 0755). It shadows `/usr/bin/update` on `PATH`;
+  community-scripts regenerates that file after every successful update, so the
+  gate does not live there.
+- **When it opens.** The gate runs the updater only while
+  `/run/orca-update-backup.json` is less than an hour old. Otherwise it refuses
+  and names the exact `proxmox.guest.update --endpoint … --ctid …` call. The
+  endpoint name is written into the script, so it must match `[A-Za-z0-9._-]`.
   `/run` is tmpfs, so a reboot closes the gate.
 
 ## Update
 
-1. Probe, and resolve the updater. With `auto`, that is the app's own
-   `/usr/bin/update` when present, otherwise `apk` on Alpine and `apt-get`
-   otherwise.
-2. Refuse **before the backup** if any updater step is outside the allowlist.
-3. Back up through the unit `backup` action: vzdump through the PVE API, waited
-   on. A failed backup aborts the update. When the caller passes a `backup`
-   (`BackupRef`) in the payload, that one is used instead.
-4. Write the backup reference to `/run/orca-update-backup.json`, which opens the
+Everything that can refuse does so before the backup:
+
+1. Probe, and resolve the updater. With `auto`, that is `/usr/bin/update` when
+   present, otherwise `apk` on Alpine and `apt-get` on Debian/Ubuntu.
+   - An explicit updater that does not fit the OS is refused, for example `apt`
+     on Alpine, or `community` without `/usr/bin/update`.
+   - So is an OS with no updater.
+2. Refuse if any updater command is outside the allowlist.
+3. On systemd guests, refuse if `orca-guest-update.service` is already running.
+
+Then:
+
+4. Back up through the unit `backup` action: vzdump through the PVE API, waited
+   on. A failed backup aborts the update.
+5. Write the backup reference to `/run/orca-update-backup.json`, which opens the
    in-guest gate for an hour.
-5. Run the updater. A failing step stops the run and names what already ran.
+6. Run the updater.
+   - **On Debian/Ubuntu** it runs as a oneshot systemd unit, so the 5-minute
+     lxc-exec timeout cannot kill dpkg mid-upgrade. Orca writes
+     `/run/systemd/system/orca-guest-update.service` with
+     `DEBIAN_FRONTEND=noninteractive` and one `ExecStart=` per command, and
+     resets `/var/log/orca-guest-update.log`. It then runs
+     `systemctl daemon-reload` and
+     `systemctl start --no-block orca-guest-update.service`, polls
+     `systemctl is-active` every 5 s for up to 2 h, and requires
+     `systemctl show -p Result` to be `success`. The last 40 log lines come
+     back as output.
+   - **On Alpine** the commands run directly through the seam, still under its
+     5-minute timeout.
+
+Any failure after the backup names the restore point and the exact
+`unit.update action=restore` payload.
+
+The update takes its own backup. The payload has no field for a backup taken
+elsewhere: a caller-supplied `BackupRef` cannot be trusted until core's
+pre-mutation guard (orca#767) hands one over on a trusted channel.
 
 This replaces the hand-rolled gate, which reached the host over ssh with a
 forced-command key (`/root/.orca/host_backup_key` →
@@ -104,7 +164,12 @@ list (`lxc_guest::EXEC_ALLOWLIST`) and the needed additions
 | --- | --- | --- |
 | `kill` | `kill -HUP 1` | makes the Alpine inittab change live without a container restart |
 | `apk` | `apk update`, `apk upgrade` | the Alpine package updater, the counterpart of the allowed `apt-get` |
-| `update` | `/usr/bin/update` | the app's own updater (community-scripts, or a Gitea or Caddy updater that validates and rolls back), run only after orca's backup |
+| `/usr/bin/update` | the app's own updater | community-scripts, or a Gitea or Caddy updater that validates and rolls back, run only after orca's backup. Proposed as an absolute path, because the allowlist matches basenames today and a bare `update` would admit any program of that name. |
 
-`sh` is not requested. Every step execs its program directly, and allowing
-`sh -c` would turn the seam into arbitrary root exec in the container.
+`sh` is not requested. Every step execs its program directly, and `sh -c` would
+let the exec seam run any command line it is handed.
+
+The allowlist bounds what the exec seam runs. It is not a complete boundary for
+the container, because `lxc-push` already writes files as root, including the
+update unit above. The plugin only ever puts commands that are themselves
+allowlisted into that unit.

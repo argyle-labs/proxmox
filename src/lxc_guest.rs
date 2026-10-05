@@ -31,10 +31,12 @@ pub const EXEC_ALLOWLIST: &[&str] = &[
 
 /// Entries the guest standard needs on orca's root-side allowlist (orca#769),
 /// each with why. Until orca ships them, steps using them are named in the
-/// dry-run plan and refused or deferred before anything runs.
+/// dry-run plan and refused or deferred before anything runs. `/usr/bin/update`
+/// is an absolute path because a bare `update` basename would admit any
+/// program of that name anywhere in the container.
 ///
-/// `sh` is deliberately absent: every step execs its program directly, and
-/// `sh -c` would turn the allowlist into arbitrary root-in-container exec.
+/// `sh` is absent: every step execs its program directly, and `sh -c` would
+/// let the exec seam run any command line it is handed.
 pub const PROPOSED_ALLOWLIST: &[(&str, &str)] = &[
     (
         "kill",
@@ -47,8 +49,8 @@ pub const PROPOSED_ALLOWLIST: &[(&str, &str)] = &[
          equivalent already allowed",
     ),
     (
-        "update",
-        "`/usr/bin/update`: the app's own updater (community-scripts, or the Gitea \
+        "/usr/bin/update",
+        "the app's own updater (community-scripts, or the Gitea \
          and Caddy updaters that validate and roll back), run after orca's backup",
     ),
 ];
@@ -188,11 +190,20 @@ async fn push(vmid: u32, path: &str, contents: &[u8], mode: Option<&str>) -> Res
     Ok(())
 }
 
+/// Largest file [`read_file`] returns. The path is guest-controlled, and a
+/// `cat` of `/dev/zero` would have root on the host buffer without bound.
+pub const READ_CAP: usize = 64 * 1024;
+
 /// A file's contents (trimmed, as the seam returns them), or `None` when it
-/// does not exist.
+/// does not exist. A file of [`READ_CAP`] bytes or more is an error, so a
+/// truncated read is never mistaken for the whole file.
 pub async fn read_file(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<Option<String>> {
-    let r = io.exec(vmid, &["cat", path]).await?;
+    let cap = READ_CAP.to_string();
+    let r = io.exec(vmid, &["head", "-c", &cap, "--", path]).await?;
     if r.success {
+        if r.stdout.len() >= READ_CAP {
+            bail!("read {path} in CT {vmid}: larger than {READ_CAP} bytes");
+        }
         return Ok(Some(r.stdout));
     }
     if r.stderr.contains("No such file") {
@@ -273,6 +284,30 @@ pub fn require_local(ct: &CtRef, local: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `/etc/pve/lxc` holds only this node's containers (pmxcfs links it to
+/// `nodes/<this node>/lxc`), so a conf there proves the container is local even
+/// when the plugin's hostname differs from its PVE node name.
+pub const PVE_LXC_CONF_DIR: &str = "/etc/pve/lxc";
+
+pub fn require_local_conf(dir: &std::path::Path, vmid: u64) -> Result<()> {
+    let conf = dir.join(format!("{vmid}.conf"));
+    if !conf.exists() {
+        bail!(
+            "CT {vmid}: {} is not on this node, so `pct` here cannot reach it; run this on \
+             the orca instance on the container's node",
+            conf.display()
+        );
+    }
+    Ok(())
+}
+
+/// [`require_local`] by node name, then by the node-local conf, before any
+/// in-container exec.
+pub fn ensure_local(ct: &CtRef) -> Result<()> {
+    require_local(ct, &crate::diagnostics::local_node())?;
+    require_local_conf(std::path::Path::new(PVE_LXC_CONF_DIR), ct.vmid)
 }
 
 /// Recording fake for tests: answers `exec` from a table keyed by the joined
@@ -408,8 +443,33 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_maps_missing_to_none() {
-        let io = fake::FakeIo::with(&[("cat /a", fake::ok("x")), ("cat /b", fake::missing("/b"))]);
+        let io = fake::FakeIo::with(&[
+            ("head -c 65536 -- /a", fake::ok("x")),
+            ("head -c 65536 -- /b", fake::missing("/b")),
+        ]);
         assert_eq!(read_file(&io, 1, "/a").await.unwrap().as_deref(), Some("x"));
         assert_eq!(read_file(&io, 1, "/b").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn read_file_refuses_a_capped_read() {
+        let big = "z".repeat(READ_CAP);
+        let io = fake::FakeIo::with(&[("head -c 65536 -- /dev/zero", fake::ok(&big))]);
+        let err = read_file(&io, 1, "/dev/zero")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("larger than 65536 bytes"), "{err}");
+    }
+
+    #[test]
+    fn locality_needs_the_node_local_conf() {
+        let dir = std::env::temp_dir().join(format!("pve-lxc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("116.conf"), "arch: amd64\n").unwrap();
+        assert!(require_local_conf(&dir, 116).is_ok());
+        let err = require_local_conf(&dir, 117).unwrap_err().to_string();
+        assert!(err.contains("117.conf is not on this node"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

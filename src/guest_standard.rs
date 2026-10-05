@@ -1,33 +1,32 @@
 //! Guest standard for LXC containers: a root console that logs in without a
 //! password, and a one-word `update` that only runs after an orca backup.
 //!
-//! * [`probe`] reads the facts through allowlisted `cat`/`ls`, feeding
-//!   `UnitFacts::has_root_console` / `has_update_command`.
+//! * [`probe`] reads the facts through allowlisted `head`/`ls`/`systemctl cat`,
+//!   feeding `UnitFacts::has_root_console` / `has_update_command`.
 //! * `proxmox.guest.standard.audit` (read) reports them per container, checked
 //!   against [`standard_guard`].
 //! * `proxmox.guest.standard.apply` (admin, dry-run by default) installs the
 //!   console autologin (Debian: a `container-getty@` drop-in; Alpine: an
 //!   inittab `getty -n -l` wrapper) and the `update` gate script.
 //! * `proxmox.guest.update` (admin, dry-run by default) and the unit action
-//!   `update` take a vzdump backup through the PVE API, record it in the
-//!   container, then run the updater.
-//!
-//! The backup is the same `unit.update action=backup` path core's
-//! `dispatch_guarded` (orca#767) will call before a mutation. Once that is
-//! wired, core passes the [`BackupRef`] it took in [`GuestUpdatePayload::backup`]
-//! and the update skips its own.
+//!   `update` (dry-run unless its payload sets `execute`) take a vzdump backup
+//!   through the PVE API, record it in the container, then run the updater.
 //!
 //! The `update` gate replaces the hand-rolled forced-command ssh key
 //! ([`LEGACY_BACKUP_KEY`] → the host's `orca-guest-backup`): orca takes the
 //! backup through the PVE API, so the guest holds no credential to its host.
-//! The probe reports a leftover key so it can be retired.
+//! The probe reports a leftover key so it can be retired. The gate is a safety
+//! interlock against updating without a restore point, not a security control:
+//! root in the container can always run the updater directly.
 //!
 //! Every in-container command goes through orca's lxc-exec allowlist. A step
 //! outside it ([`lxc_guest::PROPOSED_ALLOWLIST`]) is named in the plan as
 //! `needs allowlist: X` and refused before anything runs, except the Alpine
 //! inittab reload, which is deferred to the container's next start.
 
-use plugin_toolkit::contract::plan::PlannedChange;
+use std::time::Duration;
+
+use plugin_toolkit::contract::plan::{ExecutionPlan, PlannedChange};
 use plugin_toolkit::contract::{BackupRef, BoxFuture, CallerIdentity, UnitFacts, UnitGuard};
 use plugin_toolkit::prelude::*;
 
@@ -36,9 +35,18 @@ use crate::lxc_guest::{self, CtRef, GuestIo, needs_allowlist};
 use crate::tools::resolve_config;
 
 pub const DEBIAN_AUTOLOGIN: &str = "/etc/systemd/system/container-getty@.service.d/autologin.conf";
+/// The unit PVE starts for the first console; `systemctl cat` of it shows every
+/// drop-in, so autologin from any layout (ours, community-scripts' per-tty
+/// override) is seen.
+const DEBIAN_CONSOLE_UNIT: &str = "container-getty@1.service";
 pub const ALPINE_AUTOLOGIN: &str = "/usr/local/sbin/autologin";
 pub const INITTAB: &str = "/etc/inittab";
+/// PVE's Alpine setup regenerates every `ttyN::…getty` line in `/etc/inittab`
+/// on each container start unless this file exists.
+pub const PVE_IGNORE_INITTAB: &str = "/etc/.pve-ignore.inittab";
 pub const UPDATE_GATE: &str = "/usr/local/bin/update";
+/// Where `apply` keeps a non-orca gate it replaces.
+pub const REPLACED_GATE: &str = "/usr/local/bin/update.orca-replaced";
 /// community-scripts' per-app updater.
 pub const COMMUNITY_UPDATER: &str = "/usr/bin/update";
 /// Written after a successful pre-update backup; the gate script runs the
@@ -49,6 +57,16 @@ pub const BACKUP_MARKER: &str = "/run/orca-update-backup.json";
 pub const LEGACY_BACKUP_KEY: &str = "/root/.orca/host_backup_key";
 pub const GATE_WINDOW_SECS: u64 = 3600;
 const GATE_MARKER: &str = "# orca-update-gate v1";
+
+/// systemd guests run the updater as this unit so the seam's 5-minute exec
+/// timeout can never kill dpkg mid-upgrade.
+pub const UPDATE_UNIT: &str = "orca-guest-update.service";
+pub const UPDATE_UNIT_PATH: &str = "/run/systemd/system/orca-guest-update.service";
+pub const UPDATE_LOG: &str = "/var/log/orca-guest-update.log";
+const UPDATE_DEADLINE: Duration = Duration::from_secs(2 * 3600);
+const UPDATE_POLL: Duration = Duration::from_secs(5);
+/// Bounds the whole probe; `unit.detail` runs it for any caller.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub const DEBIAN_AUTOLOGIN_CONF: &str = "[Service]
 ExecStart=
@@ -100,43 +118,97 @@ pub struct StandardFacts {
     /// The hand-rolled gate's ssh key is still in the container.
     #[serde(default)]
     pub legacy_backup_key: bool,
+    /// A `/usr/local/bin/update` exists that is not orca's gate.
+    #[serde(default)]
+    pub foreign_gate: bool,
+    /// inittab getty lines that already set another login program.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub console_drift: Vec<String>,
 }
 
-fn debian_console_ok(conf: Option<&str>) -> bool {
-    conf.is_some_and(|c| c.contains("--autologin root"))
+fn live_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().filter(|l| !l.trim_start().starts_with('#'))
 }
 
-fn inittab_uses_autologin(inittab: &str) -> bool {
-    inittab
-        .lines()
-        .filter(|l| !l.trim_start().starts_with('#'))
-        .any(|l| l.contains("getty") && l.contains(&format!("-l {ALPINE_AUTOLOGIN}")))
+fn debian_console_ok(unit: &str) -> bool {
+    live_lines(unit).any(|l| l.contains("--autologin root"))
 }
 
-/// Read-only: `cat` and `ls` only.
+/// The inittab id (`tty1`, `console`, …) of a line.
+fn inittab_id(line: &str) -> &str {
+    line.trim_start().split(':').next().unwrap_or_default()
+}
+
+/// Ids the autologin rewrite touches: the virtual consoles and `console`.
+fn console_id(id: &str) -> bool {
+    id == "console"
+        || id
+            .strip_prefix("tty")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// A live getty line already passing `-l <program>`.
+fn sets_login_program(line: &str) -> bool {
+    line.split_once("/sbin/getty ")
+        .is_some_and(|(_, args)| args.split_whitespace().any(|a| a == "-l"))
+}
+
+fn uses_autologin(line: &str) -> bool {
+    line.contains(&format!("-l {ALPINE_AUTOLOGIN} "))
+}
+
+/// The PVE console attaches to tty1, so that line decides the fact.
+fn tty1_uses_autologin(inittab: &str) -> bool {
+    live_lines(inittab).any(|l| inittab_id(l) == "tty1" && uses_autologin(l))
+}
+
+/// Getty lines left alone because they already set another login program.
+fn inittab_drift(inittab: &str) -> Vec<String> {
+    live_lines(inittab)
+        .filter(|l| console_id(inittab_id(l)) && sets_login_program(l) && !uses_autologin(l))
+        .map(|l| format!("{INITTAB}: `{l}` already sets a login program; left unchanged"))
+        .collect()
+}
+
+/// Read-only, bounded by [`PROBE_TIMEOUT`].
 pub async fn probe(io: &dyn GuestIo, vmid: u32) -> Result<StandardFacts> {
+    probe_within(io, vmid, PROBE_TIMEOUT).await
+}
+
+async fn probe_within(io: &dyn GuestIo, vmid: u32, limit: Duration) -> Result<StandardFacts> {
+    tokio::time::timeout(limit, probe_inner(io, vmid))
+        .await
+        .map_err(|_| anyhow!("CT {vmid}: probe timed out after {limit:?}"))?
+}
+
+async fn probe_inner(io: &dyn GuestIo, vmid: u32) -> Result<StandardFacts> {
     let release = lxc_guest::read_file(io, vmid, "/etc/os-release")
         .await?
         .unwrap_or_default();
     let os = os_from_release(&release);
+    let mut console_drift = Vec::new();
     let has_root_console = match os {
-        Os::Debian => debian_console_ok(
-            lxc_guest::read_file(io, vmid, DEBIAN_AUTOLOGIN)
-                .await?
-                .as_deref(),
-        ),
+        Os::Debian => {
+            let r = io
+                .exec(vmid, &["systemctl", "cat", DEBIAN_CONSOLE_UNIT])
+                .await?;
+            r.success && debian_console_ok(&r.stdout)
+        }
         Os::Alpine => {
             let inittab = lxc_guest::read_file(io, vmid, INITTAB)
                 .await?
                 .unwrap_or_default();
+            console_drift = inittab_drift(&inittab);
             let wrapper = lxc_guest::read_file(io, vmid, ALPINE_AUTOLOGIN).await?;
-            inittab_uses_autologin(&inittab) && wrapper.is_some_and(|w| w.contains("login -f root"))
+            tty1_uses_autologin(&inittab)
+                && wrapper.is_some_and(|w| w.contains("login -f root"))
+                && lxc_guest::exists(io, vmid, PVE_IGNORE_INITTAB).await?
         }
         Os::Other => false,
     };
-    let has_update_command = lxc_guest::read_file(io, vmid, UPDATE_GATE)
-        .await?
-        .is_some_and(|g| g.contains(GATE_MARKER));
+    let gate = lxc_guest::read_file(io, vmid, UPDATE_GATE).await?;
+    let has_update_command = gate.as_deref().is_some_and(|g| g.contains(GATE_MARKER));
+    let foreign_gate = gate.is_some() && !has_update_command;
     let community_updater = lxc_guest::exists(io, vmid, COMMUNITY_UPDATER).await?;
     let legacy_backup_key = lxc_guest::exists(io, vmid, LEGACY_BACKUP_KEY).await?;
     Ok(StandardFacts {
@@ -145,6 +217,8 @@ pub async fn probe(io: &dyn GuestIo, vmid: u32) -> Result<StandardFacts> {
         has_update_command,
         community_updater,
         legacy_backup_key,
+        foreign_gate,
+        console_drift,
     })
 }
 
@@ -174,15 +248,16 @@ pub fn standard_guard(base: UnitGuard) -> UnitGuard {
     }
 }
 
-/// Alpine inittab with every getty line logging in through the autologin
-/// wrapper. Lines already using it are left alone.
+/// Alpine inittab with each live `ttyN` / `console` getty logging in through
+/// the autologin wrapper. Lines already using it, or already setting another
+/// login program, are left alone.
 pub fn alpine_inittab(current: &str) -> String {
     let mut out: Vec<String> = current
         .lines()
         .map(|l| {
             let live = !l.trim_start().starts_with('#');
             match l.find("/sbin/getty ") {
-                Some(i) if live && !l.contains(&format!("-l {ALPINE_AUTOLOGIN}")) => {
+                Some(i) if live && console_id(inittab_id(l)) && !sets_login_program(l) => {
                     let at = i + "/sbin/getty ".len();
                     format!("{}-n -l {ALPINE_AUTOLOGIN} {}", &l[..at], &l[at..])
                 }
@@ -194,24 +269,41 @@ pub fn alpine_inittab(current: &str) -> String {
     out.join("\n")
 }
 
-pub fn gate_script(ctid: u64) -> String {
-    format!(
+/// The endpoint is interpolated into a root shell script, so it must be inert.
+fn shell_safe(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+pub fn gate_script(endpoint: &str, ctid: u64) -> Result<String> {
+    if !shell_safe(endpoint) {
+        bail!("endpoint '{endpoint}' must be [A-Za-z0-9._-] to be named in the gate script");
+    }
+    Ok(format!(
         r#"#!/bin/sh
 {GATE_MARKER}
-# Runs the updater only after orca has backed this container up.
+# A safety interlock, not a security control: runs the updater only after orca
+# has backed this container up.
 marker={BACKUP_MARKER}
 if [ ! -f "$marker" ] || [ $(( $(date +%s) - $(stat -c %Y "$marker") )) -gt {GATE_WINDOW_SECS} ]; then
   echo "update: no orca backup of CT {ctid} in the last hour." >&2
-  echo "Run it through orca (backs up first): proxmox.guest.update --ctid {ctid} --execute" >&2
+  echo "Run it through orca (backs up first): proxmox.guest.update --endpoint {endpoint} --ctid {ctid} --execute" >&2
   exit 1
 fi
-if [ -x {COMMUNITY_UPDATER} ]; then exec {COMMUNITY_UPDATER} "$@"; fi
-if command -v apt-get >/dev/null 2>&1; then apt-get update && exec apt-get -y dist-upgrade; fi
-if command -v apk >/dev/null 2>&1; then apk update && exec apk upgrade; fi
-echo "update: no updater found" >&2
+if [ -x {COMMUNITY_UPDATER} ]; then
+  exec {COMMUNITY_UPDATER} "$@"
+elif command -v apt-get >/dev/null 2>&1; then
+  apt-get update || exit 1
+  exec apt-get -y dist-upgrade
+elif command -v apk >/dev/null 2>&1; then
+  apk update || exit 1
+  exec apk upgrade
+fi
+echo "update: no updater found (no {COMMUNITY_UPDATER}, apt-get or apk)" >&2
 exit 1
 "#
-    )
+    ))
 }
 
 /// One step of an apply or update.
@@ -230,6 +322,10 @@ pub enum Step {
         /// change takes effect at the container's next start instead.
         deferrable: bool,
     },
+    /// Wait for [`UPDATE_UNIT`] to finish, polling `systemctl is-active`.
+    AwaitUnit,
+    /// A change apply will not make; stops the whole run.
+    Refuse { target: String, reason: String },
 }
 
 impl Step {
@@ -254,7 +350,8 @@ impl Step {
             Step::Exec { argv, why, .. } => {
                 needs_allowlist(&argv[0]).map(|n| format!("{n} ({why}: `{}`)", argv.join(" ")))
             }
-            Step::Write { .. } => None,
+            Step::Refuse { target, reason } => Some(format!("{target}: {reason}")),
+            _ => None,
         }
     }
 
@@ -262,9 +359,9 @@ impl Step {
     fn blocker(&self) -> Option<String> {
         match self {
             Step::Exec {
-                deferrable: false, ..
-            } => self.refused(),
-            _ => None,
+                deferrable: true, ..
+            } => None,
+            _ => self.refused(),
         }
     }
 
@@ -283,16 +380,19 @@ impl Step {
     fn to_change(&self, ctid: u64) -> PlannedChange {
         match self {
             Step::Write {
-                path, mode, before, ..
-            } => PlannedChange::new(
-                format!("ct/{ctid}:{path}"),
-                if before.is_some() {
-                    "overwrite"
-                } else {
-                    "create"
-                },
-            )
-            .with_detail(format!("mode {mode}")),
+                path,
+                contents,
+                mode,
+                before,
+            } => match before {
+                Some(b) => PlannedChange::new(format!("ct/{ctid}:{path}"), "overwrite")
+                    .with_detail(format!(
+                        "mode {mode}; {}",
+                        crate::backup_jobs::line_diff(b, contents)
+                    )),
+                None => PlannedChange::new(format!("ct/{ctid}:{path}"), "create")
+                    .with_detail(format!("mode {mode}")),
+            },
             Step::Exec { argv, why, .. } => {
                 let (action, detail) = match (self.blocker(), self.deferred()) {
                     (Some(b), _) => ("exec", format!("{why}; {b}")),
@@ -301,6 +401,15 @@ impl Step {
                 };
                 PlannedChange::new(format!("ct/{ctid}: {}", argv.join(" ")), action)
                     .with_detail(detail)
+            }
+            Step::AwaitUnit => PlannedChange::new(format!("ct/{ctid}: {UPDATE_UNIT}"), "wait")
+                .with_detail(format!(
+                    "poll `systemctl is-active {UPDATE_UNIT}` every {}s, up to {}h; output in {UPDATE_LOG}",
+                    UPDATE_POLL.as_secs(),
+                    UPDATE_DEADLINE.as_secs() / 3600
+                )),
+            Step::Refuse { target, reason } => {
+                PlannedChange::new(format!("ct/{ctid}:{target}"), "refused").with_detail(reason)
             }
         }
     }
@@ -320,44 +429,52 @@ fn write_if_changed(
     })
 }
 
-/// Read what `apply` would change and return its steps. Reads only.
+/// Read what `apply` would change and return its steps, with drift notes.
+/// Reads only.
 pub async fn plan_apply(
     io: &dyn GuestIo,
-    ctid: u64,
-    console: bool,
-    update_gate: bool,
-) -> Result<Vec<Step>> {
+    args: &StandardApplyArgs,
+) -> Result<(Vec<Step>, Vec<String>)> {
+    let ctid = args.ctid;
     let vmid = ctid as u32;
-    let release = lxc_guest::read_file(io, vmid, "/etc/os-release")
-        .await?
-        .unwrap_or_default();
-    let os = os_from_release(&release);
+    let facts = probe(io, vmid).await?;
     let mut steps = Vec::new();
-    if console {
-        match os {
+    let notes = facts.console_drift.clone();
+    if args.console {
+        match facts.os {
+            Os::Debian if facts.has_root_console => {}
             Os::Debian => {
                 let cur = lxc_guest::read_file(io, vmid, DEBIAN_AUTOLOGIN).await?;
-                if let Some(s) =
-                    write_if_changed(DEBIAN_AUTOLOGIN, DEBIAN_AUTOLOGIN_CONF.into(), "0644", cur)
-                {
-                    steps.push(s);
-                    steps.push(Step::exec(
-                        &["systemctl", "daemon-reload"],
-                        "load the getty drop-in",
-                    ));
-                    // Restarting the getty ends an open console session on it.
-                    steps.push(Step::exec(
-                        &[
-                            "systemctl",
-                            "try-restart",
-                            "container-getty@1.service",
-                            "container-getty@2.service",
-                        ],
-                        "restart running gettys with autologin",
-                    ));
-                }
+                steps.extend(write_if_changed(
+                    DEBIAN_AUTOLOGIN,
+                    DEBIAN_AUTOLOGIN_CONF.into(),
+                    "0644",
+                    cur,
+                ));
+                steps.push(Step::exec(
+                    &["systemctl", "daemon-reload"],
+                    "load the getty drop-in",
+                ));
+                // Restarting the getty ends an open console session on it.
+                steps.push(Step::exec(
+                    &[
+                        "systemctl",
+                        "try-restart",
+                        "container-getty@1.service",
+                        "container-getty@2.service",
+                    ],
+                    "restart running gettys with autologin",
+                ));
             }
             Os::Alpine => {
+                if !lxc_guest::exists(io, vmid, PVE_IGNORE_INITTAB).await? {
+                    steps.push(Step::Write {
+                        path: PVE_IGNORE_INITTAB.into(),
+                        contents: String::new(),
+                        mode: "0644",
+                        before: None,
+                    });
+                }
                 let wrapper = lxc_guest::read_file(io, vmid, ALPINE_AUTOLOGIN).await?;
                 steps.extend(write_if_changed(
                     ALPINE_AUTOLOGIN,
@@ -383,16 +500,64 @@ pub async fn plan_apply(
             ),
         }
     }
-    if update_gate {
-        let cur = lxc_guest::read_file(io, vmid, UPDATE_GATE).await?;
-        steps.extend(write_if_changed(
-            UPDATE_GATE,
-            gate_script(ctid),
-            "0755",
-            cur,
+    if args.update_gate {
+        steps.extend(plan_gate(io, args, &facts).await?);
+    }
+    Ok((steps, notes))
+}
+
+async fn plan_gate(
+    io: &dyn GuestIo,
+    args: &StandardApplyArgs,
+    facts: &StandardFacts,
+) -> Result<Vec<Step>> {
+    let vmid = args.ctid as u32;
+    let refuse = |reason: String| {
+        Ok(vec![Step::Refuse {
+            target: UPDATE_GATE.into(),
+            reason,
+        }])
+    };
+    // A gate whose updater orca cannot run would never open.
+    let updater_blocked = match updater_commands(Updater::Auto, facts) {
+        Ok(cmds) => blockers(&cmds),
+        Err(e) => vec![e.to_string()],
+    };
+    if !updater_blocked.is_empty() {
+        return refuse(format!(
+            "the gate could never open: its updater is refused ({})",
+            updater_blocked.join("; ")
         ));
     }
-    Ok(steps)
+    let want = gate_script(&args.endpoint, args.ctid)?;
+    let cur = lxc_guest::read_file(io, vmid, UPDATE_GATE).await?;
+    match cur {
+        Some(c) if !c.contains(GATE_MARKER) => {
+            if !args.replace_gate {
+                return refuse(format!(
+                    "is not orca's gate; pass replace_gate to replace it (kept as {REPLACED_GATE})"
+                ));
+            }
+            let kept = lxc_guest::read_file(io, vmid, REPLACED_GATE).await?;
+            Ok(vec![
+                Step::Write {
+                    path: REPLACED_GATE.into(),
+                    contents: c.clone(),
+                    mode: "0755",
+                    before: kept,
+                },
+                Step::Write {
+                    path: UPDATE_GATE.into(),
+                    contents: want,
+                    mode: "0755",
+                    before: Some(c),
+                },
+            ])
+        }
+        cur => Ok(write_if_changed(UPDATE_GATE, want, "0755", cur)
+            .into_iter()
+            .collect()),
+    }
 }
 
 fn blockers(steps: &[Step]) -> Vec<String> {
@@ -427,8 +592,71 @@ pub struct StepOutcome {
     pub output: Option<String>,
 }
 
-/// Run `steps`. An exec that exits non-zero stops the run with what already
-/// ran named, so a partial apply never reads as success.
+fn exec_failure(r: lxc_guest::ExecResult) -> anyhow::Error {
+    anyhow!(
+        "exit {:?}: {}",
+        r.exit_code,
+        if r.stderr.is_empty() {
+            r.stdout
+        } else {
+            r.stderr
+        }
+    )
+}
+
+async fn run_exec(io: &dyn GuestIo, vmid: u32, argv: &[&str]) -> Result<String> {
+    let r = io.exec(vmid, argv).await?;
+    if r.success {
+        Ok(r.stdout)
+    } else {
+        Err(exec_failure(r))
+    }
+}
+
+async fn update_log_tail(io: &dyn GuestIo, vmid: u32) -> String {
+    match io.exec(vmid, &["tail", "-n", "40", UPDATE_LOG]).await {
+        Ok(r) => r.stdout,
+        Err(e) => format!("(could not read {UPDATE_LOG}: {e})"),
+    }
+}
+
+/// Poll [`UPDATE_UNIT`] until it leaves `activating`/`active`, then require
+/// `Result=success`.
+async fn await_unit(io: &dyn GuestIo, vmid: u32) -> Result<String> {
+    let deadline = tokio::time::Instant::now() + UPDATE_DEADLINE;
+    loop {
+        // `is-active` exits non-zero for every state but active, so read stdout.
+        let state = io
+            .exec(vmid, &["systemctl", "is-active", UPDATE_UNIT])
+            .await?
+            .stdout;
+        if state != "activating" && state != "active" && state != "reloading" {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "{UPDATE_UNIT} is still running after {}h; it keeps running in the container \
+                 (check `systemctl status {UPDATE_UNIT}` and {UPDATE_LOG})",
+                UPDATE_DEADLINE.as_secs() / 3600
+            );
+        }
+        tokio::time::sleep(UPDATE_POLL).await;
+    }
+    let result = run_exec(
+        io,
+        vmid,
+        &["systemctl", "show", "-p", "Result", "--value", UPDATE_UNIT],
+    )
+    .await?;
+    let tail = update_log_tail(io, vmid).await;
+    if result != "success" {
+        bail!("{UPDATE_UNIT} finished with Result={result}; last output:\n{tail}");
+    }
+    Ok(tail)
+}
+
+/// Run `steps`. A failing step stops the run with what already ran named, so a
+/// partial apply never reads as success.
 pub async fn run_steps(io: &dyn GuestIo, ctid: u64, steps: &[Step]) -> Result<Vec<StepOutcome>> {
     let vmid = ctid as u32;
     let mut done: Vec<StepOutcome> = Vec::new();
@@ -454,24 +682,18 @@ pub async fn run_steps(io: &dyn GuestIo, ctid: u64, steps: &[Step]) -> Result<Ve
             }),
             Step::Exec { argv, .. } => {
                 let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-                match io.exec(vmid, &args).await {
-                    Ok(r) if r.success => Ok(StepOutcome {
-                        target: argv.join(" "),
-                        action: "exec".into(),
-                        output: (!r.stdout.is_empty()).then_some(r.stdout),
-                    }),
-                    Ok(r) => Err(anyhow!(
-                        "exit {:?}: {}",
-                        r.exit_code,
-                        if r.stderr.is_empty() {
-                            r.stdout
-                        } else {
-                            r.stderr
-                        }
-                    )),
-                    Err(e) => Err(e),
-                }
+                run_exec(io, vmid, &args).await.map(|out| StepOutcome {
+                    target: argv.join(" "),
+                    action: "exec".into(),
+                    output: (!out.is_empty()).then_some(out),
+                })
             }
+            Step::AwaitUnit => await_unit(io, vmid).await.map(|tail| StepOutcome {
+                target: UPDATE_UNIT.into(),
+                action: "wait".into(),
+                output: (!tail.is_empty()).then_some(tail),
+            }),
+            Step::Refuse { .. } => Err(anyhow!("{}", s.refused().unwrap_or_default())),
         };
         match outcome {
             Ok(o) => done.push(o),
@@ -492,10 +714,7 @@ pub async fn run_steps(io: &dyn GuestIo, ctid: u64, steps: &[Step]) -> Result<Ve
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct GuestApplied {
-    /// Always `false`: changes were applied.
-    pub dry_run: bool,
     pub ctid: u64,
     pub steps: Vec<StepOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -537,33 +756,38 @@ pub struct GuestUpdatePayload {
     /// backup storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<String>,
-    /// A backup already taken by the caller (core's pre-mutation guard). When
-    /// set, no second backup is taken.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backup: Option<BackupRef>,
+    /// Back up and update. Omitted, returns the plan and touches nothing.
+    #[serde(default)]
+    pub execute: bool,
 }
 
-pub fn updater_steps(updater: Updater, facts: &StandardFacts) -> Vec<Step> {
-    let resolved = match updater {
-        Updater::Auto if facts.community_updater => Updater::Community,
-        Updater::Auto if facts.os == Os::Alpine => Updater::Apk,
-        Updater::Auto => Updater::Apt,
-        u => u,
+/// The updater's commands, refused for an OS / updater pair that cannot work.
+pub fn updater_commands(updater: Updater, facts: &StandardFacts) -> Result<Vec<Step>> {
+    let resolved = match (updater, &facts.os) {
+        (Updater::Auto, _) if facts.community_updater => Updater::Community,
+        (Updater::Auto, Os::Alpine) => Updater::Apk,
+        (Updater::Auto, Os::Debian) => Updater::Apt,
+        (Updater::Auto, Os::Other) => {
+            bail!("no updater for this OS: no {COMMUNITY_UPDATER}, and not Debian or Alpine")
+        }
+        (Updater::Community, _) if !facts.community_updater => {
+            bail!("updater 'community' needs {COMMUNITY_UPDATER}, which is not present")
+        }
+        (Updater::Apt, os) if *os != Os::Debian => bail!("updater 'apt' needs Debian/Ubuntu"),
+        (Updater::Apk, os) if *os != Os::Alpine => bail!("updater 'apk' needs Alpine"),
+        (u, _) => u,
     };
-    match resolved {
-        Updater::Community => vec![Step::exec(
-            &[COMMUNITY_UPDATER],
-            "community-scripts app updater",
-        )],
+    Ok(match resolved {
+        Updater::Community => vec![Step::exec(&[COMMUNITY_UPDATER], "the app's own updater")],
         Updater::Apk => vec![
-            Step::exec(&["apk", "update"], "refresh package index"),
-            Step::exec(&["apk", "upgrade"], "upgrade packages"),
+            Step::exec(&["/sbin/apk", "update"], "refresh package index"),
+            Step::exec(&["/sbin/apk", "upgrade"], "upgrade packages"),
         ],
         _ => vec![
-            Step::exec(&["apt-get", "update"], "refresh package index"),
+            Step::exec(&["/usr/bin/apt-get", "update"], "refresh package index"),
             Step::exec(
                 &[
-                    "apt-get",
+                    "/usr/bin/apt-get",
                     "-y",
                     "-o",
                     "Dpkg::Options::=--force-confdef",
@@ -574,7 +798,58 @@ pub fn updater_steps(updater: Updater, facts: &StandardFacts) -> Vec<Step> {
                 "upgrade packages, keeping changed config files",
             ),
         ],
+    })
+}
+
+pub fn update_unit(commands: &[Step]) -> String {
+    let mut unit = format!(
+        "[Unit]
+Description=orca guest update (runs after an orca backup)
+
+[Service]
+Type=oneshot
+Environment=DEBIAN_FRONTEND=noninteractive
+StandardOutput=append:{UPDATE_LOG}
+StandardError=inherit
+"
+    );
+    for c in commands {
+        if let Step::Exec { argv, .. } = c {
+            unit.push_str(&format!("ExecStart={}\n", argv.join(" ")));
+        }
     }
+    unit
+}
+
+/// The steps that run `commands`: on systemd guests as [`UPDATE_UNIT`], polled
+/// to completion; elsewhere directly through the seam.
+pub fn updater_steps(commands: Vec<Step>, os: &Os) -> Vec<Step> {
+    if *os != Os::Debian {
+        return commands;
+    }
+    vec![
+        Step::Write {
+            path: UPDATE_UNIT_PATH.into(),
+            contents: update_unit(&commands),
+            mode: "0644",
+            before: None,
+        },
+        Step::Write {
+            path: UPDATE_LOG.into(),
+            contents: String::new(),
+            mode: "0640",
+            before: None,
+        },
+        Step::exec(
+            &["systemctl", "daemon-reload"],
+            "load the transient update unit",
+        ),
+        Step::exec(
+            &["systemctl", "start", "--no-block", UPDATE_UNIT],
+            "run the updater outside the exec timeout",
+        ),
+        Step::AwaitUnit,
+    ]
 }
 
 /// Takes the pre-update backup; the real one is the unit `backup` action.
@@ -586,9 +861,18 @@ pub trait PreUpdateBackup: Sync {
     ) -> BoxFuture<'a, Result<BackupRef>>;
 }
 
-/// Back up (unless `payload.backup` already carries one), record the backup in
-/// [`BACKUP_MARKER`], then run the updater. Refuses before the backup when an
-/// updater step is outside the allowlist.
+/// How to get back to `backup`, for an error after it was taken.
+fn restore_hint(ctid: u64, backup: &BackupRef) -> String {
+    let payload = serde_json::json!({ "from": backup }).to_string();
+    format!(
+        "Restore point: {}. Restore with unit.update on lxc {ctid} (manager {}), \
+         action=restore, payload {payload}",
+        backup.locator, backup.manager
+    )
+}
+
+/// Back up, record the backup in [`BACKUP_MARKER`], then run the updater.
+/// Everything that can refuse does so before the backup.
 pub async fn run_update(
     io: &dyn GuestIo,
     backup: &dyn PreUpdateBackup,
@@ -596,13 +880,20 @@ pub async fn run_update(
     payload: &GuestUpdatePayload,
 ) -> Result<GuestApplied> {
     const TOOL: &str = "proxmox.guest.update";
-    let facts = probe(io, ctid as u32).await?;
-    let steps = updater_steps(payload.updater, &facts);
-    refuse_blocked(TOOL, &steps)?;
-    let backup_ref = match &payload.backup {
-        Some(b) => b.clone(),
-        None => backup.backup(ctid, payload.storage.as_deref()).await?,
-    };
+    let vmid = ctid as u32;
+    let facts = probe(io, vmid).await?;
+    let commands = updater_commands(payload.updater, &facts)?;
+    refuse_blocked(TOOL, &commands)?;
+    if facts.os == Os::Debian {
+        let state = io
+            .exec(vmid, &["systemctl", "is-active", UPDATE_UNIT])
+            .await?
+            .stdout;
+        if state == "active" || state == "activating" {
+            bail!("{TOOL}: {UPDATE_UNIT} is already running in CT {ctid}; nothing was changed");
+        }
+    }
+    let backup_ref = backup.backup(ctid, payload.storage.as_deref()).await?;
     let marker = Step::Write {
         path: BACKUP_MARKER.to_string(),
         contents: serde_json::to_string(&backup_ref)?,
@@ -610,14 +901,60 @@ pub async fn run_update(
         before: None,
     };
     let mut all = vec![marker];
-    all.extend(steps);
-    let outcomes = run_steps(io, ctid, &all).await?;
+    all.extend(updater_steps(commands, &facts.os));
+    let outcomes = run_steps(io, ctid, &all)
+        .await
+        .map_err(|e| anyhow!("{e:#}. {}", restore_hint(ctid, &backup_ref)))?;
     Ok(GuestApplied {
-        dry_run: false,
         ctid,
         steps: outcomes,
         backup: Some(backup_ref),
     })
+}
+
+/// The plan for an update. With `facts` (a probe), the exact steps; without
+/// (the unit action's dry run, which touches nothing), how they are chosen.
+pub fn plan_update<A: Serialize>(
+    tool: &str,
+    inputs: &A,
+    ctid: u64,
+    payload: &GuestUpdatePayload,
+    facts: Option<&StandardFacts>,
+) -> Result<ExecutionPlan> {
+    let mut changes = vec![
+        PlannedChange::new(format!("lxc/{ctid}"), "backup").with_detail(format!(
+            "vzdump snapshot to {}, waited on; a failed backup aborts the update",
+            payload
+                .storage
+                .as_deref()
+                .unwrap_or("the node's first backup storage")
+        )),
+        PlannedChange::new(format!("ct/{ctid}:{BACKUP_MARKER}"), "create")
+            .with_detail("the backup reference; opens the in-guest `update` gate for an hour"),
+    ];
+    let mut summary = format!("back up then update CT {ctid}");
+    match facts {
+        Some(f) => {
+            let commands = updater_commands(payload.updater, f)?;
+            for b in blockers(&commands) {
+                summary.push_str("; ");
+                summary.push_str(&b);
+            }
+            changes.extend(
+                updater_steps(commands, &f.os)
+                    .iter()
+                    .map(|s| s.to_change(ctid)),
+            );
+        }
+        None => changes.push(
+            PlannedChange::new(format!("ct/{ctid}: updater"), "exec").with_detail(format!(
+                "{:?}, resolved from a probe at execute: {COMMUNITY_UPDATER} when present, else \
+                 apt-get (Debian/Ubuntu, as {UPDATE_UNIT}) or apk (Alpine)",
+                payload.updater
+            )),
+        ),
+    }
+    execute::plan(tool, inputs, summary, changes)
 }
 
 /// The unit provider's `backup` action for one LXC.
@@ -644,7 +981,7 @@ impl PreUpdateBackup for UnitBackup {
 async fn local_ct(endpoint: &str, ctid: u64) -> Result<CtRef> {
     let client = resolve_config(endpoint).await?.build_generated_client()?;
     let ct = lxc_guest::find_ct(&client, ctid).await?;
-    lxc_guest::require_local(&ct, &crate::diagnostics::local_node())?;
+    lxc_guest::ensure_local(&ct)?;
     Ok(ct)
 }
 
@@ -663,14 +1000,15 @@ pub struct StandardAudit {
     pub facts: StandardFacts,
     /// Guard violations under the guest standard (empty = compliant).
     pub violations: Vec<String>,
-    /// Leftovers the standard replaces, which `apply` cannot remove.
+    /// What stands in the way of the standard, or that it replaces, which
+    /// `apply` will not change on its own.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub drift: Vec<String>,
 }
 
 /// Probe one container's guest standard: OS, root console autologin, the orca
-/// `update` gate, and community-scripts' updater. Read-only (`cat`/`ls`); the
-/// container must run on this plugin's node.
+/// `update` gate, and community-scripts' updater. Read-only; the container must
+/// run on this plugin's node.
 #[orca_tool(
     domain = "proxmox",
     verb = "guest.standard.audit",
@@ -706,7 +1044,13 @@ async fn proxmox_guest_standard_audit(
 }
 
 fn audit_drift(f: &StandardFacts) -> Vec<String> {
-    let mut drift = Vec::new();
+    let mut drift = f.console_drift.clone();
+    if f.foreign_gate {
+        drift.push(format!(
+            "{UPDATE_GATE} is not orca's gate; `apply` replaces it only with replace_gate \
+             (kept as {REPLACED_GATE})"
+        ));
+    }
     if f.legacy_backup_key {
         drift.push(format!(
             "{LEGACY_BACKUP_KEY} is still present: the forced-command key the orca \
@@ -736,6 +1080,11 @@ pub struct StandardApplyArgs {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     #[serde(default = "default_true")]
     pub update_gate: bool,
+    /// Replace an existing /usr/local/bin/update that is not orca's gate,
+    /// keeping it as /usr/local/bin/update.orca-replaced.
+    #[arg(long)]
+    #[serde(default)]
+    pub replace_gate: bool,
     /// Apply. Omitted, returns the plan and changes nothing.
     #[arg(long)]
     #[serde(default)]
@@ -748,12 +1097,12 @@ pub async fn apply(
     caller: Option<&CallerIdentity>,
 ) -> Result<Change<GuestApplied>> {
     const TOOL: &str = "proxmox.guest.standard.apply";
-    let steps = plan_apply(io, args.ctid, args.console, args.update_gate).await?;
+    let (steps, drift) = plan_apply(io, args).await?;
     if !args.execute {
         let mut summary = format!("apply the guest standard to CT {}", args.ctid);
-        for b in plan_notes(&steps) {
+        for n in plan_notes(&steps).into_iter().chain(drift) {
             summary.push_str("; ");
-            summary.push_str(&b);
+            summary.push_str(&n);
         }
         return Ok(Change::Plan(execute::plan(
             TOOL,
@@ -765,7 +1114,6 @@ pub async fn apply(
     execute::authorize_execute(TOOL, caller)?;
     refuse_blocked(TOOL, &steps)?;
     Ok(Change::Applied(GuestApplied {
-        dry_run: false,
         ctid: args.ctid,
         steps: run_steps(io, args.ctid, &steps).await?,
         backup: None,
@@ -830,46 +1178,28 @@ async fn proxmox_guest_update(
     execute::guard(TOOL, args.execute, ctx)?;
     local_ct(&args.endpoint, args.ctid).await?;
     let io = lxc_guest::SeamIo;
-    if !args.execute {
-        let facts = probe(&io, args.ctid as u32).await?;
-        return Ok(Change::Plan(plan_update(&args, &facts)?));
-    }
-    execute::authorize_execute(TOOL, ctx.caller().as_ref())?;
     let payload = GuestUpdatePayload {
         updater: args.updater,
         storage: args.storage.clone(),
-        backup: None,
+        execute: args.execute,
     };
+    if !args.execute {
+        let facts = probe(&io, args.ctid as u32).await?;
+        return Ok(Change::Plan(plan_update(
+            TOOL,
+            &args,
+            args.ctid,
+            &payload,
+            Some(&facts),
+        )?));
+    }
+    execute::authorize_execute(TOOL, ctx.caller().as_ref())?;
     let backup = UnitBackup {
         endpoint: args.endpoint.clone(),
     };
     Ok(Change::Applied(
         run_update(&io, &backup, args.ctid, &payload).await?,
     ))
-}
-
-pub fn plan_update(
-    args: &GuestUpdateArgs,
-    facts: &StandardFacts,
-) -> Result<plugin_toolkit::contract::plan::ExecutionPlan> {
-    let steps = updater_steps(args.updater, facts);
-    let mut changes = vec![
-        PlannedChange::new(format!("lxc/{}", args.ctid), "backup").with_detail(format!(
-            "vzdump snapshot to {}, waited on",
-            args.storage
-                .as_deref()
-                .unwrap_or("the node's first backup storage")
-        )),
-        PlannedChange::new(format!("ct/{}:{BACKUP_MARKER}", args.ctid), "write")
-            .with_detail("the backup reference; opens the in-guest `update` gate for an hour"),
-    ];
-    changes.extend(steps.iter().map(|s| s.to_change(args.ctid)));
-    let mut summary = format!("back up then update CT {}", args.ctid);
-    for b in blockers(&steps) {
-        summary.push_str("; ");
-        summary.push_str(&b);
-    }
-    execute::plan("proxmox.guest.update", args, summary, changes)
 }
 
 #[cfg(test)]
@@ -881,11 +1211,17 @@ mod tests {
     const ALPINE: &str = "NAME=\"Alpine Linux\"\nID=alpine";
     const ALPINE_INITTAB: &str = "::sysinit:/sbin/openrc sysinit
 tty1::respawn:/sbin/getty 38400 tty1
-# tty2::respawn:/sbin/getty 38400 tty2
+tty2::respawn:/sbin/getty 38400 tty2
+# tty3::respawn:/sbin/getty 38400 tty3
+ttyS0::respawn:/sbin/getty -L 115200 ttyS0 vt100
 console::respawn:/sbin/getty 38400 console";
+    const GETTY_UNIT: &str = "# /lib/systemd/system/container-getty@.service
+[Service]
+ExecStart=-/sbin/agetty --noclear --keep-baud pts/%I 115200,38400,9600 $TERM";
 
     fn rt() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .unwrap()
     }
@@ -899,6 +1235,82 @@ console::respawn:/sbin/getty 38400 console";
         }
     }
 
+    fn read(path: &str) -> String {
+        format!("head -c 65536 -- {path}")
+    }
+
+    fn ls(path: &str) -> String {
+        format!("ls -d {path}")
+    }
+
+    fn not_running() -> lxc_guest::ExecResult {
+        lxc_guest::ExecResult {
+            success: false,
+            exit_code: Some(3),
+            stdout: "inactive".into(),
+            stderr: String::new(),
+        }
+    }
+
+    fn facts(os: Os) -> StandardFacts {
+        StandardFacts {
+            os,
+            has_root_console: false,
+            has_update_command: false,
+            community_updater: false,
+            legacy_backup_key: false,
+            foreign_gate: false,
+            console_drift: Vec::new(),
+        }
+    }
+
+    /// Probe replies for a Debian CT: console from `systemctl cat`, gate
+    /// content, whether `/usr/bin/update` exists.
+    fn debian(
+        console: &str,
+        gate: Option<&str>,
+        community: bool,
+    ) -> Vec<(String, lxc_guest::ExecResult)> {
+        vec![
+            (read("/etc/os-release"), fake::ok(DEBIAN)),
+            (
+                format!("systemctl cat {DEBIAN_CONSOLE_UNIT}"),
+                fake::ok(console),
+            ),
+            (
+                read(UPDATE_GATE),
+                gate.map_or_else(|| fake::missing(UPDATE_GATE), fake::ok),
+            ),
+            (
+                ls(COMMUNITY_UPDATER),
+                if community {
+                    fake::ok(COMMUNITY_UPDATER)
+                } else {
+                    fake::missing(COMMUNITY_UPDATER)
+                },
+            ),
+            (ls(LEGACY_BACKUP_KEY), fake::missing(LEGACY_BACKUP_KEY)),
+        ]
+    }
+
+    fn io_of(replies: Vec<(String, lxc_guest::ExecResult)>) -> FakeIo {
+        FakeIo {
+            replies,
+            ..Default::default()
+        }
+    }
+
+    fn apply_args(ctid: u64) -> StandardApplyArgs {
+        StandardApplyArgs {
+            endpoint: "pve".into(),
+            ctid,
+            console: true,
+            update_gate: true,
+            replace_gate: false,
+            execute: false,
+        }
+    }
+
     #[test]
     fn os_detection_reads_id_and_id_like() {
         assert_eq!(os_from_release(DEBIAN), Os::Debian);
@@ -908,41 +1320,53 @@ console::respawn:/sbin/getty 38400 console";
     }
 
     #[test]
-    fn alpine_inittab_rewrites_live_gettys_only() {
-        let out = alpine_inittab(ALPINE_INITTAB);
+    fn alpine_inittab_rewrites_tty_and_console_gettys_only() {
+        let with_foreign =
+            format!("{ALPINE_INITTAB}\ntty4::respawn:/sbin/getty -l /bin/other 38400 tty4");
+        let out = alpine_inittab(&with_foreign);
         assert!(
             out.contains("tty1::respawn:/sbin/getty -n -l /usr/local/sbin/autologin 38400 tty1")
         );
         assert!(out.contains(
             "console::respawn:/sbin/getty -n -l /usr/local/sbin/autologin 38400 console"
         ));
-        assert!(
-            out.contains("# tty2::respawn:/sbin/getty 38400 tty2"),
-            "comments untouched"
-        );
-        assert!(inittab_uses_autologin(&out));
+        assert!(out.contains("ttyS0::respawn:/sbin/getty -L 115200 ttyS0 vt100"));
+        assert!(out.contains("# tty3::respawn:/sbin/getty 38400 tty3"));
+        assert!(out.contains("tty4::respawn:/sbin/getty -l /bin/other 38400 tty4"));
+        assert_eq!(inittab_drift(&out).len(), 1, "{:?}", inittab_drift(&out));
+        assert!(tty1_uses_autologin(&out));
         assert_eq!(alpine_inittab(&out).trim(), out.trim(), "idempotent");
     }
 
     #[test]
+    fn console_alone_using_autologin_is_not_a_root_console() {
+        let only_console = ALPINE_INITTAB.replace(
+            "console::respawn:/sbin/getty 38400",
+            "console::respawn:/sbin/getty -n -l /usr/local/sbin/autologin 38400",
+        );
+        assert!(!tty1_uses_autologin(&only_console));
+    }
+
+    #[test]
+    fn debian_console_reads_any_dropin_layout() {
+        assert!(!debian_console_ok(GETTY_UNIT));
+        let community = format!(
+            "{GETTY_UNIT}\n# /etc/systemd/system/container-getty@1.service.d/override.conf\n[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,38400,9600 $TERM"
+        );
+        assert!(debian_console_ok(&community));
+        assert!(!debian_console_ok(
+            "# ExecStart=-/sbin/agetty --autologin root"
+        ));
+    }
+
+    #[test]
     fn probe_debian_with_standard_installed() {
-        let gate = gate_script(116);
-        let io = FakeIo::with(&[
-            ("cat /etc/os-release", fake::ok(DEBIAN)),
-            (
-                format!("cat {DEBIAN_AUTOLOGIN}").as_str(),
-                fake::ok(DEBIAN_AUTOLOGIN_CONF),
-            ),
-            (format!("cat {UPDATE_GATE}").as_str(), fake::ok(&gate)),
-            (
-                format!("ls -d {COMMUNITY_UPDATER}").as_str(),
-                fake::ok(COMMUNITY_UPDATER),
-            ),
-            (
-                format!("ls -d {LEGACY_BACKUP_KEY}").as_str(),
-                fake::missing(LEGACY_BACKUP_KEY),
-            ),
-        ]);
+        let gate = gate_script("pve", 116).unwrap();
+        let io = io_of(debian(
+            &format!("{GETTY_UNIT}\n{DEBIAN_AUTOLOGIN_CONF}"),
+            Some(&gate),
+            true,
+        ));
         let f = rt().block_on(probe(&io, 116)).unwrap();
         assert_eq!(
             f,
@@ -951,7 +1375,7 @@ console::respawn:/sbin/getty 38400 console";
                 has_root_console: true,
                 has_update_command: true,
                 community_updater: true,
-                legacy_backup_key: false,
+                ..facts(Os::Debian)
             }
         );
         assert!(
@@ -959,37 +1383,87 @@ console::respawn:/sbin/getty 38400 console";
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|e| e.starts_with("cat ") || e.starts_with("ls "))
+                .all(|e| e.starts_with("head ")
+                    || e.starts_with("ls ")
+                    || e.starts_with("systemctl cat "))
         );
     }
 
+    fn alpine_probe(inittab: &str, ignore: bool) -> Vec<(String, lxc_guest::ExecResult)> {
+        vec![
+            (read("/etc/os-release"), fake::ok(ALPINE)),
+            (read(INITTAB), fake::ok(inittab)),
+            (read(ALPINE_AUTOLOGIN), fake::ok(ALPINE_AUTOLOGIN_SH.trim())),
+            (
+                ls(PVE_IGNORE_INITTAB),
+                if ignore {
+                    fake::ok(PVE_IGNORE_INITTAB)
+                } else {
+                    fake::missing(PVE_IGNORE_INITTAB)
+                },
+            ),
+            (
+                read(UPDATE_GATE),
+                fake::ok("#!/bin/sh\nssh host orca-guest-backup"),
+            ),
+            (ls(COMMUNITY_UPDATER), fake::missing(COMMUNITY_UPDATER)),
+            (ls(LEGACY_BACKUP_KEY), fake::ok(LEGACY_BACKUP_KEY)),
+        ]
+    }
+
     #[test]
-    fn probe_alpine_missing_everything() {
-        let io = FakeIo::with(&[
-            ("cat /etc/os-release", fake::ok(ALPINE)),
-            ("cat /etc/inittab", fake::ok(ALPINE_INITTAB)),
-            (
-                format!("cat {ALPINE_AUTOLOGIN}").as_str(),
-                fake::missing(ALPINE_AUTOLOGIN),
-            ),
-            (
-                format!("cat {UPDATE_GATE}").as_str(),
-                fake::missing(UPDATE_GATE),
-            ),
-            (
-                format!("ls -d {COMMUNITY_UPDATER}").as_str(),
-                fake::missing(COMMUNITY_UPDATER),
-            ),
-            (
-                format!("ls -d {LEGACY_BACKUP_KEY}").as_str(),
-                fake::ok(LEGACY_BACKUP_KEY),
-            ),
-        ]);
-        let f = rt().block_on(probe(&io, 120)).unwrap();
-        assert_eq!(f.os, Os::Alpine);
-        assert!(!f.has_root_console && !f.has_update_command && !f.community_updater);
-        assert!(f.legacy_backup_key);
-        assert!(audit_drift(&f)[0].contains("authorized_keys"));
+    fn alpine_console_needs_the_pve_ignore_marker() {
+        let rewritten = alpine_inittab(ALPINE_INITTAB);
+        let f = rt()
+            .block_on(probe(&io_of(alpine_probe(&rewritten, false)), 120))
+            .unwrap();
+        assert!(
+            !f.has_root_console,
+            "PVE would regenerate tty1 on next start"
+        );
+        assert!(f.foreign_gate && f.legacy_backup_key && !f.has_update_command);
+        let drift = audit_drift(&f);
+        assert!(
+            drift.iter().any(|d| d.contains("replace_gate")),
+            "{drift:?}"
+        );
+        assert!(
+            drift.iter().any(|d| d.contains("authorized_keys")),
+            "{drift:?}"
+        );
+
+        let f = rt()
+            .block_on(probe(&io_of(alpine_probe(&rewritten, true)), 120))
+            .unwrap();
+        assert!(f.has_root_console);
+    }
+
+    #[test]
+    fn probe_is_bounded() {
+        struct Hang;
+        impl GuestIo for Hang {
+            fn exec<'a>(
+                &'a self,
+                _vmid: u32,
+                _argv: &'a [&'a str],
+            ) -> BoxFuture<'a, Result<lxc_guest::ExecResult>> {
+                Box::pin(std::future::pending())
+            }
+            fn write<'a>(
+                &'a self,
+                _vmid: u32,
+                _path: &'a str,
+                _contents: &'a [u8],
+                _mode: Option<&'a str>,
+            ) -> BoxFuture<'a, Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let err = rt()
+            .block_on(probe_within(&Hang, 1, Duration::from_millis(20)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("timed out"), "{err}");
     }
 
     #[test]
@@ -999,11 +1473,9 @@ console::respawn:/sbin/getty 38400 console";
         let none = unit_facts(Some(1), Some(1024), None);
         assert_eq!(g.check(&none).len(), 2);
         let ok = StandardFacts {
-            os: Os::Debian,
             has_root_console: true,
             has_update_command: true,
-            community_updater: false,
-            legacy_backup_key: false,
+            ..facts(Os::Debian)
         };
         assert!(g.is_satisfied(&unit_facts(Some(1), Some(1024), Some(&ok))));
         assert!(
@@ -1014,29 +1486,15 @@ console::respawn:/sbin/getty 38400 console";
 
     #[test]
     fn debian_apply_plans_dropin_reload_and_gate_then_runs_them() {
-        let io = FakeIo::with(&[
-            ("cat /etc/os-release", fake::ok(DEBIAN)),
-            (
-                format!("cat {DEBIAN_AUTOLOGIN}").as_str(),
-                fake::missing(DEBIAN_AUTOLOGIN),
-            ),
-            (
-                format!("cat {UPDATE_GATE}").as_str(),
-                fake::missing(UPDATE_GATE),
-            ),
-            ("systemctl daemon-reload", fake::ok("")),
-            (
-                "systemctl try-restart container-getty@1.service container-getty@2.service",
-                fake::ok(""),
-            ),
-        ]);
-        let mut args = StandardApplyArgs {
-            endpoint: "pve".into(),
-            ctid: 116,
-            console: true,
-            update_gate: true,
-            execute: false,
-        };
+        let mut replies = debian(GETTY_UNIT, None, false);
+        replies.push((read(DEBIAN_AUTOLOGIN), fake::missing(DEBIAN_AUTOLOGIN)));
+        replies.push(("systemctl daemon-reload".into(), fake::ok("")));
+        replies.push((
+            "systemctl try-restart container-getty@1.service container-getty@2.service".into(),
+            fake::ok(""),
+        ));
+        let io = io_of(replies);
+        let mut args = apply_args(116);
         let Change::Plan(p) = rt().block_on(apply(&io, &args, None)).unwrap() else {
             panic!()
         };
@@ -1053,32 +1511,49 @@ console::respawn:/sbin/getty 38400 console";
         assert!(writes[0].1.contains("--autologin root"));
         assert_eq!(
             writes[1],
-            (UPDATE_GATE.into(), gate_script(116), Some("0755".into()))
+            (
+                UPDATE_GATE.into(),
+                gate_script("pve", 116).unwrap(),
+                Some("0755".into())
+            )
         );
     }
 
     #[test]
-    fn alpine_apply_writes_and_defers_the_reload_the_seam_refuses() {
-        let io = FakeIo::with(&[
-            ("cat /etc/os-release", fake::ok(ALPINE)),
-            (
-                format!("cat {ALPINE_AUTOLOGIN}").as_str(),
-                fake::missing(ALPINE_AUTOLOGIN),
-            ),
-            ("cat /etc/inittab", fake::ok(ALPINE_INITTAB)),
-        ]);
+    fn existing_community_autologin_is_left_alone() {
+        let console = format!("{GETTY_UNIT}\nExecStart=-/sbin/agetty --autologin root tty%I");
+        let gate = gate_script("pve", 116).unwrap();
+        let io = io_of(debian(&console, Some(&gate), false));
+        let Change::Plan(p) = rt().block_on(apply(&io, &apply_args(116), None)).unwrap() else {
+            panic!()
+        };
+        assert!(p.changes.is_empty(), "{:?}", p.changes);
+        assert!(p.summary.ends_with("nothing to change"));
+    }
+
+    /// PVE's `Alpine::setup_init` drops and regenerates every line this matches
+    /// unless `/etc/.pve-ignore.inittab` exists.
+    fn pve_regenerates(line: &str) -> bool {
+        regex::Regex::new(r"^\s*tty\d+:\d*:[^:]*:.*getty")
+            .unwrap()
+            .is_match(line)
+    }
+
+    #[test]
+    fn alpine_apply_writes_the_pve_ignore_marker_and_defers_the_reload() {
+        let mut replies = alpine_probe(ALPINE_INITTAB, false);
+        replies.retain(|(k, _)| *k != read(ALPINE_AUTOLOGIN));
+        replies.push((read(ALPINE_AUTOLOGIN), fake::missing(ALPINE_AUTOLOGIN)));
+        let io = io_of(replies);
         let mut args = StandardApplyArgs {
-            endpoint: "pve".into(),
-            ctid: 120,
-            console: true,
             update_gate: false,
-            execute: false,
+            ..apply_args(120)
         };
         let Change::Plan(p) = rt().block_on(apply(&io, &args, None)).unwrap() else {
             panic!()
         };
-        assert_eq!(p.changes.len(), 3, "{:?}", p.changes);
-        assert_eq!(p.changes[2].action, "deferred");
+        assert_eq!(p.changes.len(), 4, "{:?}", p.changes);
+        assert_eq!(p.changes[3].action, "deferred");
         assert!(
             p.summary.contains("deferred to the container's next start")
                 && p.summary.contains("needs allowlist: kill"),
@@ -1091,18 +1566,31 @@ console::respawn:/sbin/getty 38400 console";
         let Change::Applied(a) = rt().block_on(apply(&io, &args, Some(&admin()))).unwrap() else {
             panic!()
         };
-        assert_eq!(a.steps[2].action, "deferred");
+        assert_eq!(a.steps[3].action, "deferred");
         let writes = io.writes.lock().unwrap();
         assert_eq!(
             writes[0],
+            (
+                PVE_IGNORE_INITTAB.into(),
+                String::new(),
+                Some("0644".into())
+            )
+        );
+        assert_eq!(
+            writes[1],
             (
                 ALPINE_AUTOLOGIN.into(),
                 ALPINE_AUTOLOGIN_SH.into(),
                 Some("0755".into())
             )
         );
-        assert_eq!(writes[1].0, INITTAB);
-        assert!(inittab_uses_autologin(&writes[1].1));
+        assert_eq!(writes[2].0, INITTAB);
+        let rewritten = &writes[2].1;
+        assert!(tty1_uses_autologin(rewritten));
+        assert!(
+            rewritten.lines().any(pve_regenerates),
+            "the rewritten tty lines are ones PVE regenerates, hence the marker"
+        );
         assert!(
             !io.execs
                 .lock()
@@ -1114,30 +1602,89 @@ console::respawn:/sbin/getty 38400 console";
     }
 
     #[test]
-    fn apply_with_everything_in_place_changes_nothing() {
-        let io = FakeIo::with(&[
-            ("cat /etc/os-release", fake::ok(DEBIAN)),
-            (
-                format!("cat {DEBIAN_AUTOLOGIN}").as_str(),
-                fake::ok(DEBIAN_AUTOLOGIN_CONF.trim()),
-            ),
-            (
-                format!("cat {UPDATE_GATE}").as_str(),
-                fake::ok(gate_script(116).trim()),
-            ),
-        ]);
+    fn gate_is_refused_when_its_updater_cannot_run() {
+        let io = io_of(debian(GETTY_UNIT, None, true));
         let args = StandardApplyArgs {
-            endpoint: "pve".into(),
-            ctid: 116,
-            console: true,
-            update_gate: true,
-            execute: false,
+            console: false,
+            ..apply_args(116)
         };
         let Change::Plan(p) = rt().block_on(apply(&io, &args, None)).unwrap() else {
             panic!()
         };
-        assert!(p.changes.is_empty());
-        assert!(p.summary.ends_with("nothing to change"));
+        assert_eq!(p.changes[0].action, "refused");
+        assert!(
+            p.summary.contains("needs allowlist: update"),
+            "{}",
+            p.summary
+        );
+        let err = rt()
+            .block_on(apply(
+                &io,
+                &StandardApplyArgs {
+                    execute: true,
+                    ..args
+                },
+                Some(&admin()),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could never open"), "{err}");
+        assert!(io.writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_foreign_gate_is_replaced_only_on_request_and_kept() {
+        let old = "#!/bin/sh\nssh -i /root/.orca/host_backup_key host\nexec /usr/bin/update";
+        let mut replies = debian(GETTY_UNIT, Some(old), false);
+        replies.push((read(REPLACED_GATE), fake::missing(REPLACED_GATE)));
+        let io = io_of(replies);
+        let args = StandardApplyArgs {
+            console: false,
+            ..apply_args(116)
+        };
+        let Change::Plan(p) = rt().block_on(apply(&io, &args, None)).unwrap() else {
+            panic!()
+        };
+        assert_eq!(p.changes[0].action, "refused");
+        assert!(p.summary.contains("replace_gate"), "{}", p.summary);
+
+        let args = StandardApplyArgs {
+            replace_gate: true,
+            ..args
+        };
+        let Change::Plan(p) = rt().block_on(apply(&io, &args, None)).unwrap() else {
+            panic!()
+        };
+        assert_eq!(p.changes[0].target, format!("ct/116:{REPLACED_GATE}"));
+        assert_eq!(p.changes[1].action, "overwrite");
+        let diff = p.changes[1].detail.as_deref().unwrap_or_default();
+        assert!(
+            diff.contains("-ssh -i") && diff.contains("+# orca-update-gate v1"),
+            "{diff}"
+        );
+
+        let args = StandardApplyArgs {
+            execute: true,
+            ..args
+        };
+        rt().block_on(apply(&io, &args, Some(&admin()))).unwrap();
+        let writes = io.writes.lock().unwrap();
+        assert_eq!(
+            writes[0],
+            (REPLACED_GATE.into(), old.into(), Some("0755".into()))
+        );
+        assert_eq!(writes[1].0, UPDATE_GATE);
+    }
+
+    #[test]
+    fn gate_script_names_endpoint_and_refuses_unsafe_ones() {
+        let s = gate_script("pve-1", 116).unwrap();
+        assert!(s.starts_with("#!/bin/sh\n# orca-update-gate v1"));
+        assert!(s.contains(BACKUP_MARKER) && s.contains("-gt 3600"));
+        assert!(s.contains("--endpoint pve-1 --ctid 116"));
+        assert!(s.contains("apt-get update || exit 1"));
+        assert!(gate_script("pve\"; rm -rf /", 116).is_err());
+        assert!(gate_script("$(id)", 116).is_err());
     }
 
     struct FakeBackup(std::sync::Mutex<u32>);
@@ -1160,41 +1707,25 @@ console::respawn:/sbin/getty 38400 console";
         }
     }
 
-    fn debian_probe_replies(community: bool) -> Vec<(String, lxc_guest::ExecResult)> {
-        vec![
-            ("cat /etc/os-release".into(), fake::ok(DEBIAN)),
-            (
-                format!("cat {DEBIAN_AUTOLOGIN}"),
-                fake::missing(DEBIAN_AUTOLOGIN),
-            ),
-            (format!("cat {UPDATE_GATE}"), fake::missing(UPDATE_GATE)),
-            (
-                format!("ls -d {COMMUNITY_UPDATER}"),
-                if community {
-                    fake::ok(COMMUNITY_UPDATER)
-                } else {
-                    fake::missing(COMMUNITY_UPDATER)
-                },
-            ),
-            (
-                format!("ls -d {LEGACY_BACKUP_KEY}"),
-                fake::missing(LEGACY_BACKUP_KEY),
-            ),
-        ]
+    fn apt_update_replies(result: &str) -> Vec<(String, lxc_guest::ExecResult)> {
+        let mut r = debian(GETTY_UNIT, None, false);
+        r.push((format!("systemctl is-active {UPDATE_UNIT}"), not_running()));
+        r.push(("systemctl daemon-reload".into(), fake::ok("")));
+        r.push((
+            format!("systemctl start --no-block {UPDATE_UNIT}"),
+            fake::ok(""),
+        ));
+        r.push((
+            format!("systemctl show -p Result --value {UPDATE_UNIT}"),
+            fake::ok(result),
+        ));
+        r.push((format!("tail -n 40 {UPDATE_LOG}"), fake::ok("0 upgraded")));
+        r
     }
 
     #[test]
-    fn update_backs_up_marks_then_runs_apt() {
-        let mut io = FakeIo {
-            replies: debian_probe_replies(false),
-            ..Default::default()
-        };
-        io.replies.push(("apt-get update".into(), fake::ok("")));
-        io.replies.push((
-            "apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade"
-                .into(),
-            fake::ok("0 upgraded"),
-        ));
+    fn update_backs_up_marks_then_runs_apt_as_a_unit() {
+        let io = io_of(apt_update_replies("success"));
         let backup = FakeBackup(Default::default());
         let out = rt()
             .block_on(run_update(
@@ -1205,45 +1736,66 @@ console::respawn:/sbin/getty 38400 console";
             ))
             .unwrap();
         assert_eq!(*backup.0.lock().unwrap(), 1);
-        assert_eq!(out.steps.len(), 3);
+        assert_eq!(
+            out.steps.last().unwrap().output.as_deref(),
+            Some("0 upgraded")
+        );
         let writes = io.writes.lock().unwrap();
         assert_eq!(writes[0].0, BACKUP_MARKER);
         assert!(writes[0].1.contains("vzdump-lxc-116"));
+        assert_eq!(writes[1].0, UPDATE_UNIT_PATH);
+        assert!(
+            writes[1]
+                .1
+                .contains("Environment=DEBIAN_FRONTEND=noninteractive")
+        );
+        assert!(writes[1].1.contains("ExecStart=/usr/bin/apt-get update\n"));
+        assert!(writes[1].1.contains("--force-confold dist-upgrade\n"));
     }
 
     #[test]
-    fn update_with_a_guard_backup_skips_its_own() {
-        let mut io = FakeIo {
-            replies: debian_probe_replies(false),
-            ..Default::default()
-        };
-        io.replies.push(("apt-get update".into(), fake::ok("")));
-        io.replies.push((
-            "apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade"
-                .into(),
-            fake::ok(""),
+    fn a_failed_update_names_the_restore_point() {
+        let io = io_of(apt_update_replies("exit-code"));
+        let err = rt()
+            .block_on(run_update(
+                &io,
+                &FakeBackup(Default::default()),
+                116,
+                &GuestUpdatePayload::default(),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Result=exit-code"), "{err}");
+        assert!(
+            err.contains("action=restore") && err.contains("vzdump-lxc-116.tar.zst"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_running_update_is_refused_before_the_backup() {
+        let mut replies = debian(GETTY_UNIT, None, false);
+        replies.push((
+            format!("systemctl is-active {UPDATE_UNIT}"),
+            fake::ok("activating"),
         ));
         let backup = FakeBackup(Default::default());
-        let payload = GuestUpdatePayload {
-            backup: Some(BackupRef {
-                locator: "/x".into(),
-                manager: "proxmox@pve".into(),
-                timestamp: 2,
-                checksum: None,
-            }),
-            ..Default::default()
-        };
-        rt().block_on(run_update(&io, &backup, 116, &payload))
-            .unwrap();
+        let err = rt()
+            .block_on(run_update(
+                &io_of(replies),
+                &backup,
+                116,
+                &GuestUpdatePayload::default(),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already running"), "{err}");
         assert_eq!(*backup.0.lock().unwrap(), 0);
     }
 
     #[test]
     fn community_updater_is_refused_before_the_backup() {
-        let io = FakeIo {
-            replies: debian_probe_replies(true),
-            ..Default::default()
-        };
+        let io = io_of(debian(GETTY_UNIT, None, true));
         let backup = FakeBackup(Default::default());
         let err = rt()
             .block_on(run_update(
@@ -1264,33 +1816,42 @@ console::respawn:/sbin/getty 38400 console";
     }
 
     #[test]
-    fn apk_needs_allowlist() {
-        let facts = StandardFacts {
-            os: Os::Alpine,
-            has_root_console: false,
-            has_update_command: false,
-            community_updater: false,
-            legacy_backup_key: false,
-        };
-        let b = blockers(&updater_steps(Updater::Auto, &facts));
+    fn unsupported_os_updater_pairs_are_refused() {
+        let alpine = facts(Os::Alpine);
+        let b = blockers(&updater_commands(Updater::Auto, &alpine).unwrap());
         assert!(b[0].starts_with("needs allowlist: apk"), "{b:?}");
-        assert!(blockers(&updater_steps(Updater::Apt, &facts)).is_empty());
+        assert!(updater_commands(Updater::Apt, &alpine).is_err());
+        assert!(updater_commands(Updater::Apk, &facts(Os::Debian)).is_err());
+        assert!(updater_commands(Updater::Community, &facts(Os::Debian)).is_err());
+        assert!(updater_commands(Updater::Auto, &facts(Os::Other)).is_err());
+    }
+
+    #[test]
+    fn plan_without_a_probe_names_how_the_updater_is_chosen() {
+        let p = plan_update(
+            "unit.update",
+            &serde_json::json!({}),
+            116,
+            &GuestUpdatePayload::default(),
+            None,
+        )
+        .unwrap();
+        assert!(p.dry_run);
+        assert_eq!(p.changes.len(), 3);
+        assert_eq!(p.changes[0].action, "backup");
     }
 
     #[test]
     fn failed_step_names_what_already_ran() {
-        let io = FakeIo {
-            replies: vec![(
-                "systemctl daemon-reload".into(),
-                lxc_guest::ExecResult {
-                    success: false,
-                    exit_code: Some(1),
-                    stdout: String::new(),
-                    stderr: "boom".into(),
-                },
-            )],
-            ..Default::default()
-        };
+        let io = io_of(vec![(
+            "systemctl daemon-reload".into(),
+            lxc_guest::ExecResult {
+                success: false,
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: "boom".into(),
+            },
+        )]);
         let steps = vec![
             Step::Write {
                 path: "/a".into(),
@@ -1308,14 +1869,5 @@ console::respawn:/sbin/getty 38400 console";
             err.contains("boom") && err.contains("Already applied: [write /a]"),
             "{err}"
         );
-    }
-
-    #[test]
-    fn gate_script_checks_the_marker_age_and_names_the_ct() {
-        let s = gate_script(116);
-        assert!(s.starts_with("#!/bin/sh\n# orca-update-gate v1"));
-        assert!(s.contains(BACKUP_MARKER));
-        assert!(s.contains("-gt 3600"));
-        assert!(s.contains("--ctid 116"));
     }
 }

@@ -88,6 +88,8 @@ tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
 openapiv3 = "2"
 indexmap  = "2"
 anyhow    = "1"
+# PVE's own inittab getty regex, run in the guest-standard tests.
+regex     = "1"
 
 [build-dependencies]
 plugin-toolkit-build = { git = "https://github.com/argyle-labs/orca", branch = "main" }

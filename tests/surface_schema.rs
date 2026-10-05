@@ -249,6 +249,8 @@ const SELF_GATED: &[&str] = &[
     "proxmox.backup_job.upsert",
     "proxmox.backup_job.delete",
     "proxmox.guest.pxarexclude",
+    "proxmox.guest.standard.apply",
+    "proxmox.guest.update",
 ];
 
 #[test]
@@ -289,6 +291,14 @@ fn self_gated_execute_without_a_caller_is_refused_before_anything_runs() {
         (
             "proxmox.guest.pxarexclude",
             serde_json::json!({"endpoint": "pve", "ctid": 1, "patterns": ["/data"], "execute": true}),
+        ),
+        (
+            "proxmox.guest.standard.apply",
+            serde_json::json!({"endpoint": "pve", "ctid": 1, "execute": true}),
+        ),
+        (
+            "proxmox.guest.update",
+            serde_json::json!({"endpoint": "pve", "ctid": 1, "execute": true}),
         ),
     ] {
         let err = plugin_toolkit::capsink::with_cap_sink(

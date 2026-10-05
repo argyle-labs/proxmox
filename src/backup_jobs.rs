@@ -837,7 +837,7 @@ pub struct PxarExcludeApplied {
 }
 
 /// `-old` / `+new` lines between two files, in order of the new file.
-fn line_diff(before: &str, after: &str) -> String {
+pub(crate) fn line_diff(before: &str, after: &str) -> String {
     let old: Vec<&str> = before.lines().collect();
     let new: Vec<&str> = after.lines().collect();
     let mut out: Vec<String> = old
@@ -933,6 +933,7 @@ async fn proxmox_guest_pxarexclude(
         .await?
         .build_generated_client()?;
     let ct = lxc_guest::find_ct(&client, args.ctid).await?;
+    lxc_guest::ensure_local(&ct)?;
     pxarexclude(
         &lxc_guest::SeamIo,
         &ct,
@@ -1918,7 +1919,10 @@ mod tests {
             patterns: vec!["/data".into()],
             execute: false,
         };
-        let io = FakeIo::with(&[("cat /.pxarexclude", fake::missing("/.pxarexclude"))]);
+        let io = FakeIo::with(&[(
+            "head -c 65536 -- /.pxarexclude",
+            fake::missing("/.pxarexclude"),
+        )]);
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -1947,7 +1951,7 @@ mod tests {
             )
         );
 
-        let same = FakeIo::with(&[("cat /.pxarexclude", fake::ok("/data"))]);
+        let same = FakeIo::with(&[("head -c 65536 -- /.pxarexclude", fake::ok("/data"))]);
         let out = rt
             .block_on(pxarexclude(&same, &ct, "hyp1", &exec, Some(&admin())))
             .unwrap();
