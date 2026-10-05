@@ -29,6 +29,30 @@ pub const EXEC_ALLOWLIST: &[&str] = &[
     "tail",
 ];
 
+/// Entries the guest standard needs on orca's root-side allowlist (orca#769),
+/// each with why. Until orca ships them, steps using them are named in the
+/// dry-run plan and refused or deferred before anything runs.
+///
+/// `sh` is deliberately absent: every step execs its program directly, and
+/// `sh -c` would turn the allowlist into arbitrary root-in-container exec.
+pub const PROPOSED_ALLOWLIST: &[(&str, &str)] = &[
+    (
+        "kill",
+        "`kill -HUP 1`: busybox init re-reads /etc/inittab only on SIGHUP, so the \
+         Alpine console autologin is live without restarting the container",
+    ),
+    (
+        "apk",
+        "`apk update` / `apk upgrade`: the Alpine package updater, the apt-get \
+         equivalent already allowed",
+    ),
+    (
+        "update",
+        "`/usr/bin/update`: the app's own updater (community-scripts, or the Gitea \
+         and Caddy updaters that validate and roll back), run after orca's backup",
+    ),
+];
+
 /// `Some("needs allowlist: <cmd>")` when orca's lxc-exec seam would refuse
 /// `argv0`.
 pub fn needs_allowlist(argv0: &str) -> Option<String> {
@@ -350,6 +374,14 @@ mod tests {
             needs_allowlist("/bin/kill").as_deref(),
             Some("needs allowlist: kill")
         );
+    }
+
+    #[test]
+    fn proposed_entries_are_not_already_allowed() {
+        for (cmd, why) in PROPOSED_ALLOWLIST {
+            assert!(needs_allowlist(cmd).is_some(), "{cmd} is already allowed");
+            assert!(!why.is_empty());
+        }
     }
 
     fn ct(node: &str, running: bool) -> CtRef {

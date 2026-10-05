@@ -45,11 +45,14 @@ Every VM and LXC across every enabled endpoint is a **unit** (`kind = vm` or `lx
 | verb | action(s) | what it does |
 | --- | --- | --- |
 | `list` | — | enumerate guests across the cluster (`/cluster/resources`) |
-| `detail` | — | inspect one guest (typed, proxmox-rich payload) |
+| `detail` | — | inspect one guest (typed, proxmox-rich payload); for a running LXC on this node, also probes the guest standard and reports it in `guard_violations` |
 | `update` | `start` | start the guest |
 | `update` | `stop` | hard-stop the guest |
 | `update` | `shutdown` | ACPI shutdown |
 | `update` | `reboot` | reboot the guest |
+| `update` | `backup` | vzdump the guest to backup storage, waited on; returns a `BackupRef` |
+| `update` | `restore` | restore the guest in place from a `BackupRef` |
+| `update` | `update` | LXC only: back up, then run the in-container updater (see [docs/guest-standard.md](docs/guest-standard.md)) |
 | `create` | `provision` | provision a new VM/LXC (needs a typed payload; LXC needs `ostemplate`) |
 | `delete` | — | destroy the guest |
 
@@ -70,6 +73,9 @@ Every VM and LXC across every enabled endpoint is a **unit** (`kind = vm` or `lx
 | `proxmox.backup_job.upsert` | create or update a vzdump job; `prune_backups` defaults to `keep-last=10` *(role: admin; returns the diff against the current job unless `execute: true`)* |
 | `proxmox.backup_job.delete` | delete a vzdump job *(role: admin; dry-run unless `execute: true`)* |
 | `proxmox.guest.pxarexclude` | replace an LXC's `/.pxarexclude` through orca's lxc-push seam; the CT must run on this plugin's node *(role: admin; dry-run unless `execute: true`)* |
+| `proxmox.guest.standard.audit` | an LXC's guest standard: OS, root console autologin, the orca `update` gate, the app's own updater, and a leftover forced-command backup key ([docs/guest-standard.md](docs/guest-standard.md)) |
+| `proxmox.guest.standard.apply` | install root console autologin and the `update` gate in an LXC; idempotent *(role: admin; dry-run unless `execute: true`)* |
+| `proxmox.guest.update` | back an LXC up through the PVE API, then run its updater *(role: admin; dry-run unless `execute: true`)* |
 | `proxmox.lxc_data.plan` | per LXC on this node: its mounts, the app's data paths (per-app table), where each lives (rootfs / volume / bind) and how it is backed up (vzdump / `lxc-bind` host capture / uncovered) |
 
 > `proxmox.action` overlaps with the unit `update` verb — both power-manage a guest. Use the unit surface for orca-managed fleet lifecycle; `proxmox.action` is the direct tool form.
@@ -87,7 +93,9 @@ The plugin authenticates with a PVE API token. [docs/tokens.md](docs/tokens.md) 
 - `src/access.rs` — `proxmox.access_bootstrap`: least-privilege identity via the `/access` REST API.
 - `src/thin_discard.rs` — `proxmox.thin.{audit,enable_discard}`: LVM-thin discard drift + allocation divergence.
 - `src/unit_provider.rs` — the five-verb `vm` + `lxc` surface.
+- `src/guest_standard.rs` — `proxmox.guest.standard.{audit,apply}` + `proxmox.guest.update`: console autologin and the backup-gated `update`.
+- `src/lxc_guest.rs` — in-container reads/writes through orca's `lxc-exec` / `lxc-push` seams, and the allowlist mirror.
 - `src/registration.rs`, `src/cluster_roster_impl.rs`, `src/topology.rs` — the three domain-backend registrations + impls.
 - `specs/`, `spec-tools/`, `examples/pve_to_openapi.rs` — convert Proxmox's `apidoc.js` into the vendored OpenAPI spec (`build.rs` codegens the typed client).
-- `docs/` — [setup.md](docs/setup.md) (install Proxmox), [tokens.md](docs/tokens.md) (API tokens).
+- `docs/` — [setup.md](docs/setup.md) (install Proxmox), [tokens.md](docs/tokens.md) (API tokens), [guest-standard.md](docs/guest-standard.md) (console autologin + `update` gate).
 - `assets/` — plugin icon.
