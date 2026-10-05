@@ -258,26 +258,26 @@ pub async fn read_file(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<Option
     Ok(read_sized(io, vmid, path).await?.map(|(s, _)| s))
 }
 
-/// [`read_file`], byte for byte: the seam's trim is undone when it removed
-/// only a trailing newline, and refused otherwise.
+/// [`read_file`], byte for byte. The seam trims both ends, so any difference
+/// between the on-disk size and what was read means bytes were lost and the
+/// file is refused rather than guessed at.
 pub async fn read_exact(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<Option<String>> {
     match read_sized(io, vmid, path).await? {
         None => Ok(None),
         Some((s, size)) if s.len() == size => Ok(Some(s)),
-        Some((s, size)) if s.len() + 1 == size => Ok(Some(s + "\n")),
         Some((s, size)) => bail!(
             "read {path} in CT {vmid}: {size} bytes on disk but {} read; the exec seam trims \
-             whitespace, so it cannot be copied exactly",
+             leading and trailing whitespace, so it cannot be copied exactly",
             s.len()
         ),
     }
 }
 
 /// Refuse a push to `path` unless it is a regular file or absent and every
-/// existing parent is a real directory. `lxc-push` writes as root on the host
-/// and follows guest symlinks, so a link here would redirect the write onto
-/// the host. A swap between this check and the write is closed only by core
-/// writing with `O_NOFOLLOW` or from inside the container's user namespace.
+/// existing parent is a real directory. `pct push` creates the file after
+/// entering the container's mount namespace (and user namespace when
+/// unprivileged), so a symlink cannot reach outside the container; this guards
+/// against writing through a link or over a non-file by accident.
 pub async fn check_push_target(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<()> {
     let mut paths: Vec<String> = std::path::Path::new(path)
         .ancestors()
@@ -290,17 +290,21 @@ pub async fn check_push_target(io: &dyn GuestIo, vmid: u32, path: &str) -> Resul
     let mut argv = vec!["stat", "-c", "%n|%F", "--"];
     argv.extend(paths.iter().map(String::as_str));
     let r = io.exec(vmid, &argv).await?;
-    if !r.success && !r.stderr.lines().all(|l| l.contains("No such file")) {
+    let fail = |why: String| -> Result<()> {
         bail!(
-            "check {path} in CT {vmid} before writing: exit {:?}: {}",
+            "check {path} in CT {vmid} before writing: {why} (exit {:?}: {})",
             r.exit_code,
             r.stderr
-        );
-    }
+        )
+    };
+    let mut found: Vec<(&str, &str)> = Vec::new();
     for line in r.stdout.lines() {
-        let Some((name, kind)) = line.split_once('|') else {
-            bail!("check {path} in CT {vmid}: unexpected stat output {line:?}");
+        let Some(pair) = line.split_once('|') else {
+            return fail(format!("unexpected stat output {line:?}"));
         };
+        found.push(pair);
+    }
+    for &(name, kind) in &found {
         if name == path {
             if !kind.starts_with("regular") {
                 bail!("refusing to write {path} in CT {vmid}: it is a {kind}, not a regular file");
@@ -308,6 +312,29 @@ pub async fn check_push_target(io: &dyn GuestIo, vmid: u32, path: &str) -> Resul
         } else if kind != "directory" {
             bail!("refusing to write {path} in CT {vmid}: parent {name} is a {kind}");
         }
+    }
+    // stat answers each path on stdout or with one "No such file" line on
+    // stderr. Absent paths must be a suffix (a missing parent hides all below),
+    // and their count must match those lines, so a stat that failed for any
+    // other reason is never read as "absent".
+    let present = paths
+        .iter()
+        .take_while(|p| found.iter().any(|(n, _)| n == p))
+        .count();
+    if found.len() != present {
+        return fail("stat answered out of order".into());
+    }
+    let missing_lines = r
+        .stderr
+        .lines()
+        .filter(|l| l.contains("No such file"))
+        .count();
+    let absent = paths.len() - present;
+    if absent != missing_lines
+        || r.stderr.lines().count() != missing_lines
+        || (absent > 0) == r.success
+    {
+        return fail(format!("{absent} path(s) unanswered"));
     }
     Ok(())
 }
@@ -619,18 +646,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_exact_restores_a_trimmed_newline_only() {
+    async fn read_exact_refuses_any_trimmed_byte() {
         let io = fake::FakeIo::with(&[
             ("stat -L -c %F|%s -- /a", fake::ok("regular file|3")),
             ("head -c 65536 -- /a", fake::ok("ab")),
             ("stat -L -c %F|%s -- /b", fake::ok("regular file|5")),
             ("head -c 65536 -- /b", fake::ok("ab")),
         ]);
-        assert_eq!(
-            read_exact(&io, 1, "/a").await.unwrap().as_deref(),
-            Some("ab\n")
+        assert!(
+            read_exact(&io, 1, "/a").await.is_err(),
+            "a trimmed byte is never guessed"
         );
         assert!(read_exact(&io, 1, "/b").await.is_err());
+        let exact = fake::FakeIo::with(&[("head -c 65536 -- /c", fake::ok("ab"))]);
+        assert_eq!(
+            read_exact(&exact, 1, "/c").await.unwrap().as_deref(),
+            Some("ab")
+        );
     }
 
     #[tokio::test]
@@ -669,6 +701,32 @@ mod tests {
         );
         write_checked(&io, 1, "/run/x", b"y", None).await.unwrap();
         assert_eq!(io.writes.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stat_that_failed_otherwise_is_not_read_as_absent() {
+        let failed = |stdout: &str, stderr: &str| ExecResult {
+            success: false,
+            exit_code: Some(1),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        };
+        let io = fake::FakeIo::with(&[
+            ("stat -c %n|%F -- /run /run/a", failed("", "")),
+            (
+                "stat -c %n|%F -- /run /run/b",
+                failed("", "Failed to exec stat: permission denied"),
+            ),
+            (
+                "stat -c %n|%F -- /run /run/c",
+                failed("", "stat: '/run/c': No such file or directory"),
+            ),
+        ]);
+        for p in ["/run/a", "/run/b", "/run/c"] {
+            let err = check_push_target(&io, 1, p).await.unwrap_err().to_string();
+            assert!(err.contains("unanswered"), "{p}: {err}");
+        }
+        assert!(io.writes.lock().unwrap().is_empty());
     }
 
     #[test]

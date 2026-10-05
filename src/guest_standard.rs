@@ -138,20 +138,43 @@ fn live_lines(text: &str) -> impl Iterator<Item = &str> {
     text.lines().filter(|l| !l.trim_start().starts_with('#'))
 }
 
-/// `systemctl show -p ExecStart --value` output: one `{ path=… ; argv[]=… ; … }`
-/// per effective command. True when one passes `--autologin root` / `-a root`.
-fn debian_console_ok(exec_start: &str) -> bool {
-    exec_start.split("argv[]=").skip(1).any(|rest| {
+fn autologin_root(argv: &[&str]) -> bool {
+    argv.windows(2)
+        .any(|w| matches!(w[0], "--autologin" | "-a") && w[1] == "root")
+        || argv
+            .iter()
+            .any(|a| matches!(*a, "--autologin=root" | "-aroot"))
+}
+
+/// The effective `ExecStart=` value in `systemctl cat` output: the last
+/// assignment, where an empty one resets everything before it.
+fn effective_exec_start(cat: &str) -> Option<&str> {
+    let mut cur = None;
+    for l in live_lines(cat) {
+        if let Some(v) = l.trim().strip_prefix("ExecStart=") {
+            cur = Some(v.trim()).filter(|v| !v.is_empty());
+        }
+    }
+    cur
+}
+
+/// Autologin needs both views. `show` (`{ path=… ; argv[]=… ; … }`) is the
+/// effective command after drop-ins and resets, but joins argv without
+/// quoting; `cat` shows the literal line, so a quoted `"--autologin root"`
+/// (one argument to agetty) is not mistaken for the two it would need.
+fn debian_console_ok(show: &str, cat: &str) -> bool {
+    let show_ok = show.split("argv[]=").skip(1).any(|rest| {
         let argv: Vec<&str> = rest
             .split(" ; ")
             .next()
             .unwrap_or_default()
             .split_whitespace()
             .collect();
-        argv.windows(2)
-            .any(|w| matches!(w[0], "--autologin" | "-a") && w[1] == "root")
-            || argv.contains(&"--autologin=root")
-    })
+        autologin_root(&argv)
+    });
+    show_ok
+        && effective_exec_start(cat)
+            .is_some_and(|l| autologin_root(&l.split_whitespace().collect::<Vec<_>>()))
 }
 
 /// Seam output is unbounded core-side; anything larger than a file read is
@@ -238,7 +261,7 @@ async fn probe_inner(io: &dyn GuestIo, vmid: u32) -> Result<StandardFacts> {
     let mut console_drift = Vec::new();
     let has_root_console = match os {
         Os::Debian => {
-            let r = io
+            let show = io
                 .exec(
                     vmid,
                     &[
@@ -251,7 +274,15 @@ async fn probe_inner(io: &dyn GuestIo, vmid: u32) -> Result<StandardFacts> {
                     ],
                 )
                 .await?;
-            r.success && debian_console_ok(&capped("systemctl show ExecStart", r.stdout)?)
+            let cat = io
+                .exec(vmid, &["systemctl", "cat", DEBIAN_CONSOLE_UNIT])
+                .await?;
+            show.success
+                && cat.success
+                && debian_console_ok(
+                    &capped("systemctl show ExecStart", show.stdout)?,
+                    &capped("systemctl cat", cat.stdout)?,
+                )
         }
         Os::Alpine => {
             let inittab = lxc_guest::read_file(io, vmid, INITTAB)
@@ -470,10 +501,11 @@ impl Step {
                 )),
             Step::RunUnit => PlannedChange::new(format!("ct/{ctid}: {UPDATE_UNIT}"), "run")
                 .with_detail(format!(
-                    "refuse if running; `systemctl restart --no-block {UPDATE_UNIT}`; a new \
-                     InvocationID within {}s, then poll `systemctl show` every {}s for up to \
-                     {}h until ActiveState=active Result=success; output from \
-                     `systemctl status --lines=40`",
+                    "refuse if activating; `systemctl stop --job-mode=fail` an earlier finished \
+                     run; `systemctl start --no-block --job-mode=fail {UPDATE_UNIT}`; a new \
+                     InvocationID within {}s (else its queued start is stopped), then poll \
+                     `systemctl show` every {}s for up to {}h until ActiveState=active \
+                     Result=success; output from `systemctl status --lines=40`",
                     UPDATE_START_TIMEOUT.as_secs(),
                     UPDATE_POLL.as_secs(),
                     UPDATE_DEADLINE.as_secs() / 3600
@@ -766,18 +798,47 @@ fn require_own_unit(st: &UnitState, loaded: bool) -> Result<()> {
     Ok(())
 }
 
-/// Restart [`UPDATE_UNIT`] and wait for that run: a new `InvocationID` proves
+/// Start [`UPDATE_UNIT`] and wait for that run: a new `InvocationID` proves
 /// the result read is this run's, not a previous one's.
+///
+/// Never `restart`, which would kill a run someone else started. Per
+/// systemctl(1), `--job-mode=fail` fails a request that would reverse a pending
+/// start job into a stop (or the reverse), so orca's stop and start never cancel
+/// another caller's queued job. It does not refuse a start that merges into a
+/// pending start; the `ActiveState` checks before each call do that.
 async fn run_unit(io: &dyn GuestIo, vmid: u32) -> Result<String> {
-    let before = unit_state(io, vmid).await?;
-    if unit_running(&before) {
+    let mut st = unit_state(io, vmid).await?;
+    if unit_running(&st) {
         bail!("{UPDATE_UNIT} was started by someone else; not starting it again");
     }
-    let prev = prop(&before, "InvocationID").to_string();
+    // `active` is an earlier finished run held by RemainAfterExit; `start` is a
+    // no-op until it is stopped.
+    if prop(&st, "ActiveState") == "active" {
+        run_exec(
+            io,
+            vmid,
+            &["systemctl", "stop", "--job-mode=fail", UPDATE_UNIT],
+        )
+        .await?;
+        st = unit_state(io, vmid).await?;
+    }
+    if !matches!(prop(&st, "ActiveState"), "inactive" | "failed") {
+        bail!(
+            "{UPDATE_UNIT} is {}; not starting it",
+            prop(&st, "ActiveState")
+        );
+    }
+    let prev = prop(&st, "InvocationID").to_string();
     run_exec(
         io,
         vmid,
-        &["systemctl", "restart", "--no-block", UPDATE_UNIT],
+        &[
+            "systemctl",
+            "start",
+            "--no-block",
+            "--job-mode=fail",
+            UPDATE_UNIT,
+        ],
     )
     .await?;
     let started = tokio::time::Instant::now();
@@ -798,8 +859,16 @@ async fn run_unit(io: &dyn GuestIo, vmid: u32) -> Result<String> {
             );
         }
         if !ours && started.elapsed() >= UPDATE_START_TIMEOUT {
+            let cancel =
+                match run_exec(io, vmid, &["systemctl", "stop", "--no-block", UPDATE_UNIT]).await {
+                    Ok(_) => "its queued start was cancelled with `systemctl stop --no-block`"
+                        .to_string(),
+                    Err(e) => format!(
+                        "cancelling its queued start with `systemctl stop --no-block` failed: {e:#}"
+                    ),
+                };
             bail!(
-                "{UPDATE_UNIT} did not start within {}s (InvocationID unchanged)",
+                "{UPDATE_UNIT} did not start within {}s (InvocationID unchanged); {cancel}",
                 UPDATE_START_TIMEOUT.as_secs()
             );
         }
@@ -1037,7 +1106,9 @@ static UPDATING: std::sync::Mutex<std::collections::BTreeSet<u64>> =
 
 /// One update per CT in this plugin process, so two concurrent calls never
 /// both back up or attach to each other's unit run. Another orca instance is
-/// not covered; the unit's running check is the backstop there.
+/// not covered, and a caller that drops the future releases the lock while the
+/// unit keeps running in the container; the unit's running check is the
+/// backstop for both.
 struct UpdateLock(u64);
 
 impl UpdateLock {
@@ -1403,6 +1474,17 @@ tty2::respawn:/sbin/getty 38400 tty2
 ttyS0::respawn:/sbin/getty -L 115200 ttyS0 vt100
 console::respawn:/sbin/getty 38400 console";
     const GETTY_UNIT: &str = "{ path=/sbin/agetty ; argv[]=/sbin/agetty -o -p -- \\u --noclear --keep-baud pts/%I 115200,38400,9600 $TERM ; ignore_errors=yes ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }";
+    const GETTY_CAT: &str = "# /lib/systemd/system/container-getty@.service
+[Service]
+ExecStart=-/sbin/agetty -o '-p -- \\\\u' --noclear --keep-baud pts/%I 115200,38400,9600 $TERM";
+    const AUTOLOGIN_CAT: &str = "# /lib/systemd/system/container-getty@.service
+[Service]
+ExecStart=-/sbin/agetty -o '-p -- \\\\u' --noclear --keep-baud pts/%I 115200,38400,9600 $TERM
+
+# /etc/systemd/system/container-getty@1.service.d/override.conf
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,38400,9600 $TERM";
     const AUTOLOGIN_UNIT: &str = "{ path=/sbin/agetty ; argv[]=/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,38400,9600 $TERM ; ignore_errors=yes ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }";
 
     fn rt() -> tokio::runtime::Runtime {
@@ -1453,6 +1535,14 @@ console::respawn:/sbin/getty 38400 console";
             (
                 format!("systemctl show -p ExecStart --value {DEBIAN_CONSOLE_UNIT}"),
                 fake::ok(console),
+            ),
+            (
+                format!("systemctl cat {DEBIAN_CONSOLE_UNIT}"),
+                fake::ok(if console.contains("--autologin root") {
+                    AUTOLOGIN_CAT
+                } else {
+                    GETTY_CAT
+                }),
             ),
             (
                 read(UPDATE_GATE),
@@ -1526,14 +1616,29 @@ console::respawn:/sbin/getty 38400 console";
 
     #[test]
     fn debian_console_reads_the_effective_exec_start() {
-        assert!(!debian_console_ok(GETTY_UNIT));
-        assert!(debian_console_ok(AUTOLOGIN_UNIT));
-        assert!(debian_console_ok(
-            &AUTOLOGIN_UNIT.replace("--autologin root", "-a root")
-        ));
+        assert!(!debian_console_ok(GETTY_UNIT, GETTY_CAT));
+        assert!(debian_console_ok(AUTOLOGIN_UNIT, AUTOLOGIN_CAT));
+        for alt in ["-a root", "--autologin=root", "-aroot"] {
+            assert!(
+                debian_console_ok(
+                    &AUTOLOGIN_UNIT.replace("--autologin root", alt),
+                    &AUTOLOGIN_CAT.replace("--autologin root", alt)
+                ),
+                "{alt}"
+            );
+        }
         assert!(!debian_console_ok(
-            "{ path=/sbin/agetty ; argv[]=/sbin/agetty --noclear tty1 ; ignore_errors=no ; x=--autologin root }"
+            "{ path=/sbin/agetty ; argv[]=/sbin/agetty --noclear tty1 ; ignore_errors=no ; x=--autologin root }",
+            AUTOLOGIN_CAT
         ));
+        // `show` cannot tell `"--autologin root"` (one argument) from two.
+        let quoted = AUTOLOGIN_CAT.replace("--autologin root", "\"--autologin root\"");
+        assert!(!debian_console_ok(AUTOLOGIN_UNIT, &quoted));
+        // A later reset without autologin wins over an earlier drop-in.
+        let reset =
+            format!("{AUTOLOGIN_CAT}\n[Service]\nExecStart=\nExecStart=-/sbin/agetty tty%I");
+        assert!(!debian_console_ok(AUTOLOGIN_UNIT, &reset));
+        assert_eq!(effective_exec_start("ExecStart=a\nExecStart="), None);
     }
 
     #[test]
@@ -1559,7 +1664,8 @@ console::respawn:/sbin/getty 38400 console";
                 .all(|e| e.starts_with("head ")
                     || e.starts_with("stat -L ")
                     || e.starts_with("ls ")
-                    || e.starts_with("systemctl show "))
+                    || e.starts_with("systemctl show ")
+                    || e.starts_with("systemctl cat "))
         );
     }
 
@@ -1921,6 +2027,10 @@ console::respawn:/sbin/getty 38400 console";
         }
     }
 
+    fn start_key() -> String {
+        format!("systemctl start --no-block --job-mode=fail {UPDATE_UNIT}")
+    }
+
     fn unit_key() -> String {
         format!(
             "systemctl show -p ActiveState -p Result -p InvocationID -p FragmentPath -p DropInPaths {UPDATE_UNIT}"
@@ -1957,10 +2067,7 @@ console::respawn:/sbin/getty 38400 console";
         };
         r.push((unit_key(), unit(end, result, "a1", UPDATE_UNIT_PATH, "")));
         r.push(("systemctl daemon-reload".into(), fake::ok("")));
-        r.push((
-            format!("systemctl restart --no-block {UPDATE_UNIT}"),
-            fake::ok(""),
-        ));
+        r.push((start_key(), fake::ok("")));
         r.push((
             format!("systemctl status --no-pager --lines=40 {UPDATE_UNIT}"),
             fake::ok("0 upgraded"),
@@ -2060,18 +2167,30 @@ console::respawn:/sbin/getty 38400 console";
     #[test]
     fn a_unit_that_never_starts_is_an_error_not_a_stale_result() {
         let mut replies = debian(GETTY_UNIT, None, false);
+        let held = unit("active", "success", "old", UPDATE_UNIT_PATH, "");
+        // Before the backup, after daemon-reload, before start: an earlier run
+        // held active by RemainAfterExit. Stopped, it keeps its old id.
+        for _ in 0..3 {
+            replies.push((unit_key(), held.clone()));
+        }
         replies.push((
             unit_key(),
-            unit("active", "success", "old", UPDATE_UNIT_PATH, ""),
+            unit("inactive", "success", "old", UPDATE_UNIT_PATH, ""),
         ));
         replies.push(("systemctl daemon-reload".into(), fake::ok("")));
         replies.push((
-            format!("systemctl restart --no-block {UPDATE_UNIT}"),
+            format!("systemctl stop --job-mode=fail {UPDATE_UNIT}"),
             fake::ok(""),
         ));
+        replies.push((start_key(), fake::ok("")));
+        replies.push((
+            format!("systemctl stop --no-block {UPDATE_UNIT}"),
+            fake::ok(""),
+        ));
+        let io = io_of(replies);
         let err = rt()
             .block_on(run_update(
-                &io_of(replies),
+                &io,
                 &FakeBackup(Default::default()),
                 206,
                 &GuestUpdatePayload::default(),
@@ -2079,7 +2198,41 @@ console::respawn:/sbin/getty 38400 console";
             .unwrap_err()
             .to_string();
         assert!(err.contains("did not start"), "{err}");
+        assert!(err.contains("queued start was cancelled"), "{err}");
         assert!(err.contains("action=restore"), "{err}");
+        let execs = io.execs.lock().unwrap();
+        assert!(!execs.iter().any(|e| e.contains("restart")), "{execs:?}");
+    }
+
+    #[test]
+    fn a_run_started_after_the_backup_is_never_restarted_or_joined() {
+        let mut replies = debian(GETTY_UNIT, None, false);
+        let fresh = unit("inactive", "success", "", UPDATE_UNIT_PATH, "");
+        replies.push((unit_key(), fresh.clone()));
+        replies.push((unit_key(), fresh));
+        replies.push((
+            unit_key(),
+            unit("activating", "success", "theirs", UPDATE_UNIT_PATH, ""),
+        ));
+        replies.push(("systemctl daemon-reload".into(), fake::ok("")));
+        let io = io_of(replies);
+        let err = rt()
+            .block_on(run_update(
+                &io,
+                &FakeBackup(Default::default()),
+                209,
+                &GuestUpdatePayload::default(),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("started by someone else"), "{err}");
+        let execs = io.execs.lock().unwrap();
+        assert!(
+            !execs
+                .iter()
+                .any(|e| e.starts_with("systemctl start") || e.starts_with("systemctl stop")),
+            "{execs:?}"
+        );
     }
 
     #[test]

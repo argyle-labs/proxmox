@@ -60,7 +60,7 @@ own allowlist entry, and `ls -d` gives the same answer.
 | fact | read |
 | --- | --- |
 | OS | `/etc/os-release` (`ID` / `ID_LIKE`: debian, ubuntu, alpine) |
-| root console, Debian | the effective `ExecStart` from `systemctl show -p ExecStart --value container-getty@1.service` passes `--autologin root` (or `-a root`). It is read after every drop-in and `ExecStart=` reset, so it covers orca's `container-getty@.service.d/autologin.conf` and community-scripts' `container-getty@1.service.d/*.conf`. |
+| root console, Debian | two reads of `container-getty@1.service` must both show `--autologin root` (or `-a root`, `--autologin=root`, `-aroot`) in the effective `ExecStart`. `systemctl show -p ExecStart --value` gives the command after every drop-in and `ExecStart=` reset. `systemctl cat` gives the literal last `ExecStart=` line after the last reset, so a quoted `"--autologin root"` (a single argument) is not counted. This covers orca's `container-getty@.service.d/autologin.conf` and community-scripts' `container-getty@1.service.d/*.conf`. |
 | root console, Alpine | the live `tty1` line in `/etc/inittab` uses `-l /usr/local/sbin/autologin`, that wrapper contains `login -f root`, and `/etc/.pve-ignore.inittab` exists |
 | `update` gate | `/usr/local/bin/update` carries the `# orca-update-gate v1` marker |
 | foreign gate | `/usr/local/bin/update` exists without the marker (reported as drift) |
@@ -69,13 +69,20 @@ own allowlist entry, and `ls -d` gives the same answer.
 
 ## Apply
 
-Every file orca writes goes through `lxc-push`, which writes as root on the host
-and follows symlinks inside the container. Before each write, orca checks the
-target and its existing parents with `stat -c '%n|%F' --`. It refuses unless
-the target is a regular file or absent, and every existing parent is a real
-directory. A guest could still swap in a symlink between that check and the
-write. Only core can close that race, by writing with `O_NOFOLLOW` or from
-inside the container's user namespace.
+Every file orca writes goes through orca's `lxc-push` seam, which runs
+`pct push`. `pct push` enters the container's mount namespace before creating
+the file, and also its user namespace (as uid 0) for an unprivileged
+container. Paths, symlinks included, therefore resolve inside the container,
+with the access of the container's root; pve-container's `pct.pm` says so in
+its comment on `push`.
+
+Before each write, orca also checks the target and its existing parents with
+`stat -c '%n|%F' --`, as a guard against accidents. It refuses unless:
+
+- the target is a regular file or absent;
+- every existing parent is a real directory;
+- `stat` answered every path, either on stdout or with a "No such file" line.
+  A `stat` that failed for any other reason is never read as "absent".
 
 Apply is idempotent. It writes a file only when its trimmed contents differ, and
 it skips the console steps when autologin is already in effect. The dry run
@@ -113,9 +120,10 @@ The `update` gate:
   hand-rolled ssh gate) is refused unless `replace_gate: true` is passed. With
   it, the old script is kept as `/usr/local/bin/update.orca-replaced`, and the
   plan shows the diff.
-  - The copy goes through orca, because the seam has no `cp`. It is refused
-    unless the read matches the on-disk size, allowing only for a trailing
-    newline the seam trimmed.
+  - The copy goes through orca, because the seam has no `cp`. The exec seam
+    trims both ends of its output, so the copy is refused unless the read
+    length equals the on-disk size. A gate ending in a newline is refused
+    until core returns raw bytes or allowlists `cp`.
   - If `.orca-replaced` already holds a different script, the replacement is
     refused, so neither script is lost.
 - **What gets written.** Otherwise the gate is written to
@@ -140,6 +148,9 @@ Everything that can refuse does so before the backup:
 2. Refuse if any updater command is outside the allowlist.
 3. Refuse if another update of the same CT is in progress in this plugin
    process. This per-CT lock is held from the probe until the update finishes.
+   A caller that drops the request releases the lock while the unit keeps
+   running in the container. The unit's own running check (below) is the
+   backstop for that case, and for another orca instance.
 4. On systemd guests, refuse if `orca-guest-update.service` is running, if it
    loads from any file other than orca's `/run/systemd/system` one, or if it
    has drop-ins. The check reads `systemctl show -p FragmentPath -p DropInPaths`.
@@ -158,10 +169,21 @@ Then:
         journal, and one `ExecStart=` per command.
      2. It runs `systemctl daemon-reload`, and checks again that the unit loads
         from that file alone.
-     3. It refuses if the unit started running since the backup, notes its
-        `InvocationID`, and runs `systemctl restart --no-block`.
+     3. It refuses if the unit is `activating` (or otherwise running) at any
+        check. It never uses `restart`, which would kill a run someone else
+        started.
+        - An earlier finished run, held `active` by `RemainAfterExit`, is
+          stopped with `systemctl stop --job-mode=fail` first.
+        - It then notes the `InvocationID` and runs
+          `systemctl start --no-block --job-mode=fail`.
+        - Per systemctl(1), `fail` makes a request fail if it would reverse a
+          pending start job into a stop, or the reverse. It does not refuse a
+          start that merges into another caller's pending start; the
+          `ActiveState` check just before is what refuses that.
      4. A new `InvocationID` must appear within 60 s, or the update fails
-        rather than reading a previous run's result.
+        rather than reading a previous run's result. The queued start is
+        cancelled with `systemctl stop --no-block`, and the error says whether
+        that worked.
      5. It polls `systemctl show` every 5 s, for up to 2 h, and requires
         `ActiveState=active` and `Result=success`. `RemainAfterExit` keeps
         those values after the run, so systemd cannot reset them before orca
@@ -203,6 +225,6 @@ list (`lxc_guest::EXEC_ALLOWLIST`) and the needed additions
 let the exec seam run any command line it is handed.
 
 The allowlist bounds what the exec seam runs. It is not a complete boundary for
-the container, because `lxc-push` already writes files as root, including the
-update unit above. The plugin only ever puts commands that are themselves
-allowlisted into that unit.
+the container, because `lxc-push` already writes files as the container's root,
+including the update unit above. The plugin only ever puts commands that are
+themselves allowlisted into that unit.
