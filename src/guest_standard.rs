@@ -1,7 +1,7 @@
 //! Guest standard for LXC containers: a root console that logs in without a
 //! password, and a one-word `update` that only runs after an orca backup.
 //!
-//! * [`probe`] reads the facts through allowlisted `head`/`ls`/`systemctl cat`,
+//! * [`probe`] reads the facts through allowlisted `stat`/`head`/`ls`/`systemctl show`,
 //!   feeding `UnitFacts::has_root_console` / `has_update_command`.
 //! * `proxmox.guest.standard.audit` (read) reports them per container, checked
 //!   against [`standard_guard`].
@@ -35,9 +35,9 @@ use crate::lxc_guest::{self, CtRef, GuestIo, needs_allowlist};
 use crate::tools::resolve_config;
 
 pub const DEBIAN_AUTOLOGIN: &str = "/etc/systemd/system/container-getty@.service.d/autologin.conf";
-/// The unit PVE starts for the first console; `systemctl cat` of it shows every
-/// drop-in, so autologin from any layout (ours, community-scripts' per-tty
-/// override) is seen.
+/// The unit PVE starts for the first console. Its effective `ExecStart`, after
+/// every drop-in and reset, shows autologin from any layout (ours,
+/// community-scripts' per-tty override).
 const DEBIAN_CONSOLE_UNIT: &str = "container-getty@1.service";
 pub const ALPINE_AUTOLOGIN: &str = "/usr/local/sbin/autologin";
 pub const INITTAB: &str = "/etc/inittab";
@@ -62,9 +62,17 @@ const GATE_MARKER: &str = "# orca-update-gate v1";
 /// timeout can never kill dpkg mid-upgrade.
 pub const UPDATE_UNIT: &str = "orca-guest-update.service";
 pub const UPDATE_UNIT_PATH: &str = "/run/systemd/system/orca-guest-update.service";
-pub const UPDATE_LOG: &str = "/var/log/orca-guest-update.log";
+const UPDATE_START_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(30)
+} else {
+    Duration::from_secs(60)
+};
 const UPDATE_DEADLINE: Duration = Duration::from_secs(2 * 3600);
-const UPDATE_POLL: Duration = Duration::from_secs(5);
+const UPDATE_POLL: Duration = if cfg!(test) {
+    Duration::from_millis(1)
+} else {
+    Duration::from_secs(5)
+};
 /// Bounds the whole probe; `unit.detail` runs it for any caller.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -130,8 +138,49 @@ fn live_lines(text: &str) -> impl Iterator<Item = &str> {
     text.lines().filter(|l| !l.trim_start().starts_with('#'))
 }
 
-fn debian_console_ok(unit: &str) -> bool {
-    live_lines(unit).any(|l| l.contains("--autologin root"))
+/// `systemctl show -p ExecStart --value` output: one `{ path=… ; argv[]=… ; … }`
+/// per effective command. True when one passes `--autologin root` / `-a root`.
+fn debian_console_ok(exec_start: &str) -> bool {
+    exec_start.split("argv[]=").skip(1).any(|rest| {
+        let argv: Vec<&str> = rest
+            .split(" ; ")
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect();
+        argv.windows(2)
+            .any(|w| matches!(w[0], "--autologin" | "-a") && w[1] == "root")
+            || argv.contains(&"--autologin=root")
+    })
+}
+
+/// Seam output is unbounded core-side; anything larger than a file read is
+/// refused rather than parsed.
+fn capped(what: &str, out: String) -> Result<String> {
+    if out.len() > lxc_guest::READ_CAP {
+        bail!("{what}: output larger than {} bytes", lxc_guest::READ_CAP);
+    }
+    Ok(out)
+}
+
+/// `systemctl show -p <props> UNIT` as `(key, value)` pairs.
+async fn unit_show(
+    io: &dyn GuestIo,
+    vmid: u32,
+    unit: &str,
+    props: &[&str],
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut argv = vec!["systemctl", "show"];
+    for p in props {
+        argv.extend(["-p", p]);
+    }
+    argv.push(unit);
+    let out = capped("systemctl show", run_exec(io, vmid, &argv).await?)?;
+    Ok(out
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect())
 }
 
 /// The inittab id (`tty1`, `console`, …) of a line.
@@ -190,9 +239,19 @@ async fn probe_inner(io: &dyn GuestIo, vmid: u32) -> Result<StandardFacts> {
     let has_root_console = match os {
         Os::Debian => {
             let r = io
-                .exec(vmid, &["systemctl", "cat", DEBIAN_CONSOLE_UNIT])
+                .exec(
+                    vmid,
+                    &[
+                        "systemctl",
+                        "show",
+                        "-p",
+                        "ExecStart",
+                        "--value",
+                        DEBIAN_CONSOLE_UNIT,
+                    ],
+                )
                 .await?;
-            r.success && debian_console_ok(&r.stdout)
+            r.success && debian_console_ok(&capped("systemctl show ExecStart", r.stdout)?)
         }
         Os::Alpine => {
             let inittab = lxc_guest::read_file(io, vmid, INITTAB)
@@ -322,8 +381,10 @@ pub enum Step {
         /// change takes effect at the container's next start instead.
         deferrable: bool,
     },
-    /// Wait for [`UPDATE_UNIT`] to finish, polling `systemctl is-active`.
-    AwaitUnit,
+    /// Require that systemd loaded [`UPDATE_UNIT`] from orca's file alone.
+    VerifyUnit,
+    /// Start [`UPDATE_UNIT`] and wait for this run of it to finish.
+    RunUnit,
     /// A change apply will not make; stops the whole run.
     Refuse { target: String, reason: String },
 }
@@ -402,9 +463,18 @@ impl Step {
                 PlannedChange::new(format!("ct/{ctid}: {}", argv.join(" ")), action)
                     .with_detail(detail)
             }
-            Step::AwaitUnit => PlannedChange::new(format!("ct/{ctid}: {UPDATE_UNIT}"), "wait")
+            Step::VerifyUnit => PlannedChange::new(format!("ct/{ctid}: {UPDATE_UNIT}"), "verify")
                 .with_detail(format!(
-                    "poll `systemctl is-active {UPDATE_UNIT}` every {}s, up to {}h; output in {UPDATE_LOG}",
+                    "`systemctl show -p FragmentPath -p DropInPaths`: loaded from \
+                     {UPDATE_UNIT_PATH} with no drop-ins"
+                )),
+            Step::RunUnit => PlannedChange::new(format!("ct/{ctid}: {UPDATE_UNIT}"), "run")
+                .with_detail(format!(
+                    "refuse if running; `systemctl restart --no-block {UPDATE_UNIT}`; a new \
+                     InvocationID within {}s, then poll `systemctl show` every {}s for up to \
+                     {}h until ActiveState=active Result=success; output from \
+                     `systemctl status --lines=40`",
+                    UPDATE_START_TIMEOUT.as_secs(),
                     UPDATE_POLL.as_secs(),
                     UPDATE_DEADLINE.as_secs() / 3600
                 )),
@@ -538,21 +608,33 @@ async fn plan_gate(
                     "is not orca's gate; pass replace_gate to replace it (kept as {REPLACED_GATE})"
                 ));
             }
-            let kept = lxc_guest::read_file(io, vmid, REPLACED_GATE).await?;
-            Ok(vec![
-                Step::Write {
+            let mut steps = Vec::new();
+            match lxc_guest::read_file(io, vmid, REPLACED_GATE).await? {
+                Some(kept) if kept.trim() != c.trim() => {
+                    return refuse(format!(
+                        "{REPLACED_GATE} already holds a different script; move it aside \
+                         before replacing this gate, so neither is lost"
+                    ));
+                }
+                Some(_) => {}
+                // No `cp` on the seam, so the copy round-trips; `read_exact`
+                // refuses anything it cannot reproduce byte for byte.
+                None => steps.push(Step::Write {
                     path: REPLACED_GATE.into(),
-                    contents: c.clone(),
+                    contents: lxc_guest::read_exact(io, vmid, UPDATE_GATE)
+                        .await?
+                        .ok_or_else(|| anyhow!("{UPDATE_GATE} vanished while planning"))?,
                     mode: "0755",
-                    before: kept,
-                },
-                Step::Write {
-                    path: UPDATE_GATE.into(),
-                    contents: want,
-                    mode: "0755",
-                    before: Some(c),
-                },
-            ])
+                    before: None,
+                }),
+            }
+            steps.push(Step::Write {
+                path: UPDATE_GATE.into(),
+                contents: want,
+                mode: "0755",
+                before: Some(c),
+            });
+            Ok(steps)
         }
         cur => Ok(write_if_changed(UPDATE_GATE, want, "0755", cur)
             .into_iter()
@@ -613,46 +695,123 @@ async fn run_exec(io: &dyn GuestIo, vmid: u32, argv: &[&str]) -> Result<String> 
     }
 }
 
-async fn update_log_tail(io: &dyn GuestIo, vmid: u32) -> String {
-    match io.exec(vmid, &["tail", "-n", "40", UPDATE_LOG]).await {
-        Ok(r) => r.stdout,
-        Err(e) => format!("(could not read {UPDATE_LOG}: {e})"),
+/// The unit's status and last journal lines; output only, never an error.
+async fn unit_output(io: &dyn GuestIo, vmid: u32) -> String {
+    match io
+        .exec(
+            vmid,
+            &[
+                "systemctl",
+                "status",
+                "--no-pager",
+                "--lines=40",
+                UPDATE_UNIT,
+            ],
+        )
+        .await
+    {
+        Ok(r) => {
+            let mut out = r.stdout;
+            if out.len() > lxc_guest::READ_CAP {
+                let mut end = lxc_guest::READ_CAP;
+                while !out.is_char_boundary(end) {
+                    end -= 1;
+                }
+                out.truncate(end);
+            }
+            out
+        }
+        Err(e) => format!("(could not read `systemctl status {UPDATE_UNIT}`: {e})"),
     }
 }
 
-/// Poll [`UPDATE_UNIT`] until it leaves `activating`/`active`, then require
-/// `Result=success`.
-async fn await_unit(io: &dyn GuestIo, vmid: u32) -> Result<String> {
-    let deadline = tokio::time::Instant::now() + UPDATE_DEADLINE;
+const UNIT_PROPS: &[&str] = &[
+    "ActiveState",
+    "Result",
+    "InvocationID",
+    "FragmentPath",
+    "DropInPaths",
+];
+
+type UnitState = std::collections::HashMap<String, String>;
+
+async fn unit_state(io: &dyn GuestIo, vmid: u32) -> Result<UnitState> {
+    unit_show(io, vmid, UPDATE_UNIT, UNIT_PROPS).await
+}
+
+fn prop<'a>(st: &'a UnitState, key: &str) -> &'a str {
+    st.get(key).map(String::as_str).unwrap_or_default()
+}
+
+fn unit_running(st: &UnitState) -> bool {
+    matches!(
+        prop(st, "ActiveState"),
+        "activating" | "deactivating" | "reloading"
+    )
+}
+
+/// An `/etc` unit of the same name or any drop-in would replace or extend the
+/// commands orca wrote.
+fn require_own_unit(st: &UnitState, loaded: bool) -> Result<()> {
+    let fragment = prop(st, "FragmentPath");
+    if (loaded || !fragment.is_empty()) && fragment != UPDATE_UNIT_PATH {
+        bail!(
+            "{UPDATE_UNIT} loads from {fragment:?}, not {UPDATE_UNIT_PATH}; remove the other unit file"
+        );
+    }
+    let dropins = prop(st, "DropInPaths");
+    if !dropins.is_empty() {
+        bail!("{UPDATE_UNIT} has drop-ins ({dropins}); remove them");
+    }
+    Ok(())
+}
+
+/// Restart [`UPDATE_UNIT`] and wait for that run: a new `InvocationID` proves
+/// the result read is this run's, not a previous one's.
+async fn run_unit(io: &dyn GuestIo, vmid: u32) -> Result<String> {
+    let before = unit_state(io, vmid).await?;
+    if unit_running(&before) {
+        bail!("{UPDATE_UNIT} was started by someone else; not starting it again");
+    }
+    let prev = prop(&before, "InvocationID").to_string();
+    run_exec(
+        io,
+        vmid,
+        &["systemctl", "restart", "--no-block", UPDATE_UNIT],
+    )
+    .await?;
+    let started = tokio::time::Instant::now();
+    let mut ours = false;
     loop {
-        // `is-active` exits non-zero for every state but active, so read stdout.
-        let state = io
-            .exec(vmid, &["systemctl", "is-active", UPDATE_UNIT])
-            .await?
-            .stdout;
-        if state != "activating" && state != "active" && state != "reloading" {
-            break;
+        let st = unit_state(io, vmid).await?;
+        let id = prop(&st, "InvocationID");
+        ours = ours || (!id.is_empty() && id != prev);
+        if ours && !unit_running(&st) {
+            let out = unit_output(io, vmid).await;
+            if prop(&st, "ActiveState") == "active" && prop(&st, "Result") == "success" {
+                return Ok(out);
+            }
+            bail!(
+                "{UPDATE_UNIT} finished with ActiveState={} Result={}; status:\n{out}",
+                prop(&st, "ActiveState"),
+                prop(&st, "Result")
+            );
         }
-        if tokio::time::Instant::now() >= deadline {
+        if !ours && started.elapsed() >= UPDATE_START_TIMEOUT {
+            bail!(
+                "{UPDATE_UNIT} did not start within {}s (InvocationID unchanged)",
+                UPDATE_START_TIMEOUT.as_secs()
+            );
+        }
+        if started.elapsed() >= UPDATE_DEADLINE {
             bail!(
                 "{UPDATE_UNIT} is still running after {}h; it keeps running in the container \
-                 (check `systemctl status {UPDATE_UNIT}` and {UPDATE_LOG})",
+                 (check `systemctl status {UPDATE_UNIT}`)",
                 UPDATE_DEADLINE.as_secs() / 3600
             );
         }
         tokio::time::sleep(UPDATE_POLL).await;
     }
-    let result = run_exec(
-        io,
-        vmid,
-        &["systemctl", "show", "-p", "Result", "--value", UPDATE_UNIT],
-    )
-    .await?;
-    let tail = update_log_tail(io, vmid).await;
-    if result != "success" {
-        bail!("{UPDATE_UNIT} finished with Result={result}; last output:\n{tail}");
-    }
-    Ok(tail)
 }
 
 /// Run `steps`. A failing step stops the run with what already ran named, so a
@@ -667,8 +826,7 @@ pub async fn run_steps(io: &dyn GuestIo, ctid: u64, steps: &[Step]) -> Result<Ve
                 contents,
                 mode,
                 ..
-            } => io
-                .write(vmid, path, contents.as_bytes(), Some(mode))
+            } => lxc_guest::write_checked(io, vmid, path, contents.as_bytes(), Some(mode))
                 .await
                 .map(|_| StepOutcome {
                     target: path.clone(),
@@ -688,10 +846,18 @@ pub async fn run_steps(io: &dyn GuestIo, ctid: u64, steps: &[Step]) -> Result<Ve
                     output: (!out.is_empty()).then_some(out),
                 })
             }
-            Step::AwaitUnit => await_unit(io, vmid).await.map(|tail| StepOutcome {
+            Step::VerifyUnit => unit_state(io, vmid)
+                .await
+                .and_then(|st| require_own_unit(&st, true))
+                .map(|_| StepOutcome {
+                    target: UPDATE_UNIT.into(),
+                    action: "verify".into(),
+                    output: None,
+                }),
+            Step::RunUnit => run_unit(io, vmid).await.map(|out| StepOutcome {
                 target: UPDATE_UNIT.into(),
-                action: "wait".into(),
-                output: (!tail.is_empty()).then_some(tail),
+                action: "run".into(),
+                output: (!out.is_empty()).then_some(out),
             }),
             Step::Refuse { .. } => Err(anyhow!("{}", s.refused().unwrap_or_default())),
         };
@@ -801,17 +967,21 @@ pub fn updater_commands(updater: Updater, facts: &StandardFacts) -> Result<Vec<S
     })
 }
 
+/// `RemainAfterExit` keeps a finished run `active` with its `InvocationID` and
+/// `Result`, where a plain oneshot could be garbage-collected back to defaults
+/// before orca reads them.
 pub fn update_unit(commands: &[Step]) -> String {
-    let mut unit = format!(
+    let mut unit = String::from(
         "[Unit]
 Description=orca guest update (runs after an orca backup)
 
 [Service]
 Type=oneshot
+RemainAfterExit=yes
 Environment=DEBIAN_FRONTEND=noninteractive
-StandardOutput=append:{UPDATE_LOG}
-StandardError=inherit
-"
+StandardOutput=journal
+StandardError=journal
+",
     );
     for c in commands {
         if let Step::Exec { argv, .. } = c {
@@ -834,21 +1004,12 @@ pub fn updater_steps(commands: Vec<Step>, os: &Os) -> Vec<Step> {
             mode: "0644",
             before: None,
         },
-        Step::Write {
-            path: UPDATE_LOG.into(),
-            contents: String::new(),
-            mode: "0640",
-            before: None,
-        },
         Step::exec(
             &["systemctl", "daemon-reload"],
             "load the transient update unit",
         ),
-        Step::exec(
-            &["systemctl", "start", "--no-block", UPDATE_UNIT],
-            "run the updater outside the exec timeout",
-        ),
-        Step::AwaitUnit,
+        Step::VerifyUnit,
+        Step::RunUnit,
     ]
 }
 
@@ -871,6 +1032,33 @@ fn restore_hint(ctid: u64, backup: &BackupRef) -> String {
     )
 }
 
+static UPDATING: std::sync::Mutex<std::collections::BTreeSet<u64>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// One update per CT in this plugin process, so two concurrent calls never
+/// both back up or attach to each other's unit run. Another orca instance is
+/// not covered; the unit's running check is the backstop there.
+struct UpdateLock(u64);
+
+impl UpdateLock {
+    fn take(ctid: u64) -> Result<Self> {
+        let mut held = UPDATING.lock().unwrap_or_else(|e| e.into_inner());
+        if !held.insert(ctid) {
+            bail!("an update of CT {ctid} is already in progress; nothing was changed");
+        }
+        Ok(Self(ctid))
+    }
+}
+
+impl Drop for UpdateLock {
+    fn drop(&mut self) {
+        UPDATING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
 /// Back up, record the backup in [`BACKUP_MARKER`], then run the updater.
 /// Everything that can refuse does so before the backup.
 pub async fn run_update(
@@ -881,17 +1069,16 @@ pub async fn run_update(
 ) -> Result<GuestApplied> {
     const TOOL: &str = "proxmox.guest.update";
     let vmid = ctid as u32;
+    let _lock = UpdateLock::take(ctid)?;
     let facts = probe(io, vmid).await?;
     let commands = updater_commands(payload.updater, &facts)?;
     refuse_blocked(TOOL, &commands)?;
     if facts.os == Os::Debian {
-        let state = io
-            .exec(vmid, &["systemctl", "is-active", UPDATE_UNIT])
-            .await?
-            .stdout;
-        if state == "active" || state == "activating" {
+        let st = unit_state(io, vmid).await?;
+        if unit_running(&st) {
             bail!("{TOOL}: {UPDATE_UNIT} is already running in CT {ctid}; nothing was changed");
         }
+        require_own_unit(&st, false).map_err(|e| anyhow!("{TOOL}: {e}; nothing was changed"))?;
     }
     let backup_ref = backup.backup(ctid, payload.storage.as_deref()).await?;
     let marker = Step::Write {
@@ -1215,9 +1402,8 @@ tty2::respawn:/sbin/getty 38400 tty2
 # tty3::respawn:/sbin/getty 38400 tty3
 ttyS0::respawn:/sbin/getty -L 115200 ttyS0 vt100
 console::respawn:/sbin/getty 38400 console";
-    const GETTY_UNIT: &str = "# /lib/systemd/system/container-getty@.service
-[Service]
-ExecStart=-/sbin/agetty --noclear --keep-baud pts/%I 115200,38400,9600 $TERM";
+    const GETTY_UNIT: &str = "{ path=/sbin/agetty ; argv[]=/sbin/agetty -o -p -- \\u --noclear --keep-baud pts/%I 115200,38400,9600 $TERM ; ignore_errors=yes ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }";
+    const AUTOLOGIN_UNIT: &str = "{ path=/sbin/agetty ; argv[]=/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,38400,9600 $TERM ; ignore_errors=yes ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }";
 
     fn rt() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -1243,15 +1429,6 @@ ExecStart=-/sbin/agetty --noclear --keep-baud pts/%I 115200,38400,9600 $TERM";
         format!("ls -d {path}")
     }
 
-    fn not_running() -> lxc_guest::ExecResult {
-        lxc_guest::ExecResult {
-            success: false,
-            exit_code: Some(3),
-            stdout: "inactive".into(),
-            stderr: String::new(),
-        }
-    }
-
     fn facts(os: Os) -> StandardFacts {
         StandardFacts {
             os,
@@ -1264,7 +1441,7 @@ ExecStart=-/sbin/agetty --noclear --keep-baud pts/%I 115200,38400,9600 $TERM";
         }
     }
 
-    /// Probe replies for a Debian CT: console from `systemctl cat`, gate
+    /// Probe replies for a Debian CT: console from `systemctl show ExecStart`, gate
     /// content, whether `/usr/bin/update` exists.
     fn debian(
         console: &str,
@@ -1274,7 +1451,7 @@ ExecStart=-/sbin/agetty --noclear --keep-baud pts/%I 115200,38400,9600 $TERM";
         vec![
             (read("/etc/os-release"), fake::ok(DEBIAN)),
             (
-                format!("systemctl cat {DEBIAN_CONSOLE_UNIT}"),
+                format!("systemctl show -p ExecStart --value {DEBIAN_CONSOLE_UNIT}"),
                 fake::ok(console),
             ),
             (
@@ -1348,25 +1525,21 @@ ExecStart=-/sbin/agetty --noclear --keep-baud pts/%I 115200,38400,9600 $TERM";
     }
 
     #[test]
-    fn debian_console_reads_any_dropin_layout() {
+    fn debian_console_reads_the_effective_exec_start() {
         assert!(!debian_console_ok(GETTY_UNIT));
-        let community = format!(
-            "{GETTY_UNIT}\n# /etc/systemd/system/container-getty@1.service.d/override.conf\n[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,38400,9600 $TERM"
-        );
-        assert!(debian_console_ok(&community));
+        assert!(debian_console_ok(AUTOLOGIN_UNIT));
+        assert!(debian_console_ok(
+            &AUTOLOGIN_UNIT.replace("--autologin root", "-a root")
+        ));
         assert!(!debian_console_ok(
-            "# ExecStart=-/sbin/agetty --autologin root"
+            "{ path=/sbin/agetty ; argv[]=/sbin/agetty --noclear tty1 ; ignore_errors=no ; x=--autologin root }"
         ));
     }
 
     #[test]
     fn probe_debian_with_standard_installed() {
         let gate = gate_script("pve", 116).unwrap();
-        let io = io_of(debian(
-            &format!("{GETTY_UNIT}\n{DEBIAN_AUTOLOGIN_CONF}"),
-            Some(&gate),
-            true,
-        ));
+        let io = io_of(debian(AUTOLOGIN_UNIT, Some(&gate), true));
         let f = rt().block_on(probe(&io, 116)).unwrap();
         assert_eq!(
             f,
@@ -1384,8 +1557,9 @@ ExecStart=-/sbin/agetty --noclear --keep-baud pts/%I 115200,38400,9600 $TERM";
                 .unwrap()
                 .iter()
                 .all(|e| e.starts_with("head ")
+                    || e.starts_with("stat -L ")
                     || e.starts_with("ls ")
-                    || e.starts_with("systemctl cat "))
+                    || e.starts_with("systemctl show "))
         );
     }
 
@@ -1521,9 +1695,8 @@ ExecStart=-/sbin/agetty --noclear --keep-baud pts/%I 115200,38400,9600 $TERM";
 
     #[test]
     fn existing_community_autologin_is_left_alone() {
-        let console = format!("{GETTY_UNIT}\nExecStart=-/sbin/agetty --autologin root tty%I");
         let gate = gate_script("pve", 116).unwrap();
-        let io = io_of(debian(&console, Some(&gate), false));
+        let io = io_of(debian(AUTOLOGIN_UNIT, Some(&gate), false));
         let Change::Plan(p) = rt().block_on(apply(&io, &apply_args(116), None)).unwrap() else {
             panic!()
         };
@@ -1677,6 +1850,47 @@ ExecStart=-/sbin/agetty --noclear --keep-baud pts/%I 115200,38400,9600 $TERM";
     }
 
     #[test]
+    fn replace_gate_never_overwrites_a_different_kept_gate() {
+        let old = "#!/bin/sh\nssh host orca-guest-backup";
+        let mut replies = debian(GETTY_UNIT, Some(old), false);
+        replies.push((read(REPLACED_GATE), fake::ok("#!/bin/sh\nan older gate")));
+        let args = StandardApplyArgs {
+            console: false,
+            replace_gate: true,
+            ..apply_args(116)
+        };
+        let Change::Plan(p) = rt().block_on(apply(&io_of(replies), &args, None)).unwrap() else {
+            panic!()
+        };
+        assert_eq!(p.changes[0].action, "refused");
+        assert!(
+            p.summary.contains("already holds a different script"),
+            "{}",
+            p.summary
+        );
+    }
+
+    #[test]
+    fn a_symlinked_write_target_is_refused_before_the_write() {
+        let io = io_of(vec![(
+            format!("stat -c %n|%F -- /run {BACKUP_MARKER}"),
+            fake::ok(&format!("/run|directory\n{BACKUP_MARKER}|symbolic link")),
+        )]);
+        let steps = vec![Step::Write {
+            path: BACKUP_MARKER.into(),
+            contents: "{}".into(),
+            mode: "0644",
+            before: None,
+        }];
+        let err = rt()
+            .block_on(run_steps(&io, 1, &steps))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symbolic link"), "{err}");
+        assert!(io.writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn gate_script_names_endpoint_and_refuses_unsafe_ones() {
         let s = gate_script("pve-1", 116).unwrap();
         assert!(s.starts_with("#!/bin/sh\n# orca-update-gate v1"));
@@ -1707,19 +1921,50 @@ ExecStart=-/sbin/agetty --noclear --keep-baud pts/%I 115200,38400,9600 $TERM";
         }
     }
 
+    fn unit_key() -> String {
+        format!(
+            "systemctl show -p ActiveState -p Result -p InvocationID -p FragmentPath -p DropInPaths {UPDATE_UNIT}"
+        )
+    }
+
+    fn unit(
+        active: &str,
+        result: &str,
+        id: &str,
+        fragment: &str,
+        dropins: &str,
+    ) -> lxc_guest::ExecResult {
+        fake::ok(&format!(
+            "ActiveState={active}\nResult={result}\nInvocationID={id}\nFragmentPath={fragment}\nDropInPaths={dropins}"
+        ))
+    }
+
+    /// An apt update whose unit run ends `active`/`failed` with `result`.
     fn apt_update_replies(result: &str) -> Vec<(String, lxc_guest::ExecResult)> {
         let mut r = debian(GETTY_UNIT, None, false);
-        r.push((format!("systemctl is-active {UPDATE_UNIT}"), not_running()));
+        let fresh = unit("inactive", "success", "", UPDATE_UNIT_PATH, "");
+        r.push((unit_key(), unit("inactive", "success", "", "", "")));
+        r.push((unit_key(), fresh.clone()));
+        r.push((unit_key(), fresh));
+        r.push((
+            unit_key(),
+            unit("activating", "success", "a1", UPDATE_UNIT_PATH, ""),
+        ));
+        let end = if result == "success" {
+            "active"
+        } else {
+            "failed"
+        };
+        r.push((unit_key(), unit(end, result, "a1", UPDATE_UNIT_PATH, "")));
         r.push(("systemctl daemon-reload".into(), fake::ok("")));
         r.push((
-            format!("systemctl start --no-block {UPDATE_UNIT}"),
+            format!("systemctl restart --no-block {UPDATE_UNIT}"),
             fake::ok(""),
         ));
         r.push((
-            format!("systemctl show -p Result --value {UPDATE_UNIT}"),
-            fake::ok(result),
+            format!("systemctl status --no-pager --lines=40 {UPDATE_UNIT}"),
+            fake::ok("0 upgraded"),
         ));
-        r.push((format!("tail -n 40 {UPDATE_LOG}"), fake::ok("0 upgraded")));
         r
     }
 
@@ -1731,7 +1976,7 @@ ExecStart=-/sbin/agetty --noclear --keep-baud pts/%I 115200,38400,9600 $TERM";
             .block_on(run_update(
                 &io,
                 &backup,
-                116,
+                201,
                 &GuestUpdatePayload::default(),
             ))
             .unwrap();
@@ -1742,8 +1987,10 @@ ExecStart=-/sbin/agetty --noclear --keep-baud pts/%I 115200,38400,9600 $TERM";
         );
         let writes = io.writes.lock().unwrap();
         assert_eq!(writes[0].0, BACKUP_MARKER);
-        assert!(writes[0].1.contains("vzdump-lxc-116"));
+        assert!(writes[0].1.contains("vzdump-lxc-201"));
         assert_eq!(writes[1].0, UPDATE_UNIT_PATH);
+        assert!(writes[1].1.contains("RemainAfterExit=yes\nEnvironment"));
+        assert!(writes[1].1.contains("StandardOutput=journal"));
         assert!(
             writes[1]
                 .1
@@ -1760,37 +2007,88 @@ ExecStart=-/sbin/agetty --noclear --keep-baud pts/%I 115200,38400,9600 $TERM";
             .block_on(run_update(
                 &io,
                 &FakeBackup(Default::default()),
-                116,
+                202,
                 &GuestUpdatePayload::default(),
             ))
             .unwrap_err()
             .to_string();
         assert!(err.contains("Result=exit-code"), "{err}");
         assert!(
-            err.contains("action=restore") && err.contains("vzdump-lxc-116.tar.zst"),
+            err.contains("action=restore") && err.contains("vzdump-lxc-202.tar.zst"),
             "{err}"
         );
     }
 
     #[test]
     fn a_running_update_is_refused_before_the_backup() {
+        let refused = |state: lxc_guest::ExecResult, ctid: u64| {
+            let mut replies = debian(GETTY_UNIT, None, false);
+            replies.push((unit_key(), state));
+            let backup = FakeBackup(Default::default());
+            let err = rt()
+                .block_on(run_update(
+                    &io_of(replies),
+                    &backup,
+                    ctid,
+                    &GuestUpdatePayload::default(),
+                ))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(*backup.0.lock().unwrap(), 0, "{err}");
+            err
+        };
+        let running = unit("activating", "success", "a1", UPDATE_UNIT_PATH, "");
+        assert!(refused(running, 203).contains("already running"));
+        let etc = unit(
+            "inactive",
+            "success",
+            "",
+            "/etc/systemd/system/orca-guest-update.service",
+            "",
+        );
+        assert!(refused(etc, 204).contains("loads from"));
+        let dropin = unit(
+            "inactive",
+            "success",
+            "",
+            UPDATE_UNIT_PATH,
+            "/etc/systemd/system/orca-guest-update.service.d/x.conf",
+        );
+        assert!(refused(dropin, 205).contains("has drop-ins"));
+    }
+
+    #[test]
+    fn a_unit_that_never_starts_is_an_error_not_a_stale_result() {
         let mut replies = debian(GETTY_UNIT, None, false);
         replies.push((
-            format!("systemctl is-active {UPDATE_UNIT}"),
-            fake::ok("activating"),
+            unit_key(),
+            unit("active", "success", "old", UPDATE_UNIT_PATH, ""),
         ));
-        let backup = FakeBackup(Default::default());
+        replies.push(("systemctl daemon-reload".into(), fake::ok("")));
+        replies.push((
+            format!("systemctl restart --no-block {UPDATE_UNIT}"),
+            fake::ok(""),
+        ));
         let err = rt()
             .block_on(run_update(
                 &io_of(replies),
-                &backup,
-                116,
+                &FakeBackup(Default::default()),
+                206,
                 &GuestUpdatePayload::default(),
             ))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("already running"), "{err}");
-        assert_eq!(*backup.0.lock().unwrap(), 0);
+        assert!(err.contains("did not start"), "{err}");
+        assert!(err.contains("action=restore"), "{err}");
+    }
+
+    #[test]
+    fn one_update_per_ct_at_a_time() {
+        let held = UpdateLock::take(207).unwrap();
+        let err = UpdateLock::take(207).err().unwrap().to_string();
+        assert!(err.contains("already in progress"), "{err}");
+        drop(held);
+        UpdateLock::take(207).unwrap();
     }
 
     #[test]
@@ -1801,7 +2099,7 @@ ExecStart=-/sbin/agetty --noclear --keep-baud pts/%I 115200,38400,9600 $TERM";
             .block_on(run_update(
                 &io,
                 &backup,
-                116,
+                208,
                 &GuestUpdatePayload::default(),
             ))
             .unwrap_err()

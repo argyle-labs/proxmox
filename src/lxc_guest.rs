@@ -190,30 +190,138 @@ async fn push(vmid: u32, path: &str, contents: &[u8], mode: Option<&str>) -> Res
     Ok(())
 }
 
-/// Largest file [`read_file`] returns. The path is guest-controlled, and a
-/// `cat` of `/dev/zero` would have root on the host buffer without bound.
+/// Largest file [`read_file`] returns. Paths are guest-controlled, so a read
+/// is bounded by the file's `stat` size before anything is read.
 pub const READ_CAP: usize = 64 * 1024;
 
-/// A file's contents (trimmed, as the seam returns them), or `None` when it
-/// does not exist. A file of [`READ_CAP`] bytes or more is an error, so a
-/// truncated read is never mistaken for the whole file.
-pub async fn read_file(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<Option<String>> {
-    let cap = READ_CAP.to_string();
-    let r = io.exec(vmid, &["head", "-c", &cap, "--", path]).await?;
-    if r.success {
-        if r.stdout.len() >= READ_CAP {
-            bail!("read {path} in CT {vmid}: larger than {READ_CAP} bytes");
-        }
-        return Ok(Some(r.stdout));
-    }
-    if r.stderr.contains("No such file") {
+fn missing(r: &ExecResult) -> bool {
+    !r.success && r.stderr.contains("No such file")
+}
+
+/// Contents (trimmed by the seam) and on-disk size of a regular file at most
+/// [`READ_CAP`] bytes, or `None` when it does not exist. Symlinks are followed:
+/// the read runs inside the container, as the container's root.
+async fn read_sized(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<Option<(String, usize)>> {
+    let st = io
+        .exec(vmid, &["stat", "-L", "-c", "%F|%s", "--", path])
+        .await?;
+    if missing(&st) {
         return Ok(None);
     }
-    bail!(
-        "read {path} in CT {vmid}: exit {:?}: {}",
-        r.exit_code,
-        r.stderr
-    )
+    if !st.success {
+        bail!(
+            "stat {path} in CT {vmid}: exit {:?}: {}",
+            st.exit_code,
+            st.stderr
+        );
+    }
+    let (kind, size) = st.stdout.split_once('|').ok_or_else(|| {
+        anyhow!(
+            "stat {path} in CT {vmid}: unexpected output {:?}",
+            st.stdout
+        )
+    })?;
+    if !kind.starts_with("regular") {
+        bail!("read {path} in CT {vmid}: it is a {kind}, not a regular file");
+    }
+    let size: usize = size
+        .trim()
+        .parse()
+        .map_err(|e| anyhow!("stat {path} in CT {vmid}: size {size:?}: {e}"))?;
+    if size > READ_CAP {
+        bail!("read {path} in CT {vmid}: {size} bytes is larger than {READ_CAP}");
+    }
+    let cap = READ_CAP.to_string();
+    let r = io.exec(vmid, &["head", "-c", &cap, "--", path]).await?;
+    if missing(&r) {
+        return Ok(None);
+    }
+    if !r.success {
+        bail!(
+            "read {path} in CT {vmid}: exit {:?}: {}",
+            r.exit_code,
+            r.stderr
+        );
+    }
+    // The seam decodes lossily; a replacement character means the bytes were
+    // not UTF-8 and the text is not the file.
+    if r.stdout.contains('\u{FFFD}') {
+        bail!("read {path} in CT {vmid}: not valid UTF-8");
+    }
+    Ok(Some((r.stdout, size)))
+}
+
+/// A file's contents (trimmed, as the seam returns them), or `None` when it
+/// does not exist. Refused when larger than [`READ_CAP`], not a regular file,
+/// or not UTF-8.
+pub async fn read_file(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<Option<String>> {
+    Ok(read_sized(io, vmid, path).await?.map(|(s, _)| s))
+}
+
+/// [`read_file`], byte for byte: the seam's trim is undone when it removed
+/// only a trailing newline, and refused otherwise.
+pub async fn read_exact(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<Option<String>> {
+    match read_sized(io, vmid, path).await? {
+        None => Ok(None),
+        Some((s, size)) if s.len() == size => Ok(Some(s)),
+        Some((s, size)) if s.len() + 1 == size => Ok(Some(s + "\n")),
+        Some((s, size)) => bail!(
+            "read {path} in CT {vmid}: {size} bytes on disk but {} read; the exec seam trims \
+             whitespace, so it cannot be copied exactly",
+            s.len()
+        ),
+    }
+}
+
+/// Refuse a push to `path` unless it is a regular file or absent and every
+/// existing parent is a real directory. `lxc-push` writes as root on the host
+/// and follows guest symlinks, so a link here would redirect the write onto
+/// the host. A swap between this check and the write is closed only by core
+/// writing with `O_NOFOLLOW` or from inside the container's user namespace.
+pub async fn check_push_target(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<()> {
+    let mut paths: Vec<String> = std::path::Path::new(path)
+        .ancestors()
+        .skip(1)
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| !p.is_empty() && p != "/")
+        .collect();
+    paths.reverse();
+    paths.push(path.to_string());
+    let mut argv = vec!["stat", "-c", "%n|%F", "--"];
+    argv.extend(paths.iter().map(String::as_str));
+    let r = io.exec(vmid, &argv).await?;
+    if !r.success && !r.stderr.lines().all(|l| l.contains("No such file")) {
+        bail!(
+            "check {path} in CT {vmid} before writing: exit {:?}: {}",
+            r.exit_code,
+            r.stderr
+        );
+    }
+    for line in r.stdout.lines() {
+        let Some((name, kind)) = line.split_once('|') else {
+            bail!("check {path} in CT {vmid}: unexpected stat output {line:?}");
+        };
+        if name == path {
+            if !kind.starts_with("regular") {
+                bail!("refusing to write {path} in CT {vmid}: it is a {kind}, not a regular file");
+            }
+        } else if kind != "directory" {
+            bail!("refusing to write {path} in CT {vmid}: parent {name} is a {kind}");
+        }
+    }
+    Ok(())
+}
+
+/// [`GuestIo::write`] after [`check_push_target`].
+pub async fn write_checked(
+    io: &dyn GuestIo,
+    vmid: u32,
+    path: &str,
+    contents: &[u8],
+    mode: Option<&str>,
+) -> Result<()> {
+    check_push_target(io, vmid, path).await?;
+    io.write(vmid, path, contents, mode).await
 }
 
 pub async fn exists(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<bool> {
@@ -322,6 +430,7 @@ pub mod fake {
         pub replies: Vec<(String, ExecResult)>,
         pub execs: Mutex<Vec<String>>,
         pub writes: Mutex<Vec<(String, String, Option<String>)>>,
+        pub served: Mutex<std::collections::HashMap<String, usize>>,
     }
 
     pub fn ok(stdout: &str) -> ExecResult {
@@ -366,11 +475,49 @@ pub mod fake {
                 }
                 let key = argv.join(" ");
                 self.execs.lock().unwrap().push(key.clone());
-                self.replies
+                let reply = |k: &str| {
+                    self.replies
+                        .iter()
+                        .find(|(rk, _)| rk == k)
+                        .map(|(_, v)| v.clone())
+                };
+                // A key scripted more than once answers in order, then repeats
+                // its last reply.
+                let scripted: Vec<&ExecResult> = self
+                    .replies
                     .iter()
-                    .find(|(k, _)| *k == key)
-                    .map(|(_, v)| v.clone())
-                    .ok_or_else(|| anyhow!("unexpected exec: {key}"))
+                    .filter(|(k, _)| *k == key)
+                    .map(|(_, v)| v)
+                    .collect();
+                if !scripted.is_empty() {
+                    let mut served = self.served.lock().unwrap();
+                    let n = served.entry(key.clone()).or_default();
+                    let r = scripted[(*n).min(scripted.len() - 1)].clone();
+                    *n += 1;
+                    return Ok(r);
+                }
+                // Unscripted stats answer from the scripted reads: a file with a
+                // `head` reply is regular, and a push target's parents are dirs.
+                match argv {
+                    ["stat", "-L", "-c", "%F|%s", "--", path] => {
+                        if let Some(r) = reply(&format!("head -c {READ_CAP} -- {path}")) {
+                            return Ok(if r.success {
+                                ok(&format!("regular file|{}", r.stdout.len()))
+                            } else {
+                                r
+                            });
+                        }
+                    }
+                    ["stat", "-c", "%n|%F", "--", paths @ ..] => {
+                        let (target, parents) = paths.split_last().unwrap();
+                        let mut lines: Vec<String> =
+                            parents.iter().map(|p| format!("{p}|directory")).collect();
+                        lines.push(format!("{target}|regular file"));
+                        return Ok(ok(&lines.join("\n")));
+                    }
+                    _ => {}
+                }
+                Err(anyhow!("unexpected exec: {key}"))
             })
         }
 
@@ -452,14 +599,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_file_refuses_a_capped_read() {
-        let big = "z".repeat(READ_CAP);
-        let io = fake::FakeIo::with(&[("head -c 65536 -- /dev/zero", fake::ok(&big))]);
-        let err = read_file(&io, 1, "/dev/zero")
+    async fn read_file_refuses_big_special_or_binary_files() {
+        let io = fake::FakeIo::with(&[
+            ("stat -L -c %F|%s -- /big", fake::ok("regular file|70000")),
+            (
+                "stat -L -c %F|%s -- /dev/zero",
+                fake::ok("character special file|0"),
+            ),
+            ("head -c 65536 -- /bin/x", fake::ok("\u{FFFD}ELF")),
+        ]);
+        for (path, want) in [
+            ("/big", "larger than 65536"),
+            ("/dev/zero", "not a regular file"),
+            ("/bin/x", "not valid UTF-8"),
+        ] {
+            let err = read_file(&io, 1, path).await.unwrap_err().to_string();
+            assert!(err.contains(want), "{path}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_exact_restores_a_trimmed_newline_only() {
+        let io = fake::FakeIo::with(&[
+            ("stat -L -c %F|%s -- /a", fake::ok("regular file|3")),
+            ("head -c 65536 -- /a", fake::ok("ab")),
+            ("stat -L -c %F|%s -- /b", fake::ok("regular file|5")),
+            ("head -c 65536 -- /b", fake::ok("ab")),
+        ]);
+        assert_eq!(
+            read_exact(&io, 1, "/a").await.unwrap().as_deref(),
+            Some("ab\n")
+        );
+        assert!(read_exact(&io, 1, "/b").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn push_targets_refuse_symlinks_and_non_directory_parents() {
+        let io = fake::FakeIo::with(&[
+            (
+                "stat -c %n|%F -- /etc /etc/inittab",
+                fake::ok("/etc|directory\n/etc/inittab|symbolic link"),
+            ),
+            (
+                "stat -c %n|%F -- /usr /usr/local /usr/local/bin /usr/local/bin/update",
+                fake::ok("/usr|directory\n/usr/local|symbolic link\n/usr/local/bin|directory"),
+            ),
+            (
+                "stat -c %n|%F -- /run /run/x",
+                ExecResult {
+                    success: false,
+                    exit_code: Some(1),
+                    stdout: "/run|directory".into(),
+                    stderr: "stat: cannot stat '/run/x': No such file or directory".into(),
+                },
+            ),
+        ]);
+        let err = check_push_target(&io, 1, "/etc/inittab")
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("larger than 65536 bytes"), "{err}");
+        assert!(err.contains("it is a symbolic link"), "{err}");
+        let err = check_push_target(&io, 1, "/usr/local/bin/update")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("parent /usr/local is a symbolic link"),
+            "{err}"
+        );
+        write_checked(&io, 1, "/run/x", b"y", None).await.unwrap();
+        assert_eq!(io.writes.lock().unwrap().len(), 1);
     }
 
     #[test]

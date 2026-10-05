@@ -42,16 +42,25 @@ containers there.
 
 ## Probe (read-only)
 
-The probe uses only `head -c 65536 --`, `ls -d` and `systemctl cat`, all already
-on the allowlist. It is bounded to 10 s. Reads are capped because the paths are
-inside the container, and a guest could point one at `/dev/zero`. A file at the
-cap is an error, never a truncated read. `test -e` would need its own allowlist
-entry, and `ls -d` gives the same answer.
+The probe uses only `stat`, `head`, `ls -d` and `systemctl show`, all already on
+the allowlist. It is bounded to 10 s.
+
+Every file read first runs `stat -L -c '%F|%s' --`, then `head -c 65536 --`. The
+paths are inside the container, and a guest could point one at `/dev/zero` or a
+FIFO. A read is refused when the file is:
+
+- not a regular file;
+- larger than 64 KiB on disk (the seam trims output, so the size comes from
+  `stat`, not from what was read);
+- not valid UTF-8.
+
+`systemctl` output larger than 64 KiB is refused too. `test -e` would need its
+own allowlist entry, and `ls -d` gives the same answer.
 
 | fact | read |
 | --- | --- |
 | OS | `/etc/os-release` (`ID` / `ID_LIKE`: debian, ubuntu, alpine) |
-| root console, Debian | `systemctl cat container-getty@1.service` has a live line with `--autologin root`. This covers orca's `container-getty@.service.d/autologin.conf` and community-scripts' `container-getty@1.service.d/*.conf`. |
+| root console, Debian | the effective `ExecStart` from `systemctl show -p ExecStart --value container-getty@1.service` passes `--autologin root` (or `-a root`). It is read after every drop-in and `ExecStart=` reset, so it covers orca's `container-getty@.service.d/autologin.conf` and community-scripts' `container-getty@1.service.d/*.conf`. |
 | root console, Alpine | the live `tty1` line in `/etc/inittab` uses `-l /usr/local/sbin/autologin`, that wrapper contains `login -f root`, and `/etc/.pve-ignore.inittab` exists |
 | `update` gate | `/usr/local/bin/update` carries the `# orca-update-gate v1` marker |
 | foreign gate | `/usr/local/bin/update` exists without the marker (reported as drift) |
@@ -59,6 +68,14 @@ entry, and `ls -d` gives the same answer.
 | legacy backup key | `ls -d /root/.orca/host_backup_key` (reported as drift) |
 
 ## Apply
+
+Every file orca writes goes through `lxc-push`, which writes as root on the host
+and follows symlinks inside the container. Before each write, orca checks the
+target and its existing parents with `stat -c '%n|%F' --`. It refuses unless
+the target is a regular file or absent, and every existing parent is a real
+directory. A guest could still swap in a symlink between that check and the
+write. Only core can close that race, by writing with `O_NOFOLLOW` or from
+inside the container's user namespace.
 
 Apply is idempotent. It writes a file only when its trimmed contents differ, and
 it skips the console steps when autologin is already in effect. The dry run
@@ -96,6 +113,11 @@ The `update` gate:
   hand-rolled ssh gate) is refused unless `replace_gate: true` is passed. With
   it, the old script is kept as `/usr/local/bin/update.orca-replaced`, and the
   plan shows the diff.
+  - The copy goes through orca, because the seam has no `cp`. It is refused
+    unless the read matches the on-disk size, allowing only for a trailing
+    newline the seam trimmed.
+  - If `.orca-replaced` already holds a different script, the replacement is
+    refused, so neither script is lost.
 - **What gets written.** Otherwise the gate is written to
   `/usr/local/bin/update` (mode 0755). It shadows `/usr/bin/update` on `PATH`;
   community-scripts regenerates that file after every successful update, so the
@@ -116,25 +138,36 @@ Everything that can refuse does so before the backup:
      on Alpine, or `community` without `/usr/bin/update`.
    - So is an OS with no updater.
 2. Refuse if any updater command is outside the allowlist.
-3. On systemd guests, refuse if `orca-guest-update.service` is already running.
+3. Refuse if another update of the same CT is in progress in this plugin
+   process. This per-CT lock is held from the probe until the update finishes.
+4. On systemd guests, refuse if `orca-guest-update.service` is running, if it
+   loads from any file other than orca's `/run/systemd/system` one, or if it
+   has drop-ins. The check reads `systemctl show -p FragmentPath -p DropInPaths`.
 
 Then:
 
-4. Back up through the unit `backup` action: vzdump through the PVE API, waited
+5. Back up through the unit `backup` action: vzdump through the PVE API, waited
    on. A failed backup aborts the update.
-5. Write the backup reference to `/run/orca-update-backup.json`, which opens the
+6. Write the backup reference to `/run/orca-update-backup.json`, which opens the
    in-guest gate for an hour.
-6. Run the updater.
+7. Run the updater.
    - **On Debian/Ubuntu** it runs as a oneshot systemd unit, so the 5-minute
-     lxc-exec timeout cannot kill dpkg mid-upgrade. Orca writes
-     `/run/systemd/system/orca-guest-update.service` with
-     `DEBIAN_FRONTEND=noninteractive` and one `ExecStart=` per command, and
-     resets `/var/log/orca-guest-update.log`. It then runs
-     `systemctl daemon-reload` and
-     `systemctl start --no-block orca-guest-update.service`, polls
-     `systemctl is-active` every 5 s for up to 2 h, and requires
-     `systemctl show -p Result` to be `success`. The last 40 log lines come
-     back as output.
+     lxc-exec timeout cannot kill dpkg mid-upgrade.
+     1. Orca writes `/run/systemd/system/orca-guest-update.service` with
+        `RemainAfterExit=yes`, `DEBIAN_FRONTEND=noninteractive`, output to the
+        journal, and one `ExecStart=` per command.
+     2. It runs `systemctl daemon-reload`, and checks again that the unit loads
+        from that file alone.
+     3. It refuses if the unit started running since the backup, notes its
+        `InvocationID`, and runs `systemctl restart --no-block`.
+     4. A new `InvocationID` must appear within 60 s, or the update fails
+        rather than reading a previous run's result.
+     5. It polls `systemctl show` every 5 s, for up to 2 h, and requires
+        `ActiveState=active` and `Result=success`. `RemainAfterExit` keeps
+        those values after the run, so systemd cannot reset them before orca
+        reads them.
+     6. The output is `systemctl status --lines=40`, capped at 64 KiB.
+       `journalctl` would need its own allowlist entry.
    - **On Alpine** the commands run directly through the seam, still under its
      5-minute timeout.
 

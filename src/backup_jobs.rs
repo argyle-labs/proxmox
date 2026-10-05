@@ -902,8 +902,7 @@ pub async fn pxarexclude(
     }
     execute::authorize_execute(TOOL, caller)?;
     if changed {
-        io.write(vmid, PXAREXCLUDE, want.as_bytes(), Some("0644"))
-            .await?;
+        lxc_guest::write_checked(io, vmid, PXAREXCLUDE, want.as_bytes(), Some("0644")).await?;
     }
     Ok(Change::Applied(PxarExcludeApplied {
         dry_run: false,
