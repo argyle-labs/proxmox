@@ -147,12 +147,22 @@ fn autologin_root(argv: &[&str]) -> bool {
 }
 
 /// The effective `ExecStart=` value in `systemctl cat` output: the last
-/// assignment, where an empty one resets everything before it.
-fn effective_exec_start(cat: &str) -> Option<&str> {
+/// `[Service]` assignment, where an empty one resets everything before it.
+/// A trailing `\` continues a line onto the next, as systemd joins them.
+fn effective_exec_start(cat: &str) -> Option<String> {
     let mut cur = None;
-    for l in live_lines(cat) {
-        if let Some(v) = l.trim().strip_prefix("ExecStart=") {
-            cur = Some(v.trim()).filter(|v| !v.is_empty());
+    let mut service = false;
+    let mut lines = live_lines(cat);
+    while let Some(l) = lines.next() {
+        let mut l = l.trim().to_string();
+        while let Some(head) = l.strip_suffix('\\') {
+            let next = lines.next().unwrap_or_default().trim();
+            l = format!("{} {next}", head.trim_end());
+        }
+        if l.starts_with('[') {
+            service = l == "[Service]";
+        } else if let Some(v) = l.strip_prefix("ExecStart=").filter(|_| service) {
+            cur = Some(v.trim().to_string()).filter(|v| !v.is_empty());
         }
     }
     cur
@@ -503,7 +513,7 @@ impl Step {
                 .with_detail(format!(
                     "refuse if activating; `systemctl stop --job-mode=fail` an earlier finished \
                      run; `systemctl start --no-block --job-mode=fail {UPDATE_UNIT}`; a new \
-                     InvocationID within {}s (else its queued start is stopped), then poll \
+                     InvocationID within {}s (else its queued start job is cancelled), then poll \
                      `systemctl show` every {}s for up to {}h until ActiveState=active \
                      Result=success; output from `systemctl status --lines=40`",
                     UPDATE_START_TIMEOUT.as_secs(),
@@ -798,6 +808,41 @@ fn require_own_unit(st: &UnitState, loaded: bool) -> Result<()> {
     Ok(())
 }
 
+fn new_run(st: &UnitState, prev: &str) -> bool {
+    let id = prop(st, "InvocationID");
+    !id.is_empty() && id != prev
+}
+
+/// Past the start timeout: the unit's state if the run began after all,
+/// otherwise an error. Only the queued start job is cancelled; stopping the
+/// unit could SIGTERM a run that began after the last poll, mid-upgrade.
+async fn late_start(io: &dyn GuestIo, vmid: u32, prev: &str) -> Result<UnitState> {
+    const PROPS: &[&str] = &["ActiveState", "Result", "InvocationID", "Job"];
+    let st = unit_show(io, vmid, UPDATE_UNIT, PROPS).await?;
+    if new_run(&st, prev) {
+        return Ok(st);
+    }
+    let job = prop(&st, "Job").to_string();
+    let why = if job.is_empty() {
+        "no start job is queued".to_string()
+    } else {
+        let why = match run_exec(io, vmid, &["systemctl", "cancel", &job]).await {
+            Ok(_) => format!("its queued start job {job} was cancelled"),
+            Err(e) => format!("queued, not started (`systemctl cancel {job}` failed: {e:#})"),
+        };
+        // Cancelling does not stop a run whose job began just before it.
+        let st = unit_show(io, vmid, UPDATE_UNIT, PROPS).await?;
+        if new_run(&st, prev) {
+            return Ok(st);
+        }
+        why
+    };
+    bail!(
+        "{UPDATE_UNIT} did not start within {}s (InvocationID unchanged); {why}",
+        UPDATE_START_TIMEOUT.as_secs()
+    )
+}
+
 /// Start [`UPDATE_UNIT`] and wait for that run: a new `InvocationID` proves
 /// the result read is this run's, not a previous one's.
 ///
@@ -805,7 +850,9 @@ fn require_own_unit(st: &UnitState, loaded: bool) -> Result<()> {
 /// systemctl(1), `--job-mode=fail` fails a request that would reverse a pending
 /// start job into a stop (or the reverse), so orca's stop and start never cancel
 /// another caller's queued job. It does not refuse a start that merges into a
-/// pending start; the `ActiveState` checks before each call do that.
+/// pending start; the `ActiveState` checks before each call only narrow that
+/// window. Another root caller's start can still merge with orca's, and orca
+/// then reports that run.
 async fn run_unit(io: &dyn GuestIo, vmid: u32) -> Result<String> {
     let mut st = unit_state(io, vmid).await?;
     if unit_running(&st) {
@@ -843,10 +890,13 @@ async fn run_unit(io: &dyn GuestIo, vmid: u32) -> Result<String> {
     .await?;
     let started = tokio::time::Instant::now();
     let mut ours = false;
+    let mut late = None;
     loop {
-        let st = unit_state(io, vmid).await?;
-        let id = prop(&st, "InvocationID");
-        ours = ours || (!id.is_empty() && id != prev);
+        let st = match late.take() {
+            Some(st) => st,
+            None => unit_state(io, vmid).await?,
+        };
+        ours = ours || new_run(&st, &prev);
         if ours && !unit_running(&st) {
             let out = unit_output(io, vmid).await;
             if prop(&st, "ActiveState") == "active" && prop(&st, "Result") == "success" {
@@ -859,18 +909,8 @@ async fn run_unit(io: &dyn GuestIo, vmid: u32) -> Result<String> {
             );
         }
         if !ours && started.elapsed() >= UPDATE_START_TIMEOUT {
-            let cancel =
-                match run_exec(io, vmid, &["systemctl", "stop", "--no-block", UPDATE_UNIT]).await {
-                    Ok(_) => "its queued start was cancelled with `systemctl stop --no-block`"
-                        .to_string(),
-                    Err(e) => format!(
-                        "cancelling its queued start with `systemctl stop --no-block` failed: {e:#}"
-                    ),
-                };
-            bail!(
-                "{UPDATE_UNIT} did not start within {}s (InvocationID unchanged); {cancel}",
-                UPDATE_START_TIMEOUT.as_secs()
-            );
+            late = Some(late_start(io, vmid, &prev).await?);
+            continue;
         }
         if started.elapsed() >= UPDATE_DEADLINE {
             bail!(
@@ -1638,7 +1678,31 @@ ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,3840
         let reset =
             format!("{AUTOLOGIN_CAT}\n[Service]\nExecStart=\nExecStart=-/sbin/agetty tty%I");
         assert!(!debian_console_ok(AUTOLOGIN_UNIT, &reset));
-        assert_eq!(effective_exec_start("ExecStart=a\nExecStart="), None);
+        assert_eq!(
+            effective_exec_start("[Service]\nExecStart=a\nExecStart="),
+            None
+        );
+    }
+
+    #[test]
+    fn exec_start_joins_continuation_lines() {
+        let cat = "[Service]\nExecStart=-/sbin/agetty \\\n  --autologin root \\\n  --noclear tty%I";
+        assert_eq!(
+            effective_exec_start(cat).as_deref(),
+            Some("-/sbin/agetty --autologin root --noclear tty%I")
+        );
+        assert!(debian_console_ok(AUTOLOGIN_UNIT, cat));
+    }
+
+    #[test]
+    fn exec_start_is_read_from_the_service_section_only() {
+        let cat = "[Service]\nExecStart=-/sbin/agetty --noclear tty%I\n[Install]\nExecStart=-/sbin/agetty --autologin root tty%I";
+        assert_eq!(
+            effective_exec_start(cat).as_deref(),
+            Some("-/sbin/agetty --noclear tty%I")
+        );
+        assert!(!debian_console_ok(AUTOLOGIN_UNIT, cat));
+        assert_eq!(effective_exec_start("ExecStart=a"), None);
     }
 
     #[test]
@@ -2183,10 +2247,9 @@ ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,3840
             fake::ok(""),
         ));
         replies.push((start_key(), fake::ok("")));
-        replies.push((
-            format!("systemctl stop --no-block {UPDATE_UNIT}"),
-            fake::ok(""),
-        ));
+        replies.push((late_key(), late("inactive", "old", "42")));
+        replies.push(("systemctl cancel 42".into(), fake::ok("")));
+        replies.push((late_key(), late("inactive", "old", "")));
         let io = io_of(replies);
         let err = rt()
             .block_on(run_update(
@@ -2198,10 +2261,103 @@ ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,3840
             .unwrap_err()
             .to_string();
         assert!(err.contains("did not start"), "{err}");
-        assert!(err.contains("queued start was cancelled"), "{err}");
+        assert!(err.contains("start job 42 was cancelled"), "{err}");
         assert!(err.contains("action=restore"), "{err}");
         let execs = io.execs.lock().unwrap();
-        assert!(!execs.iter().any(|e| e.contains("restart")), "{execs:?}");
+        assert!(
+            !execs
+                .iter()
+                .any(|e| e.contains("restart") || e.contains("stop --no-block")),
+            "{execs:?}"
+        );
+    }
+
+    fn late_key() -> String {
+        format!("systemctl show -p ActiveState -p Result -p InvocationID -p Job {UPDATE_UNIT}")
+    }
+
+    fn late(active: &str, id: &str, job: &str) -> lxc_guest::ExecResult {
+        let result = if active == "active" { "success" } else { "" };
+        fake::ok(&format!(
+            "ActiveState={active}\nResult={result}\nInvocationID={id}\nJob={job}"
+        ))
+    }
+
+    /// Before the start timeout every poll still shows the earlier run's id.
+    fn slow_start_replies() -> Vec<(String, lxc_guest::ExecResult)> {
+        let mut r = debian(GETTY_UNIT, None, false);
+        let fresh = unit("inactive", "success", "old", UPDATE_UNIT_PATH, "");
+        r.push((unit_key(), unit("inactive", "success", "old", "", "")));
+        r.push((unit_key(), fresh));
+        r.push(("systemctl daemon-reload".into(), fake::ok("")));
+        r.push((start_key(), fake::ok("")));
+        r.push((
+            format!("systemctl status --no-pager --lines=40 {UPDATE_UNIT}"),
+            fake::ok("0 upgraded"),
+        ));
+        r
+    }
+
+    fn update(io: &FakeIo, ctid: u64) -> Result<GuestApplied> {
+        rt().block_on(run_update(
+            io,
+            &FakeBackup(Default::default()),
+            ctid,
+            &GuestUpdatePayload::default(),
+        ))
+    }
+
+    #[test]
+    fn a_run_seen_at_the_start_timeout_is_followed_not_cancelled() {
+        let mut replies = slow_start_replies();
+        replies.push((late_key(), late("active", "new", "")));
+        let io = io_of(replies);
+        let out = update(&io, 210).unwrap();
+        assert_eq!(
+            out.steps.last().unwrap().output.as_deref(),
+            Some("0 upgraded")
+        );
+        let execs = io.execs.lock().unwrap();
+        assert!(
+            !execs
+                .iter()
+                .any(|e| e.contains("cancel") || e.contains("stop")),
+            "{execs:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_that_began_before_the_cancel_is_still_reported() {
+        let mut replies = slow_start_replies();
+        replies.push((late_key(), late("inactive", "old", "42")));
+        replies.push(("systemctl cancel 42".into(), fake::ok("")));
+        replies.push((late_key(), late("active", "new", "")));
+        let out = update(&io_of(replies), 211).unwrap();
+        assert_eq!(
+            out.steps.last().unwrap().output.as_deref(),
+            Some("0 upgraded")
+        );
+    }
+
+    #[test]
+    fn a_failed_cancel_leaves_the_start_queued_and_names_the_restore_point() {
+        let mut replies = slow_start_replies();
+        replies.push((late_key(), late("inactive", "old", "42")));
+        replies.push((
+            "systemctl cancel 42".into(),
+            lxc_guest::ExecResult {
+                success: false,
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: "Job 42 not found".into(),
+            },
+        ));
+        let io = io_of(replies);
+        let err = update(&io, 212).unwrap_err().to_string();
+        assert!(err.contains("queued, not started"), "{err}");
+        assert!(err.contains("action=restore"), "{err}");
+        let execs = io.execs.lock().unwrap();
+        assert!(!execs.iter().any(|e| e.contains("stop")), "{execs:?}");
     }
 
     #[test]

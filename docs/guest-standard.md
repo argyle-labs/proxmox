@@ -60,7 +60,7 @@ own allowlist entry, and `ls -d` gives the same answer.
 | fact | read |
 | --- | --- |
 | OS | `/etc/os-release` (`ID` / `ID_LIKE`: debian, ubuntu, alpine) |
-| root console, Debian | two reads of `container-getty@1.service` must both show `--autologin root` (or `-a root`, `--autologin=root`, `-aroot`) in the effective `ExecStart`. `systemctl show -p ExecStart --value` gives the command after every drop-in and `ExecStart=` reset. `systemctl cat` gives the literal last `ExecStart=` line after the last reset, so a quoted `"--autologin root"` (a single argument) is not counted. This covers orca's `container-getty@.service.d/autologin.conf` and community-scripts' `container-getty@1.service.d/*.conf`. |
+| root console, Debian | two reads of `container-getty@1.service` must both show `--autologin root` (or `-a root`, `--autologin=root`, `-aroot`) in the effective `ExecStart`. `systemctl show -p ExecStart --value` gives the command after every drop-in and `ExecStart=` reset. `systemctl cat` gives the literal last `[Service]` `ExecStart=` line after the last reset, with `\` continuation lines joined, so a quoted `"--autologin root"` (a single argument) is not counted. This covers orca's `container-getty@.service.d/autologin.conf` and community-scripts' `container-getty@1.service.d/*.conf`. |
 | root console, Alpine | the live `tty1` line in `/etc/inittab` uses `-l /usr/local/sbin/autologin`, that wrapper contains `login -f root`, and `/etc/.pve-ignore.inittab` exists |
 | `update` gate | `/usr/local/bin/update` carries the `# orca-update-gate v1` marker |
 | foreign gate | `/usr/local/bin/update` exists without the marker (reported as drift) |
@@ -173,17 +173,27 @@ Then:
         check. It never uses `restart`, which would kill a run someone else
         started.
         - An earlier finished run, held `active` by `RemainAfterExit`, is
-          stopped with `systemctl stop --job-mode=fail` first.
+          stopped with `systemctl stop --job-mode=fail` first. Its commands
+          have exited by then. With the default `KillMode=control-group`, the
+          stop does kill any process an update command left behind in the
+          unit's cgroup.
         - It then notes the `InvocationID` and runs
           `systemctl start --no-block --job-mode=fail`.
         - Per systemctl(1), `fail` makes a request fail if it would reverse a
           pending start job into a stop, or the reverse. It does not refuse a
-          start that merges into another caller's pending start; the
-          `ActiveState` check just before is what refuses that.
+          start that merges into another caller's pending start. The
+          `ActiveState` check just before only narrows that window: another
+          root caller's start can still merge with orca's, and orca then
+          reports that run.
      4. A new `InvocationID` must appear within 60 s, or the update fails
-        rather than reading a previous run's result. The queued start is
-        cancelled with `systemctl stop --no-block`, and the error says whether
-        that worked.
+        rather than reading a previous run's result. Orca then reads the unit
+        again. If the `InvocationID` has changed, the run is orca's and polling
+        continues. Otherwise only the queued start job is cancelled
+        (`systemctl show -p Job`, then `systemctl cancel <job>`). The unit is
+        never stopped, which could kill a run that began after the last poll,
+        mid-upgrade. If the cancel fails, the start stays queued and the error
+        says "queued, not started". A run that starts late is still covered by
+        the backup and the gate marker.
      5. It polls `systemctl show` every 5 s, for up to 2 h, and requires
         `ActiveState=active` and `Result=success`. `RemainAfterExit` keeps
         those values after the run, so systemd cannot reset them before orca
