@@ -26,6 +26,7 @@ pub mod diagnostics;
 pub mod execute;
 pub mod guest_exec;
 pub mod guest_mount;
+pub mod guest_standard;
 pub mod host_workloads;
 pub mod lxc_guest;
 pub mod mount_scan;

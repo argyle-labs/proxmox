@@ -29,6 +29,32 @@ pub const EXEC_ALLOWLIST: &[&str] = &[
     "tail",
 ];
 
+/// Entries the guest standard needs on orca's root-side allowlist (orca#769),
+/// each with why. Until orca ships them, steps using them are named in the
+/// dry-run plan and refused or deferred before anything runs. `/usr/bin/update`
+/// is an absolute path because a bare `update` basename would admit any
+/// program of that name anywhere in the container.
+///
+/// `sh` is absent: every step execs its program directly, and `sh -c` would
+/// let the exec seam run any command line it is handed.
+pub const PROPOSED_ALLOWLIST: &[(&str, &str)] = &[
+    (
+        "kill",
+        "`kill -HUP 1`: busybox init re-reads /etc/inittab only on SIGHUP, so the \
+         Alpine console autologin is live without restarting the container",
+    ),
+    (
+        "apk",
+        "`apk update` / `apk upgrade`: the Alpine package updater, the apt-get \
+         equivalent already allowed",
+    ),
+    (
+        "/usr/bin/update",
+        "the app's own updater (community-scripts, or the Gitea \
+         and Caddy updaters that validate and roll back), run after orca's backup",
+    ),
+];
+
 /// `Some("needs allowlist: <cmd>")` when orca's lxc-exec seam would refuse
 /// `argv0`.
 pub fn needs_allowlist(argv0: &str) -> Option<String> {
@@ -164,21 +190,165 @@ async fn push(vmid: u32, path: &str, contents: &[u8], mode: Option<&str>) -> Res
     Ok(())
 }
 
-/// A file's contents (trimmed, as the seam returns them), or `None` when it
-/// does not exist.
-pub async fn read_file(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<Option<String>> {
-    let r = io.exec(vmid, &["cat", path]).await?;
-    if r.success {
-        return Ok(Some(r.stdout));
-    }
-    if r.stderr.contains("No such file") {
+/// Largest file [`read_file`] returns. Paths are guest-controlled, so a read
+/// is bounded by the file's `stat` size before anything is read.
+pub const READ_CAP: usize = 64 * 1024;
+
+fn missing(r: &ExecResult) -> bool {
+    !r.success && r.stderr.contains("No such file")
+}
+
+/// Contents (trimmed by the seam) and on-disk size of a regular file at most
+/// [`READ_CAP`] bytes, or `None` when it does not exist. Symlinks are followed:
+/// the read runs inside the container, as the container's root.
+async fn read_sized(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<Option<(String, usize)>> {
+    let st = io
+        .exec(vmid, &["stat", "-L", "-c", "%F|%s", "--", path])
+        .await?;
+    if missing(&st) {
         return Ok(None);
     }
-    bail!(
-        "read {path} in CT {vmid}: exit {:?}: {}",
-        r.exit_code,
-        r.stderr
-    )
+    if !st.success {
+        bail!(
+            "stat {path} in CT {vmid}: exit {:?}: {}",
+            st.exit_code,
+            st.stderr
+        );
+    }
+    let (kind, size) = st.stdout.split_once('|').ok_or_else(|| {
+        anyhow!(
+            "stat {path} in CT {vmid}: unexpected output {:?}",
+            st.stdout
+        )
+    })?;
+    if !kind.starts_with("regular") {
+        bail!("read {path} in CT {vmid}: it is a {kind}, not a regular file");
+    }
+    let size: usize = size
+        .trim()
+        .parse()
+        .map_err(|e| anyhow!("stat {path} in CT {vmid}: size {size:?}: {e}"))?;
+    if size > READ_CAP {
+        bail!("read {path} in CT {vmid}: {size} bytes is larger than {READ_CAP}");
+    }
+    let cap = READ_CAP.to_string();
+    let r = io.exec(vmid, &["head", "-c", &cap, "--", path]).await?;
+    if missing(&r) {
+        return Ok(None);
+    }
+    if !r.success {
+        bail!(
+            "read {path} in CT {vmid}: exit {:?}: {}",
+            r.exit_code,
+            r.stderr
+        );
+    }
+    // The seam decodes lossily; a replacement character means the bytes were
+    // not UTF-8 and the text is not the file.
+    if r.stdout.contains('\u{FFFD}') {
+        bail!("read {path} in CT {vmid}: not valid UTF-8");
+    }
+    Ok(Some((r.stdout, size)))
+}
+
+/// A file's contents (trimmed, as the seam returns them), or `None` when it
+/// does not exist. Refused when larger than [`READ_CAP`], not a regular file,
+/// or not UTF-8.
+pub async fn read_file(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<Option<String>> {
+    Ok(read_sized(io, vmid, path).await?.map(|(s, _)| s))
+}
+
+/// [`read_file`], byte for byte. The seam trims both ends, so any difference
+/// between the on-disk size and what was read means bytes were lost and the
+/// file is refused rather than guessed at.
+pub async fn read_exact(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<Option<String>> {
+    match read_sized(io, vmid, path).await? {
+        None => Ok(None),
+        Some((s, size)) if s.len() == size => Ok(Some(s)),
+        Some((s, size)) => bail!(
+            "read {path} in CT {vmid}: {size} bytes on disk but {} read; the exec seam trims \
+             leading and trailing whitespace, so it cannot be copied exactly",
+            s.len()
+        ),
+    }
+}
+
+/// Refuse a push to `path` unless it is a regular file or absent and every
+/// existing parent is a real directory. `pct push` creates the file after
+/// entering the container's mount namespace (and user namespace when
+/// unprivileged), so a symlink cannot reach outside the container; this guards
+/// against writing through a link or over a non-file by accident.
+pub async fn check_push_target(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<()> {
+    let mut paths: Vec<String> = std::path::Path::new(path)
+        .ancestors()
+        .skip(1)
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| !p.is_empty() && p != "/")
+        .collect();
+    paths.reverse();
+    paths.push(path.to_string());
+    let mut argv = vec!["stat", "-c", "%n|%F", "--"];
+    argv.extend(paths.iter().map(String::as_str));
+    let r = io.exec(vmid, &argv).await?;
+    let fail = |why: String| -> Result<()> {
+        bail!(
+            "check {path} in CT {vmid} before writing: {why} (exit {:?}: {})",
+            r.exit_code,
+            r.stderr
+        )
+    };
+    let mut found: Vec<(&str, &str)> = Vec::new();
+    for line in r.stdout.lines() {
+        let Some(pair) = line.split_once('|') else {
+            return fail(format!("unexpected stat output {line:?}"));
+        };
+        found.push(pair);
+    }
+    for &(name, kind) in &found {
+        if name == path {
+            if !kind.starts_with("regular") {
+                bail!("refusing to write {path} in CT {vmid}: it is a {kind}, not a regular file");
+            }
+        } else if kind != "directory" {
+            bail!("refusing to write {path} in CT {vmid}: parent {name} is a {kind}");
+        }
+    }
+    // stat answers each path on stdout or with one "No such file" line on
+    // stderr. Absent paths must be a suffix (a missing parent hides all below),
+    // and their count must match those lines, so a stat that failed for any
+    // other reason is never read as "absent".
+    let present = paths
+        .iter()
+        .take_while(|p| found.iter().any(|(n, _)| n == p))
+        .count();
+    if found.len() != present {
+        return fail("stat answered out of order".into());
+    }
+    let missing_lines = r
+        .stderr
+        .lines()
+        .filter(|l| l.contains("No such file"))
+        .count();
+    let absent = paths.len() - present;
+    if absent != missing_lines
+        || r.stderr.lines().count() != missing_lines
+        || (absent > 0) == r.success
+    {
+        return fail(format!("{absent} path(s) unanswered"));
+    }
+    Ok(())
+}
+
+/// [`GuestIo::write`] after [`check_push_target`].
+pub async fn write_checked(
+    io: &dyn GuestIo,
+    vmid: u32,
+    path: &str,
+    contents: &[u8],
+    mode: Option<&str>,
+) -> Result<()> {
+    check_push_target(io, vmid, path).await?;
+    io.write(vmid, path, contents, mode).await
 }
 
 pub async fn exists(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<bool> {
@@ -251,6 +421,30 @@ pub fn require_local(ct: &CtRef, local: &str) -> Result<()> {
     Ok(())
 }
 
+/// `/etc/pve/lxc` holds only this node's containers (pmxcfs links it to
+/// `nodes/<this node>/lxc`), so a conf there proves the container is local even
+/// when the plugin's hostname differs from its PVE node name.
+pub const PVE_LXC_CONF_DIR: &str = "/etc/pve/lxc";
+
+pub fn require_local_conf(dir: &std::path::Path, vmid: u64) -> Result<()> {
+    let conf = dir.join(format!("{vmid}.conf"));
+    if !conf.exists() {
+        bail!(
+            "CT {vmid}: {} is not on this node, so `pct` here cannot reach it; run this on \
+             the orca instance on the container's node",
+            conf.display()
+        );
+    }
+    Ok(())
+}
+
+/// [`require_local`] by node name, then by the node-local conf, before any
+/// in-container exec.
+pub fn ensure_local(ct: &CtRef) -> Result<()> {
+    require_local(ct, &crate::diagnostics::local_node())?;
+    require_local_conf(std::path::Path::new(PVE_LXC_CONF_DIR), ct.vmid)
+}
+
 /// Recording fake for tests: answers `exec` from a table keyed by the joined
 /// argv, records every write.
 #[cfg(test)]
@@ -263,6 +457,7 @@ pub mod fake {
         pub replies: Vec<(String, ExecResult)>,
         pub execs: Mutex<Vec<String>>,
         pub writes: Mutex<Vec<(String, String, Option<String>)>>,
+        pub served: Mutex<std::collections::HashMap<String, usize>>,
     }
 
     pub fn ok(stdout: &str) -> ExecResult {
@@ -307,11 +502,49 @@ pub mod fake {
                 }
                 let key = argv.join(" ");
                 self.execs.lock().unwrap().push(key.clone());
-                self.replies
+                let reply = |k: &str| {
+                    self.replies
+                        .iter()
+                        .find(|(rk, _)| rk == k)
+                        .map(|(_, v)| v.clone())
+                };
+                // A key scripted more than once answers in order, then repeats
+                // its last reply.
+                let scripted: Vec<&ExecResult> = self
+                    .replies
                     .iter()
-                    .find(|(k, _)| *k == key)
-                    .map(|(_, v)| v.clone())
-                    .ok_or_else(|| anyhow!("unexpected exec: {key}"))
+                    .filter(|(k, _)| *k == key)
+                    .map(|(_, v)| v)
+                    .collect();
+                if !scripted.is_empty() {
+                    let mut served = self.served.lock().unwrap();
+                    let n = served.entry(key.clone()).or_default();
+                    let r = scripted[(*n).min(scripted.len() - 1)].clone();
+                    *n += 1;
+                    return Ok(r);
+                }
+                // Unscripted stats answer from the scripted reads: a file with a
+                // `head` reply is regular, and a push target's parents are dirs.
+                match argv {
+                    ["stat", "-L", "-c", "%F|%s", "--", path] => {
+                        if let Some(r) = reply(&format!("head -c {READ_CAP} -- {path}")) {
+                            return Ok(if r.success {
+                                ok(&format!("regular file|{}", r.stdout.len()))
+                            } else {
+                                r
+                            });
+                        }
+                    }
+                    ["stat", "-c", "%n|%F", "--", paths @ ..] => {
+                        let (target, parents) = paths.split_last().unwrap();
+                        let mut lines: Vec<String> =
+                            parents.iter().map(|p| format!("{p}|directory")).collect();
+                        lines.push(format!("{target}|regular file"));
+                        return Ok(ok(&lines.join("\n")));
+                    }
+                    _ => {}
+                }
+                Err(anyhow!("unexpected exec: {key}"))
             })
         }
 
@@ -352,6 +585,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn proposed_entries_are_not_already_allowed() {
+        for (cmd, why) in PROPOSED_ALLOWLIST {
+            assert!(needs_allowlist(cmd).is_some(), "{cmd} is already allowed");
+            assert!(!why.is_empty());
+        }
+    }
+
     fn ct(node: &str, running: bool) -> CtRef {
         CtRef {
             node: node.into(),
@@ -376,8 +617,126 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_maps_missing_to_none() {
-        let io = fake::FakeIo::with(&[("cat /a", fake::ok("x")), ("cat /b", fake::missing("/b"))]);
+        let io = fake::FakeIo::with(&[
+            ("head -c 65536 -- /a", fake::ok("x")),
+            ("head -c 65536 -- /b", fake::missing("/b")),
+        ]);
         assert_eq!(read_file(&io, 1, "/a").await.unwrap().as_deref(), Some("x"));
         assert_eq!(read_file(&io, 1, "/b").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn read_file_refuses_big_special_or_binary_files() {
+        let io = fake::FakeIo::with(&[
+            ("stat -L -c %F|%s -- /big", fake::ok("regular file|70000")),
+            (
+                "stat -L -c %F|%s -- /dev/zero",
+                fake::ok("character special file|0"),
+            ),
+            ("head -c 65536 -- /bin/x", fake::ok("\u{FFFD}ELF")),
+        ]);
+        for (path, want) in [
+            ("/big", "larger than 65536"),
+            ("/dev/zero", "not a regular file"),
+            ("/bin/x", "not valid UTF-8"),
+        ] {
+            let err = read_file(&io, 1, path).await.unwrap_err().to_string();
+            assert!(err.contains(want), "{path}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_exact_refuses_any_trimmed_byte() {
+        let io = fake::FakeIo::with(&[
+            ("stat -L -c %F|%s -- /a", fake::ok("regular file|3")),
+            ("head -c 65536 -- /a", fake::ok("ab")),
+            ("stat -L -c %F|%s -- /b", fake::ok("regular file|5")),
+            ("head -c 65536 -- /b", fake::ok("ab")),
+        ]);
+        assert!(
+            read_exact(&io, 1, "/a").await.is_err(),
+            "a trimmed byte is never guessed"
+        );
+        assert!(read_exact(&io, 1, "/b").await.is_err());
+        let exact = fake::FakeIo::with(&[("head -c 65536 -- /c", fake::ok("ab"))]);
+        assert_eq!(
+            read_exact(&exact, 1, "/c").await.unwrap().as_deref(),
+            Some("ab")
+        );
+    }
+
+    #[tokio::test]
+    async fn push_targets_refuse_symlinks_and_non_directory_parents() {
+        let io = fake::FakeIo::with(&[
+            (
+                "stat -c %n|%F -- /etc /etc/inittab",
+                fake::ok("/etc|directory\n/etc/inittab|symbolic link"),
+            ),
+            (
+                "stat -c %n|%F -- /usr /usr/local /usr/local/bin /usr/local/bin/update",
+                fake::ok("/usr|directory\n/usr/local|symbolic link\n/usr/local/bin|directory"),
+            ),
+            (
+                "stat -c %n|%F -- /run /run/x",
+                ExecResult {
+                    success: false,
+                    exit_code: Some(1),
+                    stdout: "/run|directory".into(),
+                    stderr: "stat: cannot stat '/run/x': No such file or directory".into(),
+                },
+            ),
+        ]);
+        let err = check_push_target(&io, 1, "/etc/inittab")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("it is a symbolic link"), "{err}");
+        let err = check_push_target(&io, 1, "/usr/local/bin/update")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("parent /usr/local is a symbolic link"),
+            "{err}"
+        );
+        write_checked(&io, 1, "/run/x", b"y", None).await.unwrap();
+        assert_eq!(io.writes.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stat_that_failed_otherwise_is_not_read_as_absent() {
+        let failed = |stdout: &str, stderr: &str| ExecResult {
+            success: false,
+            exit_code: Some(1),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        };
+        let io = fake::FakeIo::with(&[
+            ("stat -c %n|%F -- /run /run/a", failed("", "")),
+            (
+                "stat -c %n|%F -- /run /run/b",
+                failed("", "Failed to exec stat: permission denied"),
+            ),
+            (
+                "stat -c %n|%F -- /run /run/c",
+                failed("", "stat: '/run/c': No such file or directory"),
+            ),
+        ]);
+        for p in ["/run/a", "/run/b", "/run/c"] {
+            let err = check_push_target(&io, 1, p).await.unwrap_err().to_string();
+            assert!(err.contains("unanswered"), "{p}: {err}");
+        }
+        assert!(io.writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn locality_needs_the_node_local_conf() {
+        let dir = std::env::temp_dir().join(format!("pve-lxc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("116.conf"), "arch: amd64\n").unwrap();
+        assert!(require_local_conf(&dir, 116).is_ok());
+        let err = require_local_conf(&dir, 117).unwrap_err().to_string();
+        assert!(err.contains("117.conf is not on this node"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

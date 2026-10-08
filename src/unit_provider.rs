@@ -33,10 +33,13 @@ use plugin_toolkit::serde::{Deserialize, Serialize};
 use plugin_toolkit::serde_json::{self, json};
 
 use crate::GuestKind;
+use crate::execute::Change;
 use crate::generated::{self, types as gtypes};
 
 const KIND_VM: &str = "vm";
 const KIND_LXC: &str = "lxc";
+/// Unit action that backs an LXC up, then runs its updater.
+const ACTION_GUEST_UPDATE: &str = "update";
 
 /// Upper bound orca waits for a vzdump / restore task before giving up. A minimal
 /// state backup is small, but a large qemu restore can run long; generous so a
@@ -96,6 +99,10 @@ pub struct GuestSummary {
     /// breach their kind's provisioning floors.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guard_violations: Vec<String>,
+    /// Console and update-gate facts, probed by `detail` for a running LXC on
+    /// this plugin's node. With them present the guard also requires both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standard: Option<crate::guest_standard::StandardFacts>,
 }
 
 /// Typed payload for `Create { action: "provision" }`. Shared by both kinds;
@@ -231,15 +238,44 @@ fn guest_guard(kind: GuestKind) -> UnitGuard {
     }
 }
 
-/// Observed facts for a live guest, from its cluster-resource row. PVE exposes no
-/// console / update-command reachability here, so those stay unchecked (the
-/// baseline guard declares no such requirement).
+/// Observed facts for a live guest: resources from its cluster-resource row,
+/// console and update command from its probe when it has one.
 fn facts_of(g: &GuestSummary) -> UnitFacts {
-    UnitFacts {
-        cpu: g.maxcpu.map(|c| c.round() as u32),
-        mem_mb: g.maxmem.map(|b| (b.max(0) as u64) / (1024 * 1024)),
-        has_root_console: false,
-        has_update_command: false,
+    crate::guest_standard::unit_facts(
+        g.maxcpu.map(|c| c.round() as u32),
+        g.maxmem.map(|b| (b.max(0) as u64) / (1024 * 1024)),
+        g.standard.as_ref(),
+    )
+}
+
+/// Fold a guest-standard probe into `g`'s guard result. A failed probe is a
+/// violation, never a silent pass.
+fn apply_probe(
+    kind: GuestKind,
+    g: &mut GuestSummary,
+    probed: Result<crate::guest_standard::StandardFacts>,
+) {
+    match probed {
+        Ok(f) => {
+            g.standard = Some(f);
+            g.guard_violations = live_guard(kind, g)
+                .check(&facts_of(g))
+                .iter()
+                .map(GuardViolation::reason)
+                .collect();
+        }
+        Err(e) => g
+            .guard_violations
+            .push(format!("guest standard probe failed: {e:#}")),
+    }
+}
+
+/// The guard a live guest is held to: the guest standard once probed, the
+/// resource floor otherwise.
+fn live_guard(kind: GuestKind, g: &GuestSummary) -> UnitGuard {
+    match g.standard {
+        Some(_) => crate::guest_standard::standard_guard(guest_guard(kind)),
+        None => guest_guard(kind),
     }
 }
 
@@ -293,12 +329,13 @@ async fn guests_for_endpoint(
             mem: r.mem,
             maxmem: r.maxmem,
             guard_violations: Vec::new(),
+            standard: None,
         });
     }
     // Stamp each guest's guard compliance so the unit surface shows breaches.
     for g in &mut out {
         if let Ok(k) = kind_from_str(&g.kind) {
-            g.guard_violations = guest_guard(k)
+            g.guard_violations = live_guard(k, g)
                 .check(&facts_of(g))
                 .iter()
                 .map(GuardViolation::reason)
@@ -500,6 +537,20 @@ impl ProxmoxUnitProvider {
             .await
             .ok()
             .and_then(|s| s.name);
+        // In-container probes run `pct` locally, so only a running LXC on this
+        // node can be probed; elsewhere the resource floor alone applies.
+        if kind == GuestKind::Lxc
+            && guest.status.as_deref() == Some("running")
+            && guest.node == crate::diagnostics::local_node()
+            && crate::lxc_guest::require_local_conf(
+                std::path::Path::new(crate::lxc_guest::PVE_LXC_CONF_DIR),
+                vmid,
+            )
+            .is_ok()
+        {
+            let probed = crate::guest_standard::probe(&crate::lxc_guest::SeamIo, vmid as u32).await;
+            apply_probe(kind, &mut guest, probed);
+        }
         Ok(VerbOutcome::Item(Self::list_item(&guest)))
     }
 
@@ -511,6 +562,9 @@ impl ProxmoxUnitProvider {
         }
         if args.action == ACTION_RESTORE {
             return self.do_restore(&args.id, args.payload).await;
+        }
+        if args.action == ACTION_GUEST_UPDATE {
+            return self.do_guest_update(&args).await;
         }
         let endpoint = endpoint_of(&args.id)?;
         let kind = kind_from_str(&args.id.kind)?;
@@ -586,6 +640,76 @@ impl ProxmoxUnitProvider {
         Ok(VerbOutcome::Item(ItemOutcome::new(
             id.clone(),
             serde_json::to_string(&backup).unwrap_or_default(),
+        )))
+    }
+
+    /// The pre-update backup of one LXC, through the same path as the unit
+    /// `backup` action.
+    pub(crate) async fn backup_lxc(
+        &self,
+        endpoint: &str,
+        ctid: u64,
+        storage: Option<&str>,
+    ) -> Result<BackupRef> {
+        let id = UnitId {
+            manager: manager_for(endpoint),
+            kind: KIND_LXC.to_string(),
+            id: ctid.to_string(),
+            name: String::new(),
+        };
+        let payload = BackupPayload {
+            storage: storage.map(str::to_string),
+            ..Default::default()
+        };
+        match self
+            .do_backup(&id, Some(serde_json::to_string(&payload)?))
+            .await?
+        {
+            VerbOutcome::Item(item) => serde_json::from_str(&item.payload)
+                .map_err(|e| anyhow!("backup ref from vzdump: {e}")),
+            _ => Err(anyhow!("backup of lxc {ctid} returned no backup ref")),
+        }
+    }
+
+    /// `update` on an LXC: a plan unless the payload sets `execute`; then, for
+    /// an admin caller, back up and run the in-container updater. Node-local.
+    async fn do_guest_update(&self, args: &UpdateArgs) -> Result<VerbOutcome> {
+        const TOOL: &str = "unit.update action=update";
+        let id = &args.id;
+        let endpoint = endpoint_of(id)?;
+        if kind_from_str(&id.kind)? != GuestKind::Lxc {
+            return Err(anyhow!("the update action is LXC-only"));
+        }
+        let ctid: u64 = id
+            .id
+            .parse()
+            .map_err(|_| anyhow!("vmid '{}' is not a u64", id.id))?;
+        let p: crate::guest_standard::GuestUpdatePayload = match &args.payload {
+            Some(raw) => serde_json::from_str(raw).map_err(|e| anyhow!("update payload: {e}"))?,
+            None => Default::default(),
+        };
+        let out: Change<crate::guest_standard::GuestApplied> = if !p.execute {
+            Change::Plan(crate::guest_standard::plan_update(
+                TOOL, &p, ctid, &p, None,
+            )?)
+        } else {
+            crate::execute::authorize_execute(TOOL, args.caller.as_ref())?;
+            let client = crate::tools::make_client(&endpoint).await?;
+            let ct = crate::lxc_guest::find_ct(&client, ctid).await?;
+            crate::lxc_guest::ensure_local(&ct)?;
+            Change::Applied(
+                crate::guest_standard::run_update(
+                    &crate::lxc_guest::SeamIo,
+                    &crate::guest_standard::UnitBackup { endpoint },
+                    ctid,
+                    &p,
+                )
+                .await?,
+            )
+        };
+        Ok(VerbOutcome::Item(ItemOutcome::new(
+            id.clone(),
+            serde_json::to_string(&out)?,
         )))
     }
 
@@ -1016,7 +1140,7 @@ async fn provision(
 
 /// Verbs shared by both guest kinds. `provision` payload/response schemas differ
 /// only in which fields matter per kind, so one [`ProvisionPayload`] serves both.
-fn guest_verbs() -> Vec<VerbDecl> {
+fn guest_verbs(kind: GuestKind) -> Vec<VerbDecl> {
     let mut update_actions: Vec<ActionDecl> = ["start", "stop", "shutdown", "reboot"]
         .into_iter()
         .map(|a| ActionDecl {
@@ -1040,6 +1164,13 @@ fn guest_verbs() -> Vec<VerbDecl> {
         payload_schema: Some(schema_for!(RestorePayload)),
         response_schema: None,
     });
+    if kind == GuestKind::Lxc {
+        update_actions.push(ActionDecl {
+            action: ACTION_GUEST_UPDATE.to_string(),
+            payload_schema: Some(schema_for!(crate::guest_standard::GuestUpdatePayload)),
+            response_schema: Some(schema_for!(Change<crate::guest_standard::GuestApplied>)),
+        });
+    }
     vec![
         VerbDecl::list(),
         VerbDecl::detail(),
@@ -1083,8 +1214,10 @@ impl UnitProvider for ProxmoxUnitProvider {
 
     fn declarations(&self) -> Vec<KindDeclaration> {
         vec![
-            KindDeclaration::new(KIND_VM, guest_verbs()).with_backup_spec(guest_backup_spec()),
-            KindDeclaration::new(KIND_LXC, guest_verbs()).with_backup_spec(guest_backup_spec()),
+            KindDeclaration::new(KIND_VM, guest_verbs(GuestKind::Qemu))
+                .with_backup_spec(guest_backup_spec()),
+            KindDeclaration::new(KIND_LXC, guest_verbs(GuestKind::Lxc))
+                .with_backup_spec(guest_backup_spec()),
         ]
     }
 
@@ -1125,6 +1258,7 @@ impl UnitProvider for ProxmoxUnitProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plugin_toolkit::contract::CallerIdentity;
 
     fn guest(endpoint: &str, cluster: Option<&str>, kind: &str, vmid: u64) -> GuestSummary {
         GuestSummary {
@@ -1140,6 +1274,7 @@ mod tests {
             mem: None,
             maxmem: None,
             guard_violations: Vec::new(),
+            standard: None,
         }
     }
 
@@ -1250,6 +1385,117 @@ mod tests {
         // Raise it above the floor → compliant.
         g.maxmem = Some(1024 * 1024 * 1024);
         assert!(guest_guard(GuestKind::Lxc).is_satisfied(&facts_of(&g)));
+    }
+
+    #[test]
+    fn probed_lxc_is_held_to_the_guest_standard() {
+        let mut g = guest("n", None, "lxc", 100);
+        g.maxcpu = Some(2.0);
+        g.maxmem = Some(1024 * 1024 * 1024);
+        assert!(
+            live_guard(GuestKind::Lxc, &g)
+                .check(&facts_of(&g))
+                .is_empty()
+        );
+        g.standard = Some(crate::guest_standard::StandardFacts {
+            os: crate::guest_standard::Os::Debian,
+            has_root_console: false,
+            has_update_command: true,
+            community_updater: false,
+            legacy_backup_key: false,
+            foreign_gate: false,
+            console_drift: Vec::new(),
+        });
+        assert_eq!(
+            live_guard(GuestKind::Lxc, &g).check(&facts_of(&g)),
+            vec![GuardViolation::NoRootConsole]
+        );
+    }
+
+    #[test]
+    fn a_failed_probe_is_a_guard_violation() {
+        let mut g = guest("n", None, "lxc", 100);
+        apply_probe(GuestKind::Lxc, &mut g, Err(anyhow!("timed out")));
+        assert_eq!(
+            g.guard_violations,
+            vec!["guest standard probe failed: timed out"]
+        );
+        assert!(g.standard.is_none());
+    }
+
+    fn guest_update(
+        payload: serde_json::Value,
+        caller: Option<CallerIdentity>,
+    ) -> Result<VerbOutcome> {
+        let args = UpdateArgs {
+            id: UnitId {
+                manager: manager_for("pve"),
+                kind: KIND_LXC.into(),
+                id: "116".into(),
+                name: String::new(),
+            },
+            action: ACTION_GUEST_UPDATE.into(),
+            payload: Some(payload.to_string()),
+            caller,
+        };
+        // Any capability (config, http, the lxc seams) panics: none may be reached.
+        plugin_toolkit::capsink::with_cap_sink(
+            Box::new(|cap: &str, raw: &str| panic!("reached capability {cap}: {raw}")),
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(ProxmoxUnitProvider::new().do_guest_update(&args))
+            },
+        )
+    }
+
+    #[test]
+    fn update_action_without_execute_is_a_plan_that_touches_nothing() {
+        let VerbOutcome::Item(item) = guest_update(json!({"updater": "apt"}), None).unwrap() else {
+            panic!()
+        };
+        let plan: serde_json::Value = serde_json::from_str(&item.payload).unwrap();
+        assert_eq!(plan["dryRun"], json!(true), "{plan}");
+    }
+
+    #[test]
+    fn update_action_execute_needs_an_admin_caller_before_any_lookup() {
+        let err = guest_update(json!({"execute": true}), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no caller identity"), "{err}");
+        let reader = CallerIdentity {
+            user_id: "u".into(),
+            username: "op".into(),
+            role: "read".into(),
+            can_mutate: false,
+        };
+        let err = guest_update(json!({"execute": true}), Some(reader))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires role 'admin'"), "{err}");
+    }
+
+    #[test]
+    fn update_action_is_declared_for_lxc_only() {
+        let decls = ProxmoxUnitProvider::new().declarations();
+        let has = |kind: &str| {
+            decls
+                .iter()
+                .find(|d| d.kind == kind)
+                .unwrap()
+                .verbs
+                .iter()
+                .find(|v| v.verb == Verb::Update)
+                .unwrap()
+                .actions
+                .iter()
+                .any(|a| a.action == ACTION_GUEST_UPDATE)
+        };
+        assert!(has(KIND_LXC));
+        assert!(!has(KIND_VM));
     }
 
     #[test]
