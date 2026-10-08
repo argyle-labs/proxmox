@@ -863,18 +863,14 @@ async fn late_start(io: &dyn GuestIo, vmid: u32, prev: &str) -> Result<UnitState
 /// The type (`start`, `stop`, …) of [`UPDATE_UNIT`]'s queued job `job`, or
 /// `None` once it has left the queue.
 async fn job_type(io: &dyn GuestIo, vmid: u32, job: &str) -> Result<Option<String>> {
-    let out = run_exec(
-        io,
-        vmid,
-        &[
-            "systemctl",
-            "list-jobs",
-            "--no-legend",
-            "--no-pager",
-            UPDATE_UNIT,
-        ],
-    )
-    .await?;
+    let argv = [
+        "systemctl",
+        "list-jobs",
+        "--no-legend",
+        "--no-pager",
+        UPDATE_UNIT,
+    ];
+    let out = capped("systemctl list-jobs", run_exec(io, vmid, &argv).await?)?;
     // Rows are `JOB UNIT TYPE STATE`.
     Ok(out.lines().find_map(|l| {
         let mut cols = l.split_whitespace();
@@ -2427,6 +2423,38 @@ ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,3840
         let err = update(&io, 214).unwrap_err().to_string();
         assert!(err.contains("is a stop job, not a start"), "{err}");
         assert!(err.contains("action=restore"), "{err}");
+        let execs = io.execs.lock().unwrap();
+        assert!(!execs.iter().any(|e| e.contains("cancel")), "{execs:?}");
+    }
+
+    #[test]
+    fn a_job_gone_from_the_queue_is_not_cancelled() {
+        let mut replies = slow_start_replies();
+        replies.push((late_key(), late("inactive", "old", "42")));
+        replies.push((jobs_key(), fake::ok("")));
+        let io = io_of(replies);
+        let err = update(&io, 215).unwrap_err().to_string();
+        assert!(err.contains("job 42 is no longer queued"), "{err}");
+        let execs = io.execs.lock().unwrap();
+        assert!(!execs.iter().any(|e| e.contains("cancel")), "{execs:?}");
+    }
+
+    #[test]
+    fn an_unreadable_job_type_is_not_cancelled() {
+        let mut replies = slow_start_replies();
+        replies.push((late_key(), late("inactive", "old", "42")));
+        replies.push((
+            jobs_key(),
+            lxc_guest::ExecResult {
+                success: false,
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: "Failed to connect to bus".into(),
+            },
+        ));
+        let io = io_of(replies);
+        let err = update(&io, 216).unwrap_err().to_string();
+        assert!(err.contains("type could not be read"), "{err}");
         let execs = io.execs.lock().unwrap();
         assert!(!execs.iter().any(|e| e.contains("cancel")), "{execs:?}");
     }
