@@ -134,8 +134,10 @@ pub struct StandardFacts {
     pub console_drift: Vec<String>,
 }
 
+/// systemd unit files also take `;` as a comment marker.
 fn live_lines(text: &str) -> impl Iterator<Item = &str> {
-    text.lines().filter(|l| !l.trim_start().starts_with('#'))
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with(['#', ';']))
 }
 
 fn autologin_root(argv: &[&str]) -> bool {
@@ -823,7 +825,8 @@ async fn late_start(io: &dyn GuestIo, vmid: u32, prev: &str) -> Result<UnitState
         return Ok(st);
     }
     let job = prop(&st, "Job").to_string();
-    let why = if job.is_empty() {
+    // `Job=0` or an empty value: no job is queued.
+    let why = if matches!(job.as_str(), "" | "0") {
         "no start job is queued".to_string()
     } else {
         let why = match run_exec(io, vmid, &["systemctl", "cancel", &job]).await {
@@ -1695,6 +1698,15 @@ ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,3840
     }
 
     #[test]
+    fn exec_start_skips_semicolon_comments() {
+        let cat = "[Service]\nExecStart=-/sbin/agetty --autologin root tty%I\n; ExecStart=";
+        assert_eq!(
+            effective_exec_start(cat).as_deref(),
+            Some("-/sbin/agetty --autologin root tty%I")
+        );
+    }
+
+    #[test]
     fn exec_start_is_read_from_the_service_section_only() {
         let cat = "[Service]\nExecStart=-/sbin/agetty --noclear tty%I\n[Install]\nExecStart=-/sbin/agetty --autologin root tty%I";
         assert_eq!(
@@ -2337,6 +2349,18 @@ ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,3840
             out.steps.last().unwrap().output.as_deref(),
             Some("0 upgraded")
         );
+    }
+
+    #[test]
+    fn job_zero_is_never_cancelled() {
+        let mut replies = slow_start_replies();
+        replies.push((late_key(), late("inactive", "old", "0")));
+        let io = io_of(replies);
+        let err = update(&io, 213).unwrap_err().to_string();
+        assert!(err.contains("no start job is queued"), "{err}");
+        assert!(err.contains("action=restore"), "{err}");
+        let execs = io.execs.lock().unwrap();
+        assert!(!execs.iter().any(|e| e.contains("cancel")), "{execs:?}");
     }
 
     #[test]
