@@ -34,6 +34,7 @@ pub mod overallocation;
 pub mod responses;
 pub mod shm_trap;
 pub mod thin_discard;
+pub mod thin_pool;
 pub mod tools;
 pub mod topology;
 pub mod unit_provider;
