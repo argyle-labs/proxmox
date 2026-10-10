@@ -728,8 +728,9 @@ pub struct ThinEnableDiscardArgs {
 #[orca_tool(domain = "proxmox", verb = "thin.enable_discard", role = "admin")]
 async fn proxmox_thin_enable_discard(
     args: ThinEnableDiscardArgs,
-    _ctx: &ToolCtx,
+    ctx: &ToolCtx,
 ) -> Result<ThinDiscardOutcome> {
+    crate::execute::require_admin("proxmox.thin.enable_discard", ctx.caller().as_ref())?;
     let (vmid, kind) = match (args.vmid, args.ctid) {
         (Some(v), None) => (v, GuestKind::Qemu),
         (None, Some(c)) => (c, GuestKind::Lxc),

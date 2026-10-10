@@ -362,7 +362,8 @@ pub struct ProxmoxActionArgs {
 /// [MUTATES STATE] Run a lifecycle action against one VM (`vmid`) or
 /// container (`ctid`) on the named node.
 #[orca_tool(domain = "proxmox", verb = "action", role = "admin")]
-async fn proxmox_action(args: ProxmoxActionArgs, _ctx: &ToolCtx) -> Result<ProxmoxActionResult> {
+async fn proxmox_action(args: ProxmoxActionArgs, ctx: &ToolCtx) -> Result<ProxmoxActionResult> {
+    crate::execute::require_admin("proxmox.action", ctx.caller().as_ref())?;
     if args.vmid.is_some() && args.ctid.is_some() {
         bail!("set either `vmid` or `ctid`, not both");
     }

@@ -264,11 +264,12 @@ pub struct AccessBootstrapReport {
 /// identity on a registered endpoint, store its token secret in the abstract
 /// secrets domain, and repoint the endpoint at it. Run once with root/admin
 /// credentials, then rotate the bootstrap credential away.
-#[orca_tool(domain = "proxmox", verb = "access_bootstrap")]
+#[orca_tool(domain = "proxmox", verb = "access_bootstrap", role = "admin")]
 async fn proxmox_access_bootstrap(
     args: AccessBootstrapArgs,
-    _ctx: &ToolCtx,
+    ctx: &ToolCtx,
 ) -> Result<AccessBootstrapReport> {
+    crate::execute::require_admin("proxmox.access_bootstrap", ctx.caller().as_ref())?;
     let client = make_client(&args.endpoint).await?;
     let id = bootstrap_orca_identity(&client).await?;
     let secret = id

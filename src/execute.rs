@@ -35,12 +35,20 @@ pub fn authorize_execute(tool: &str, caller: Option<&CallerIdentity>) -> Result<
     }
 }
 
-/// Checked before any read, so an unauthorized execute never touches anything.
-pub fn guard(tool: &str, execute: bool, ctx: &ToolCtx) -> Result<()> {
-    if execute {
-        authorize_execute(tool, ctx.caller().as_ref())?;
+/// Admin is required to plan a mutating verb as well as to apply it: a dry run
+/// reads the same state and reveals what would change. Checked before any read.
+pub fn require_admin(tool: &str, caller: Option<&CallerIdentity>) -> Result<()> {
+    match caller {
+        Some(c) if c.role == "admin" => Ok(()),
+        Some(c) => bail!(
+            "{tool}: requires role 'admin' (dry run included); caller '{}' has '{}'",
+            c.username,
+            c.role
+        ),
+        None => bail!(
+            "{tool}: refused: the call carries no caller identity, so admin cannot be verified"
+        ),
     }
-    Ok(())
 }
 
 /// The detailed dry-run plan for `args`. An empty `changes` list is stated in
@@ -71,6 +79,19 @@ mod tests {
             role: "admin".into(),
             can_mutate: true,
         }
+    }
+
+    #[test]
+    fn dry_run_needs_an_admin_caller_too() {
+        assert!(require_admin("t", Some(&admin())).is_ok());
+        let none = require_admin("t", None).unwrap_err().to_string();
+        assert!(none.contains("no caller identity"), "{none}");
+        let viewer = CallerIdentity {
+            role: "read".into(),
+            ..admin()
+        };
+        let e = require_admin("t", Some(&viewer)).unwrap_err().to_string();
+        assert!(e.contains("dry run included"), "{e}");
     }
 
     #[test]

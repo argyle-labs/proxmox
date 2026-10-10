@@ -224,8 +224,9 @@ pub struct DeployTargetUpsertArgs {
 #[orca_tool(domain = "proxmox", verb = "deploy_target_upsert", role = "admin")]
 async fn deploy_target_upsert(
     args: DeployTargetUpsertArgs,
-    _ctx: &ToolCtx,
+    ctx: &ToolCtx,
 ) -> Result<DeployTargetRow> {
+    crate::execute::require_admin("proxmox.deploy_target_upsert", ctx.caller().as_ref())?;
     let kind = normalize_kind(&args.kind)?;
     if args.endpoint.is_empty() || args.endpoint.contains('/') {
         bail!("endpoint must be a non-empty registered endpoint name without '/'");
@@ -285,8 +286,9 @@ pub struct DeployTargetDeleteResult {
 #[orca_tool(domain = "proxmox", verb = "deploy_target_delete", role = "admin")]
 async fn deploy_target_delete(
     args: DeployTargetDeleteArgs,
-    _ctx: &ToolCtx,
+    ctx: &ToolCtx,
 ) -> Result<DeployTargetDeleteResult> {
+    crate::execute::require_admin("proxmox.deploy_target_delete", ctx.caller().as_ref())?;
     let kind = normalize_kind(&args.kind)?;
     let id = format!("{}/{}", args.endpoint, kind);
     Ok(DeployTargetDeleteResult {

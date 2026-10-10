@@ -1470,7 +1470,7 @@ async fn proxmox_guest_standard_apply(
     args: StandardApplyArgs,
     ctx: &ToolCtx,
 ) -> Result<Change<GuestApplied>> {
-    execute::guard("proxmox.guest.standard.apply", args.execute, ctx)?;
+    execute::require_admin("proxmox.guest.standard.apply", ctx.caller().as_ref())?;
     local_ct(&args.endpoint, args.ctid).await?;
     apply(&lxc_guest::SeamIo, &args, ctx.caller().as_ref()).await
 }
@@ -1511,7 +1511,7 @@ async fn proxmox_guest_update(
     ctx: &ToolCtx,
 ) -> Result<Change<GuestApplied>> {
     const TOOL: &str = "proxmox.guest.update";
-    execute::guard(TOOL, args.execute, ctx)?;
+    execute::require_admin(TOOL, ctx.caller().as_ref())?;
     local_ct(&args.endpoint, args.ctid).await?;
     let io = lxc_guest::SeamIo;
     let payload = GuestUpdatePayload {
