@@ -316,3 +316,92 @@ fn self_gated_execute_without_a_caller_is_refused_before_anything_runs() {
         assert!(err.contains("no caller identity"), "{name}: {err}");
     }
 }
+
+/// Runs an admin handler's body directly, past orca's central gate, so each
+/// handler's own `require_admin` is what refuses.
+fn run_handler<T: plugin_toolkit::contract::OrcaTool>(
+    args: Value,
+    caller: Option<plugin_toolkit::contract::CallerIdentity>,
+) -> String
+where
+    T::Args: serde::de::DeserializeOwned,
+{
+    let args: T::Args = serde_json::from_value(args).expect("valid args");
+    let ctx = match caller {
+        Some(c) => test_ctx().with_auth(c),
+        None => test_ctx(),
+    };
+    plugin_toolkit::capsink::with_cap_sink(
+        Box::new(|cap: &str, raw: &str| panic!("reached capability {cap}: {raw}")),
+        || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(T::run(args, &ctx))
+        },
+    )
+    .err()
+    .unwrap_or_else(|| panic!("{} ran for a non-admin", T::NAME))
+    .to_string()
+}
+
+#[test]
+fn every_admin_handler_refuses_a_non_admin_caller_itself() {
+    use proxmox::{access, backup_jobs, deploy, guest_standard, thin_discard, tools};
+    let reader = plugin_toolkit::contract::CallerIdentity {
+        user_id: "u".into(),
+        username: "op".into(),
+        role: "read".into(),
+        can_mutate: false,
+    };
+    type Handler = fn(Value, Option<plugin_toolkit::contract::CallerIdentity>) -> String;
+    let cases: &[(Handler, Value)] = &[
+        (
+            run_handler::<access::ProxmoxAccessBootstrap>,
+            serde_json::json!({"endpoint": "pve"}),
+        ),
+        (
+            run_handler::<backup_jobs::ProxmoxBackupJobUpsert>,
+            serde_json::json!({"endpoint": "pve", "id": "j"}),
+        ),
+        (
+            run_handler::<backup_jobs::ProxmoxBackupJobDelete>,
+            serde_json::json!({"endpoint": "pve", "id": "j"}),
+        ),
+        (
+            run_handler::<backup_jobs::ProxmoxGuestPxarexclude>,
+            serde_json::json!({"endpoint": "pve", "ctid": 1, "patterns": ["/data"]}),
+        ),
+        (
+            run_handler::<guest_standard::ProxmoxGuestStandardApply>,
+            serde_json::json!({"endpoint": "pve", "ctid": 1}),
+        ),
+        (
+            run_handler::<guest_standard::ProxmoxGuestUpdate>,
+            serde_json::json!({"endpoint": "pve", "ctid": 1}),
+        ),
+        (
+            run_handler::<deploy::DeployTargetUpsert>,
+            serde_json::json!({"endpoint": "pve", "kind": "lxc", "node": "n", "storage": "s", "cores": 1, "memory_mb": 512}),
+        ),
+        (
+            run_handler::<deploy::DeployTargetDelete>,
+            serde_json::json!({"endpoint": "pve", "kind": "lxc"}),
+        ),
+        (
+            run_handler::<thin_discard::ProxmoxThinEnableDiscard>,
+            serde_json::json!({"endpoint": "pve", "node": "n", "ctid": 1}),
+        ),
+        (
+            run_handler::<tools::ProxmoxAction>,
+            serde_json::json!({"endpoint": "pve", "node": "n", "vmid": 1, "action": "start"}),
+        ),
+    ];
+    for (run, args) in cases {
+        let err = run(args.clone(), None);
+        assert!(err.contains("no caller identity"), "{err}");
+        let err = run(args.clone(), Some(reader.clone()));
+        assert!(err.contains("requires role 'admin'"), "{err}");
+    }
+}

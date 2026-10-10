@@ -555,6 +555,12 @@ impl ProxmoxUnitProvider {
     }
 
     async fn do_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
+        if !Self::is_pre_mutation_guard_backup(&args) {
+            crate::execute::require_admin(
+                &format!("unit.update action={}", args.action),
+                args.caller.as_ref(),
+            )?;
+        }
         // Backup is a first-class managed-unit action (the pre-mutation guard and
         // scheduler both dispatch it) — route it before lifecycle transitions.
         if args.action == ACTION_BACKUP {
@@ -580,6 +586,14 @@ impl ProxmoxUnitProvider {
             changed: true,
             message: format!("{} {} {vmid} on {node}", args.action, kind_str(kind)),
         }))
+    }
+
+    /// orca's pre-mutation guard sends `backup` with no caller and no payload
+    /// (orca#704), so that exact shape is let through without an admin caller.
+    fn is_pre_mutation_guard_backup(args: &UpdateArgs) -> bool {
+        args.action == ACTION_BACKUP
+            && args.caller.is_none()
+            && args.payload.as_deref().is_none_or(|p| p.trim().is_empty())
     }
 
     /// Take the guest's minimal backup via `vzdump` and return a [`BackupRef`].
@@ -675,6 +689,7 @@ impl ProxmoxUnitProvider {
     /// an admin caller, back up and run the in-container updater. Node-local.
     async fn do_guest_update(&self, args: &UpdateArgs) -> Result<VerbOutcome> {
         const TOOL: &str = "unit.update action=update";
+        crate::execute::require_admin(TOOL, args.caller.as_ref())?;
         let id = &args.id;
         let endpoint = endpoint_of(id)?;
         if kind_from_str(&id.kind)? != GuestKind::Lxc {
@@ -688,7 +703,6 @@ impl ProxmoxUnitProvider {
             Some(raw) => serde_json::from_str(raw).map_err(|e| anyhow!("update payload: {e}"))?,
             None => Default::default(),
         };
-        crate::execute::require_admin(TOOL, args.caller.as_ref())?;
         let out: Change<crate::guest_standard::GuestApplied> = if !p.execute {
             Change::Plan(crate::guest_standard::plan_update(
                 TOOL, &p, ctid, &p, None,
@@ -783,6 +797,8 @@ impl ProxmoxUnitProvider {
         )))
     }
 
+    /// Not admin-checked here: `CreateArgs` carries no caller identity yet
+    /// (orca#788), so this relies on orca's central role gate.
     async fn do_create(&self, args: CreateArgs) -> Result<VerbOutcome> {
         if args.action != "provision" {
             return Err(anyhow!("unknown proxmox create action: {}", args.action));
@@ -963,6 +979,7 @@ impl ProxmoxUnitProvider {
     /// absent, no-op (unchanged) when it already exists. The payload is the same
     /// [`ProvisionPayload`] `create`/provision consumes.
     async fn do_upsert(&self, args: UpsertArgs) -> Result<VerbOutcome> {
+        crate::execute::require_admin("unit.upsert", args.caller.as_ref())?;
         let raw = args
             .payload
             .ok_or_else(|| anyhow!("upsert requires a payload"))?;
@@ -993,6 +1010,7 @@ impl ProxmoxUnitProvider {
     }
 
     async fn do_delete(&self, args: DeleteArgs) -> Result<VerbOutcome> {
+        crate::execute::require_admin("unit.delete", args.caller.as_ref())?;
         let endpoint = endpoint_of(&args.id)?;
         let kind = kind_from_str(&args.id.kind)?;
         let vmid: u64 = args
@@ -1502,6 +1520,107 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("requires role 'admin'"), "{err}");
+    }
+
+    fn refused<F: std::future::Future<Output = Result<VerbOutcome>>>(fut: F) -> String {
+        plugin_toolkit::capsink::with_cap_sink(
+            Box::new(|cap: &str, raw: &str| panic!("reached capability {cap}: {raw}")),
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(fut)
+            },
+        )
+        .unwrap_err()
+        .to_string()
+    }
+
+    fn unit_id() -> UnitId {
+        UnitId {
+            manager: manager_for("pve"),
+            kind: KIND_LXC.into(),
+            id: "116".into(),
+            name: String::new(),
+        }
+    }
+
+    fn non_admins() -> [(Option<CallerIdentity>, &'static str); 2] {
+        let reader = CallerIdentity {
+            user_id: "u".into(),
+            username: "op".into(),
+            role: "read".into(),
+            can_mutate: false,
+        };
+        [
+            (None, "no caller identity"),
+            (Some(reader), "requires role 'admin'"),
+        ]
+    }
+
+    #[test]
+    fn unit_update_actions_need_an_admin_caller() {
+        let p = ProxmoxUnitProvider::new();
+        for (action, payload) in [
+            ("start", None),
+            (ACTION_BACKUP, Some(r#"{"storage":"local"}"#)),
+            (ACTION_RESTORE, Some(r#"{"from":{"locator":"x"}}"#)),
+        ] {
+            for (caller, want) in non_admins() {
+                let err = refused(p.do_update(UpdateArgs {
+                    id: unit_id(),
+                    action: action.into(),
+                    payload: payload.map(str::to_string),
+                    caller,
+                }));
+                assert!(err.contains(want), "{action}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_callerless_empty_backup_is_the_pre_mutation_guard() {
+        let args = |payload: Option<&str>, caller: Option<CallerIdentity>| UpdateArgs {
+            id: unit_id(),
+            action: ACTION_BACKUP.into(),
+            payload: payload.map(str::to_string),
+            caller,
+        };
+        assert!(ProxmoxUnitProvider::is_pre_mutation_guard_backup(&args(
+            None, None
+        )));
+        assert!(ProxmoxUnitProvider::is_pre_mutation_guard_backup(&args(
+            Some(""),
+            None
+        )));
+        assert!(!ProxmoxUnitProvider::is_pre_mutation_guard_backup(&args(
+            Some("{}"),
+            None
+        )));
+        let [_, (reader, _)] = non_admins();
+        assert!(!ProxmoxUnitProvider::is_pre_mutation_guard_backup(&args(
+            None, reader
+        )));
+    }
+
+    #[test]
+    fn unit_upsert_and_delete_need_an_admin_caller() {
+        let p = ProxmoxUnitProvider::new();
+        for (caller, want) in non_admins() {
+            let err = refused(p.do_upsert(UpsertArgs {
+                id: unit_id(),
+                action: "set".into(),
+                payload: Some(r#"{"endpoint":"pve","kind":"lxc"}"#.into()),
+                caller: caller.clone(),
+            }));
+            assert!(err.contains(want), "upsert: {err}");
+            let err = refused(p.do_delete(DeleteArgs {
+                id: unit_id(),
+                caller,
+            }));
+            assert!(err.contains(want), "delete: {err}");
+        }
     }
 
     #[test]
