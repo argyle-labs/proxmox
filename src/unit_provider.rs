@@ -688,6 +688,7 @@ impl ProxmoxUnitProvider {
             Some(raw) => serde_json::from_str(raw).map_err(|e| anyhow!("update payload: {e}"))?,
             None => Default::default(),
         };
+        crate::execute::require_admin(TOOL, args.caller.as_ref())?;
         let out: Change<crate::guest_standard::GuestApplied> = if !p.execute {
             Change::Plan(crate::guest_standard::plan_update(
                 TOOL, &p, ctid, &p, None,
@@ -1453,11 +1454,36 @@ mod tests {
 
     #[test]
     fn update_action_without_execute_is_a_plan_that_touches_nothing() {
-        let VerbOutcome::Item(item) = guest_update(json!({"updater": "apt"}), None).unwrap() else {
+        let admin = CallerIdentity {
+            user_id: "u".into(),
+            username: "op".into(),
+            role: "admin".into(),
+            can_mutate: true,
+        };
+        let VerbOutcome::Item(item) = guest_update(json!({"updater": "apt"}), Some(admin)).unwrap()
+        else {
             panic!()
         };
         let plan: serde_json::Value = serde_json::from_str(&item.payload).unwrap();
         assert_eq!(plan["dryRun"], json!(true), "{plan}");
+    }
+
+    #[test]
+    fn update_action_dry_run_needs_an_admin_caller() {
+        let err = guest_update(json!({"updater": "apt"}), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no caller identity"), "{err}");
+        let reader = CallerIdentity {
+            user_id: "u".into(),
+            username: "op".into(),
+            role: "read".into(),
+            can_mutate: false,
+        };
+        let err = guest_update(json!({"updater": "apt"}), Some(reader))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires role 'admin'"), "{err}");
     }
 
     #[test]

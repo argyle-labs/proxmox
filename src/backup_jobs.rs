@@ -704,7 +704,7 @@ async fn proxmox_backup_job_upsert(
     args: BackupJobUpsertArgs,
     ctx: &ToolCtx,
 ) -> Result<Change<BackupJobApplied>> {
-    execute::guard("proxmox.backup_job.upsert", args.execute, ctx)?;
+    execute::require_admin("proxmox.backup_job.upsert", ctx.caller().as_ref())?;
     let cfg = resolve_config(&args.endpoint).await?;
     upsert(&cfg, &args, ctx.caller().as_ref()).await
 }
@@ -799,7 +799,7 @@ async fn proxmox_backup_job_delete(
     args: BackupJobDeleteArgs,
     ctx: &ToolCtx,
 ) -> Result<Change<BackupJobApplied>> {
-    execute::guard("proxmox.backup_job.delete", args.execute, ctx)?;
+    execute::require_admin("proxmox.backup_job.delete", ctx.caller().as_ref())?;
     let cfg = resolve_config(&args.endpoint).await?;
     delete(&cfg, &args, ctx.caller().as_ref()).await
 }
@@ -927,7 +927,7 @@ async fn proxmox_guest_pxarexclude(
     args: PxarExcludeArgs,
     ctx: &ToolCtx,
 ) -> Result<Change<PxarExcludeApplied>> {
-    execute::guard("proxmox.guest.pxarexclude", args.execute, ctx)?;
+    execute::require_admin("proxmox.guest.pxarexclude", ctx.caller().as_ref())?;
     let client = resolve_config(&args.endpoint)
         .await?
         .build_generated_client()?;
