@@ -161,6 +161,8 @@ pub async fn diagnose(args: DiagnoseArgs) -> Vec<Finding> {
     findings.extend(crate::backup_jobs::diagnose_backup_jobs().await);
     // Node-local: app state in LXC bind mounts, which vzdump never includes.
     findings.extend(crate::bind_mounts::diagnose_bind_mounts());
+    // Cluster-wide: thin pools whose volumes add up to more than the pool holds.
+    findings.extend(crate::thin_pool::diagnose_thin_pools().await);
     findings
 }
 
