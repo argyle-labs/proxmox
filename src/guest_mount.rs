@@ -8,10 +8,18 @@
 //! kernel performs the mount directly into the guest's mount namespace, so the
 //! LXC stays unprivileged and the mount re-establishes itself on every guest
 //! start — independent of the host's own mount state
-//! ([[proxmox per-guest mounts]]). The PVE config API exposes `mpN` bind mounts
-//! but NOT raw `lxc.mount.entry` lines, so this domain edits
-//! `/etc/pve/lxc/<vmid>.conf` on the node directly, the same node-local path the
-//! shm-resize repair already uses.
+//! ([[proxmox per-guest mounts]]).
+//!
+//! Two write paths:
+//!
+//! * a host-path bind (`fstype` `bind`/`none`, absolute source) is an `mpN`
+//!   mount point, set and removed through `PUT /nodes/{node}/lxc/{vmid}/config`
+//!   with the config `digest`, so a concurrent change fails instead of being
+//!   overwritten;
+//! * a cifs/nfs mount is a raw `lxc.mount.entry`, which the PVE config API does
+//!   not expose. Only that path edits `/etc/pve/lxc/<vmid>.conf`, and only
+//!   through [`edit_raw_conf`]: the CT must be stopped, the config digest must be
+//!   unchanged across the edit, and the write is atomic.
 //!
 //! Core routes a guest-targeted storage placement here as a
 //! [`GuestMountSpec`](plugin_toolkit::storage::GuestMountSpec): `guest` is the
@@ -25,16 +33,25 @@
 //! VM guests (their own kernel mounts via cloud-init/fstab) are a later phase;
 //! this domain handles LXC and returns a clear error for a VM vmid.
 
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 
 use plugin_toolkit::abi::BackendDef;
+use plugin_toolkit::reqwest;
 use plugin_toolkit::serde_json::{self, Value};
 use plugin_toolkit::storage::{GuestMountSpec, SECRET_FILE_DIR, parse_option_string};
 use serde::Deserialize;
 
+use crate::responses::{ConfigField, GuestConfigData};
+use crate::{GuestKind, generated};
+
 /// Invoke-name prefix for this domain's ops (`proxmox.__guest_mount.*`).
 pub const GM_PREFIX: &str = "proxmox.__guest_mount";
 const PROVIDER: &str = "proxmox";
+/// PVE allows `mp0`..`mp255`.
+const MAX_MP: u32 = 256;
+const CREDS_FILE_MODE: u32 = 0o600;
 
 /// Option keys that carry a credential and must never be rendered inline into
 /// the config — resolved into the root-owned creds file instead.
@@ -83,12 +100,13 @@ pub fn dispatch(
             "guest_mount_apply" => {
                 let a: GuestApplyArgs = serde_json::from_value(args)
                     .map_err(|e| err_val(format!("guest_mount_apply args: {e}")))?;
-                apply(&a.spec).map(Value::String).map_err(err_val)
+                apply(&a.spec).await.map(Value::String).map_err(err_val)
             }
             "guest_mount_remove" => {
                 let a: GuestRemoveArgs = serde_json::from_value(args)
                     .map_err(|e| err_val(format!("guest_mount_remove args: {e}")))?;
                 remove(&a.guest, &a.target)
+                    .await
                     .map(Value::String)
                     .map_err(err_val)
             }
@@ -107,13 +125,16 @@ fn err_val(msg: impl Into<String>) -> serde_json::Value {
 /// when they diverge. The mount goes live on the guest's next start; a running
 /// guest picks it up on reboot (the converge loop re-applies each tick, so no
 /// state is lost).
-fn apply(spec: &GuestMountSpec) -> Result<String, String> {
+async fn apply(spec: &GuestMountSpec) -> Result<String, String> {
     let vmid = parse_vmid(&spec.guest)?;
     let conf_path = lxc_conf_path(vmid)?;
     let fs_spec = spec
         .sources
         .first()
         .ok_or_else(|| format!("guest {vmid}: share has no enabled source route"))?;
+    if is_bind(&spec.fstype, fs_spec) {
+        return apply_bind(vmid, &conf_path, fs_spec, spec).await;
+    }
     let mountpoint_rel = relative_mountpoint(&spec.target);
 
     // cifs with a credential → resolve the password and materialize a root-owned
@@ -134,10 +155,12 @@ fn apply(spec: &GuestMountSpec) -> Result<String, String> {
     let options = render_entry_options(&spec.options, cred_path.as_deref());
     let entry = render_lxc_mount_entry(fs_spec, &mountpoint_rel, &spec.fstype, &options);
 
-    let conf = std::fs::read_to_string(&conf_path).map_err(|e| format!("read {conf_path}: {e}"))?;
-    let (rewritten, changed) = upsert_entry(&conf, &mountpoint_rel, &entry);
+    let changed = edit_raw_conf(vmid, |conf| {
+        let (rewritten, changed) = upsert_entry(conf, &mountpoint_rel, &entry);
+        changed.then_some(rewritten)
+    })
+    .await?;
     if changed {
-        std::fs::write(&conf_path, rewritten).map_err(|e| format!("write {conf_path}: {e}"))?;
         Ok(format!(
             "Set guest mount {} in {conf_path}; applies on next start of CT {vmid} (`pct reboot {vmid}`).",
             spec.target
@@ -150,19 +173,66 @@ fn apply(spec: &GuestMountSpec) -> Result<String, String> {
     }
 }
 
+/// Reconcile a host-path bind as an `mpN` mount point through the PVE API.
+async fn apply_bind(
+    vmid: u64,
+    conf_path: &str,
+    src: &str,
+    spec: &GuestMountSpec,
+) -> Result<String, String> {
+    let ro = parse_option_string(&spec.options)
+        .any(|o| o.key == "ro" && o.value.is_none_or(|v| v == "1"));
+    let value = render_mp_value(src, &spec.target, ro);
+    let conf = std::fs::read_to_string(conf_path).map_err(|e| format!("read {conf_path}: {e}"))?;
+    if find_mp(&conf_mp_entries(&conf), &spec.target).is_some_and(|(_, v)| v == value) {
+        return Ok(format!(
+            "Bind mount {} already present on CT {vmid}.",
+            spec.target
+        ));
+    }
+    let ct = PveCt::locate(vmid).await?;
+    let cfg = ct.config().await?;
+    let digest = config_digest(&cfg)?;
+    let entries = api_mp_entries(&cfg);
+    let key = match find_mp(&entries, &spec.target) {
+        Some((k, _)) => k.to_string(),
+        None => first_free_mp(&entries)
+            .ok_or_else(|| format!("CT {vmid}: all {MAX_MP} mount point slots are in use"))?,
+    };
+    ct.put_config(&mp_set_pairs(&key, &value, &digest)).await?;
+    Ok(format!(
+        "Set {key} bind mount {} on CT {vmid} via the PVE API.",
+        spec.target
+    ))
+}
+
 /// Remove the mount at `target` inside `guest` — the counterpart to a deleted or
 /// disabled placement. Idempotent: absent entry ⇒ `Ok`. Also removes the creds
 /// file (best-effort; a missing file is not an error).
-fn remove(guest: &str, target: &str) -> Result<String, String> {
+async fn remove(guest: &str, target: &str) -> Result<String, String> {
     let vmid = parse_vmid(guest)?;
     let conf_path = lxc_conf_path(vmid)?;
     let mountpoint_rel = relative_mountpoint(target);
 
     let conf = std::fs::read_to_string(&conf_path).map_err(|e| format!("read {conf_path}: {e}"))?;
-    let (rewritten, removed) = strip_entry(&conf, &mountpoint_rel);
-    if removed {
-        std::fs::write(&conf_path, rewritten).map_err(|e| format!("write {conf_path}: {e}"))?;
+    if find_mp(&conf_mp_entries(&conf), target).is_some() {
+        let ct = PveCt::locate(vmid).await?;
+        let cfg = ct.config().await?;
+        let digest = config_digest(&cfg)?;
+        let entries = api_mp_entries(&cfg);
+        if let Some((key, _)) = find_mp(&entries, target) {
+            ct.put_config(&mp_delete_pairs(key, &digest)).await?;
+            return Ok(format!(
+                "Removed {key} bind mount {target} from CT {vmid} via the PVE API."
+            ));
+        }
     }
+
+    let removed = edit_raw_conf(vmid, |conf| {
+        let (rewritten, removed) = strip_entry(conf, &mountpoint_rel);
+        removed.then_some(rewritten)
+    })
+    .await?;
     // Best-effort creds cleanup; a leftover/absent file is harmless.
     std::fs::remove_file(guest_creds_path(vmid, target)).ok();
 
@@ -246,9 +316,13 @@ fn write_creds_file(
     if let Some(parent) = std::path::Path::new(&path).parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
-    std::fs::write(&path, contents).map_err(|e| format!("write creds file {path}: {e}"))?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("chmod 600 {path}: {e}"))?;
+    atomic_write(
+        Path::new(&path),
+        contents.as_bytes(),
+        CREDS_FILE_MODE,
+        Some((0, 0)),
+    )
+    .map_err(|e| format!("write creds file {path}: {e}"))?;
     Ok(path)
 }
 
@@ -276,6 +350,274 @@ fn render_creds_file(username: &str, password: &str, domain: Option<&str>) -> St
         out.push_str(&format!("domain={d}\n"));
     }
     out
+}
+
+// ── Safe file writes ────────────────────────────────────────────────────────
+
+/// Create a fresh temp file beside `path` with `mode` set at creation, so the
+/// contents are never readable under a looser mode.
+fn create_temp_beside(
+    path: &Path,
+    mode: u32,
+) -> std::io::Result<(std::fs::File, std::path::PathBuf)> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("path has no file name"))?
+        .to_string_lossy();
+    let tmp = path.with_file_name(format!(".{name}.tmp.{}", std::process::id()));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&tmp)?;
+    Ok((file, tmp))
+}
+
+/// Write `contents` to `path` atomically: temp file in the same dir, `sync_all`,
+/// then rename. Mode and owner are fixed up only when the temp file differs, so
+/// pmxcfs (which rejects chmod/chown but already applies its fixed ones) works.
+fn atomic_write(
+    path: &Path,
+    contents: &[u8],
+    mode: u32,
+    owner: Option<(u32, u32)>,
+) -> std::io::Result<()> {
+    let (mut file, tmp) = create_temp_beside(path, mode)?;
+    let result = (|| {
+        file.write_all(contents)?;
+        let meta = file.metadata()?;
+        if meta.mode() & 0o7777 != mode {
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+        if let Some((uid, gid)) = owner
+            && (meta.uid() != uid || meta.gid() != gid)
+        {
+            std::os::unix::fs::fchown(&file, Some(uid), Some(gid))?;
+        }
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        std::fs::remove_file(&tmp).ok();
+    }
+    result
+}
+
+/// [`atomic_write`] over an existing file, keeping its mode and owner.
+fn atomic_replace(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let meta = std::fs::metadata(path)?;
+    atomic_write(
+        path,
+        contents,
+        meta.mode() & 0o7777,
+        Some((meta.uid(), meta.gid())),
+    )
+}
+
+// ── PVE API ─────────────────────────────────────────────────────────────────
+
+/// A CT on this node, reached through an enabled endpoint's API.
+struct PveCt {
+    http: reqwest::Client,
+    client: generated::Client,
+    base_url: String,
+    node: String,
+    vmid: u64,
+}
+
+impl PveCt {
+    /// The first enabled endpoint whose cluster places `vmid` on this node.
+    async fn locate(vmid: u64) -> Result<Self, String> {
+        let local = crate::diagnostics::local_node();
+        let mut errs = Vec::new();
+        for name in crate::tools::enabled_endpoint_names() {
+            let cfg = match crate::tools::resolve_config(&name).await {
+                Ok(c) => c,
+                Err(e) => {
+                    errs.push(format!("{name}: {e:#}"));
+                    continue;
+                }
+            };
+            let (http, client) = match (cfg.build_reqwest_client(), cfg.build_generated_client()) {
+                (Ok(h), Ok(c)) => (h, c),
+                (Err(e), _) | (_, Err(e)) => {
+                    errs.push(format!("{name}: {e}"));
+                    continue;
+                }
+            };
+            match crate::lxc_guest::find_ct(&client, vmid).await {
+                Ok(ct) if ct.node == local => {
+                    return Ok(Self {
+                        http,
+                        client,
+                        base_url: cfg.base_url,
+                        node: ct.node,
+                        vmid,
+                    });
+                }
+                Ok(ct) => errs.push(format!("{name}: CT {vmid} is on node '{}'", ct.node)),
+                Err(e) => errs.push(format!("{name}: {e:#}")),
+            }
+        }
+        Err(format!(
+            "CT {vmid}: no enabled proxmox endpoint places it on node '{local}' ({})",
+            errs.join("; ")
+        ))
+    }
+
+    async fn config(&self) -> Result<GuestConfigData, String> {
+        crate::fetch_guest_config(
+            &self.http,
+            &self.base_url,
+            &self.node,
+            GuestKind::Lxc,
+            self.vmid,
+        )
+        .await
+        .map(|r| r.data)
+        .map_err(|e| format!("CT {} config: {e}", self.vmid))
+    }
+
+    async fn status(&self) -> Result<String, String> {
+        self.client
+            .get_vm_status_nodes_node_lxc_vmid_status_current(&self.node, self.vmid as i64)
+            .await
+            .map(|r| r.into_inner().status.to_string())
+            .map_err(|e| format!("CT {} status: {e}", self.vmid))
+    }
+
+    async fn put_config(&self, pairs: &[(String, String)]) -> Result<(), String> {
+        let url = format!(
+            "{}/nodes/{}/lxc/{}/config",
+            self.base_url.trim_end_matches('/'),
+            crate::backup::enc(&self.node),
+            self.vmid
+        );
+        crate::backup::put_form(&self.http, &url, pairs)
+            .await
+            .map_err(|e| format!("{e:#}"))
+    }
+}
+
+fn config_digest(cfg: &GuestConfigData) -> Result<String, String> {
+    cfg.get_str("digest")
+        .map(str::to_string)
+        .ok_or_else(|| "PVE config response carries no digest".to_string())
+}
+
+/// Raw `lxc.*` lines have no PVE API, so they are edited in the conf file under
+/// guards: the CT must be stopped (a running CT's conf is live state PVE may
+/// rewrite), the digest must not change between read and write, and the write
+/// is atomic. `edit` returns the new conf, or `None` for no change. Returns
+/// whether the file was written; a no-op never touches the API.
+pub(crate) async fn edit_raw_conf<F>(vmid: u64, edit: F) -> Result<bool, String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let path = format!("/etc/pve/lxc/{vmid}.conf");
+    let read = || std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"));
+    if edit(&read()?).is_none() {
+        return Ok(false);
+    }
+    let ct = PveCt::locate(vmid).await?;
+    require_stopped(vmid, &ct.status().await?)?;
+    let before = config_digest(&ct.config().await?)?;
+    let Some(rewritten) = edit(&read()?) else {
+        return Ok(false);
+    };
+    let after = config_digest(&ct.config().await?)?;
+    require_same_digest(vmid, &before, &after)?;
+    atomic_replace(Path::new(&path), rewritten.as_bytes())
+        .map_err(|e| format!("write {path}: {e}"))?;
+    Ok(true)
+}
+
+fn require_stopped(vmid: u64, status: &str) -> Result<(), String> {
+    if status == "stopped" {
+        Ok(())
+    } else {
+        Err(format!(
+            "CT {vmid} is {status}; raw lxc.* config lines have no PVE API, so they are only \
+             edited while the CT is stopped (`pct stop {vmid}`)"
+        ))
+    }
+}
+
+fn require_same_digest(vmid: u64, before: &str, after: &str) -> Result<(), String> {
+    if before == after {
+        Ok(())
+    } else {
+        Err(format!(
+            "CT {vmid} config changed during the edit (digest {before} -> {after}); aborted"
+        ))
+    }
+}
+
+// ── Mount points (mpN) ──────────────────────────────────────────────────────
+
+/// True for a host-path bind, which PVE models as an `mpN` mount point.
+fn is_bind(fstype: &str, src: &str) -> bool {
+    matches!(fstype, "bind" | "none") && src.starts_with('/')
+}
+
+fn is_mp_key(key: &str) -> bool {
+    key.strip_prefix("mp")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// `mpN` entries from the conf's live section (before any `[snapshot]`).
+fn conf_mp_entries(conf: &str) -> Vec<(String, String)> {
+    conf.lines()
+        .take_while(|l| !l.trim_start().starts_with('['))
+        .filter_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            let k = k.trim();
+            is_mp_key(k).then(|| (k.to_string(), v.trim().to_string()))
+        })
+        .collect()
+}
+
+fn api_mp_entries(cfg: &GuestConfigData) -> Vec<(String, String)> {
+    cfg.fields
+        .iter()
+        .filter_map(|(k, v)| match v {
+            ConfigField::Str(s) if is_mp_key(k) => Some((k.clone(), s.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `mpN` whose `mp=` is `target`.
+fn find_mp<'a>(entries: &'a [(String, String)], target: &str) -> Option<(&'a str, &'a str)> {
+    entries
+        .iter()
+        .find(|(_, v)| v.split(',').any(|p| p.strip_prefix("mp=") == Some(target)))
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+}
+
+fn first_free_mp(entries: &[(String, String)]) -> Option<String> {
+    (0..MAX_MP)
+        .map(|i| format!("mp{i}"))
+        .find(|k| !entries.iter().any(|(e, _)| e == k))
+}
+
+fn render_mp_value(src: &str, target: &str, ro: bool) -> String {
+    let ro = if ro { ",ro=1" } else { "" };
+    format!("{src},mp={target}{ro}")
+}
+
+fn mp_set_pairs(key: &str, value: &str, digest: &str) -> Vec<(String, String)> {
+    vec![
+        (key.to_string(), value.to_string()),
+        ("digest".to_string(), digest.to_string()),
+    ]
+}
+
+fn mp_delete_pairs(key: &str, digest: &str) -> Vec<(String, String)> {
+    vec![
+        ("delete".to_string(), key.to_string()),
+        ("digest".to_string(), digest.to_string()),
+    ]
 }
 
 // ── Pure entry rendering ────────────────────────────────────────────────────
@@ -518,6 +860,126 @@ mod tests {
             guest_creds_path(110, "/mnt/backups"),
             guest_creds_path(200, "/mnt/backups")
         );
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "proxmox-gm-{name}-{}-{}",
+            std::process::id(),
+            plugin_toolkit::time::now().unix_seconds()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn entries(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn creds_temp_file_is_0600_at_creation() {
+        let dir = scratch("creds-mode");
+        let (file, _tmp) = create_temp_beside(&dir.join("x.secret"), CREDS_FILE_MODE).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_temp_and_sets_mode() {
+        let dir = scratch("atomic");
+        let path = dir.join("x.secret");
+        atomic_write(&path, b"username=a\n", CREDS_FILE_MODE, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "username=a\n");
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("x.secret")]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn atomic_replace_preserves_mode() {
+        let dir = scratch("replace");
+        let path = dir.join("110.conf");
+        std::fs::write(&path, "arch: amd64\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        atomic_replace(&path, b"arch: arm64\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "arch: arm64\n");
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o640);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn raw_edit_refused_unless_stopped() {
+        assert!(require_stopped(110, "stopped").is_ok());
+        let err = require_stopped(110, "running").unwrap_err();
+        assert!(err.contains("running"));
+    }
+
+    #[test]
+    fn raw_edit_aborts_on_digest_change() {
+        assert!(require_same_digest(110, "abc", "abc").is_ok());
+        assert!(require_same_digest(110, "abc", "def").is_err());
+    }
+
+    #[test]
+    fn first_free_mp_fills_gaps() {
+        assert_eq!(first_free_mp(&[]), Some("mp0".to_string()));
+        let e = entries(&[("mp0", "/a,mp=/a"), ("mp2", "/c,mp=/c")]);
+        assert_eq!(first_free_mp(&e), Some("mp1".to_string()));
+        let full: Vec<_> = (0..MAX_MP)
+            .map(|i| (format!("mp{i}"), String::new()))
+            .collect();
+        assert_eq!(first_free_mp(&full), None);
+    }
+
+    #[test]
+    fn find_mp_matches_target_exactly() {
+        let e = entries(&[
+            ("mp0", "/srv/a,mp=/mnt/a"),
+            ("mp3", "/srv/b,mp=/mnt/b,ro=1"),
+        ]);
+        assert_eq!(find_mp(&e, "/mnt/b").map(|(k, _)| k), Some("mp3"));
+        assert!(find_mp(&e, "/mnt").is_none());
+    }
+
+    #[test]
+    fn conf_mp_entries_reads_live_section_only() {
+        let conf = "arch: amd64\nmp0: /srv/a,mp=/mnt/a\nmemory: 512\n[snap1]\nmp1: /x,mp=/y\n";
+        assert_eq!(
+            conf_mp_entries(conf),
+            entries(&[("mp0", "/srv/a,mp=/mnt/a")])
+        );
+    }
+
+    #[test]
+    fn mp_requests_carry_value_and_digest() {
+        let value = render_mp_value("/srv/media", "/mnt/media", true);
+        assert_eq!(value, "/srv/media,mp=/mnt/media,ro=1");
+        assert_eq!(
+            mp_set_pairs("mp1", &value, "d1"),
+            entries(&[("mp1", "/srv/media,mp=/mnt/media,ro=1"), ("digest", "d1")])
+        );
+        assert_eq!(
+            mp_delete_pairs("mp1", "d1"),
+            entries(&[("delete", "mp1"), ("digest", "d1")])
+        );
+        assert_eq!(render_mp_value("/a", "/b", false), "/a,mp=/b");
+    }
+
+    #[test]
+    fn bind_detection_needs_bind_type_and_host_path() {
+        assert!(is_bind("bind", "/srv/a"));
+        assert!(is_bind("none", "/srv/a"));
+        assert!(!is_bind("cifs", "//host/share"));
+        assert!(!is_bind("nfs", "host:/export"));
     }
 
     #[test]
