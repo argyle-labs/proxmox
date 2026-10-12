@@ -37,7 +37,7 @@ use crate::unit_provider::{ProvisionPayload, ProxmoxUnitProvider};
 
 /// Plugin data namespace for proxmox-owned tables — the isolation key core
 /// derives `plug__proxmox__<table>` from.
-const NAMESPACE: &str = "proxmox";
+pub(crate) const NAMESPACE: &str = "proxmox";
 const TABLE: &str = "deploy_target";
 
 /// Invoke-prefix root the loader routes a registered deploy target's
@@ -118,7 +118,10 @@ fn table_def() -> TableDef {
 /// The `schema_json` this plugin hands `serve_tool_plugin! { schemas: … }` so
 /// core materializes `proxmox_deploy_target` at load.
 pub fn schemas_json() -> String {
-    build_schemas_json(NAMESPACE, vec![table_def()])
+    build_schemas_json(
+        NAMESPACE,
+        vec![table_def(), crate::guest_mount::raw_drop_table_def()],
+    )
 }
 
 // ── Table access (mirrors the generated `endpoint_db` over `db_op`) ─────────

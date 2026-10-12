@@ -78,6 +78,8 @@ tracing     = "0.1"
 # orca's supervisor inherits. `env-filter` honors `RUST_LOG`.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio       = { version = "1", features = ["full"] }
+# Parses an endpoint URL to decide whether it names this host.
+url         = "2"
 
 [dev-dependencies]
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }

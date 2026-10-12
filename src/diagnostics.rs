@@ -448,8 +448,7 @@ fn finding_shm_trap(node: &str, vmid: u64, name: &str, trap: &crate::shm_trap::S
             id: format!("shm-resize::{vmid}::{}::{suggested}", trap.target),
             description: format!(
                 "Rewrite the tmpfs /{} entry in /etc/pve/lxc/{vmid}.conf to size={suggested}m \
-                 (leaves headroom under the {} MiB cap). Takes effect on the next CT restart; \
-                 does not resize the live mount.",
+                 (leaves headroom under the {} MiB cap). Takes effect on the CT's next start.",
                 trap.target, trap.memory_mb
             ),
             // Confirmation required — it edits the CT config and needs a restart.
@@ -461,18 +460,21 @@ fn finding_shm_trap(node: &str, vmid: u64, name: &str, trap: &crate::shm_trap::S
 }
 
 /// Apply an `shm-resize::<vmid>::<target>::<new_mb>` repair by rewriting the
-/// tmpfs `size=` in the CT's conf. Node-local; returns honest failure if the
-/// conf can't be read/written or the entry isn't found.
-fn repair_shm_resize(vmid: u64, target: &str, new_mb: u64) -> Result<String, String> {
-    let path = format!("/etc/pve/lxc/{vmid}.conf");
-    let conf = std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))?;
-    let (rewritten, changed) = crate::shm_trap::rewrite_tmpfs_size(&conf, target, new_mb);
-    if !changed {
+/// tmpfs `size=` in the CT's conf. The tmpfs is a raw `lxc.mount.entry` with no
+/// PVE API, and `/etc/pve` is root-only, so the edit runs as root through the
+/// [`crate::guest_mount::OP_SHM_RESIZE`] privileged op.
+async fn repair_shm_resize(vmid: u64, target: &str, new_mb: u64) -> Result<String, String> {
+    let path = crate::guest_mount::lxc_conf_path(vmid)?;
+    let op = crate::guest_mount::ShmResizeOp {
+        vmid,
+        target: target.to_string(),
+        size_mb: new_mb,
+    };
+    if crate::guest_mount::shm_resize(&op).await? == crate::guest_mount::RawEdit::Unchanged {
         return Err(format!(
             "no tmpfs /{target} entry with a size= found in {path} (already fixed?)"
         ));
     }
-    std::fs::write(&path, rewritten).map_err(|e| format!("write {path}: {e}"))?;
     Ok(format!(
         "Set tmpfs /{target} to size={new_mb}m in {path}. Restart CT {vmid} \
          (`pct reboot {vmid}`) for it to take effect."
@@ -572,7 +574,7 @@ pub async fn repair(args: RepairArgs) -> RepairOutcome {
                 format!("malformed shm-resize repair id '{}'", args.repair_id),
             );
         };
-        return match repair_shm_resize(vmid, &target, new_mb) {
+        return match repair_shm_resize(vmid, &target, new_mb).await {
             Ok(msg) => outcome(&args.repair_id, true, msg),
             Err(e) => outcome(&args.repair_id, false, e),
         };
