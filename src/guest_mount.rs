@@ -21,13 +21,14 @@
 //! A change PVE cannot hotplug lands in `[pve:pending]` and is reported as
 //! pending a restart.
 //!
-//! The one raw config edit left is [`OP_SHM_RESIZE`]: a CT's tmpfs
-//! `lxc.mount.entry` `size=`, which has no PVE API or CLI. The plugin runs as
-//! the unprivileged orca user, so that edit of `/etc/pve/lxc/<vmid>.conf` runs
-//! as root through orca's verified `admin plugin-apply` seam
-//! ([`privileged_ops`]). There [`edit_raw_conf_in`] holds PVE's own per-CT
-//! config flock, re-reads the file under it, edits only the live section, and
-//! replaces it atomically.
+//! Raw config edits cover only what has no PVE API or CLI: [`OP_SHM_RESIZE`]
+//! sets a CT's tmpfs `lxc.mount.entry` `size=`, and [`OP_DROP_RAW_ENTRY`]
+//! removes a raw `lxc.mount.entry` for a guest mount target (no API removes
+//! `lxc.*` keys). The plugin runs as the unprivileged orca user, so these edits
+//! of `/etc/pve/lxc/<vmid>.conf` run as root through orca's verified
+//! `admin plugin-apply` seam ([`privileged_ops`]). There [`edit_raw_conf_in`]
+//! holds PVE's own per-CT config flock, re-reads the file under it, edits only
+//! the live section, and replaces it atomically.
 //!
 //! VM guests (their own kernel mounts via cloud-init/fstab) are a later phase;
 //! this domain handles LXC and returns a clear error for a VM vmid.
@@ -65,6 +66,11 @@ const SHM_MAX_MB: u64 = 64 * 1024;
 const CT_DEFAULT_MEMORY_MB: u64 = 512;
 /// Privileged-seam op name (`<plugin> --privileged-op`).
 pub const OP_SHM_RESIZE: &str = "guest_mount.shm_resize";
+/// Privileged-seam op removing a raw `lxc.mount.entry` for one guest target.
+pub const OP_DROP_RAW_ENTRY: &str = "guest_mount.drop_raw_entry";
+/// orca core's settings table and the key holding this host's system id.
+const SETTINGS_TABLE: &str = "settings";
+const LOCAL_SYSTEM_ID_SETTING: &str = "host.system_id";
 
 /// Kernel network filesystems staged on the host and bound into the CT.
 const NETWORK_FSTYPES: &[&str] = &["cifs", "smb3", "smb", "nfs", "nfs4"];
@@ -86,6 +92,9 @@ struct GuestApplyArgs {
 struct GuestRemoveArgs {
     guest: String,
     target: String,
+    /// The spec's host-path source; without it only the staging bind is removed.
+    #[serde(default)]
+    source: Option<String>,
 }
 
 /// The `guest_mount` backend descriptor this plugin advertises.
@@ -116,7 +125,7 @@ pub fn dispatch(
             "guest_mount_remove" => {
                 let a = serde_json::from_value::<GuestRemoveArgs>(args)
                     .map_err(|e| err_val(format!("guest_mount_remove args: {e}")))?;
-                remove(&a.guest, &a.target)
+                remove(&a.guest, &a.target, a.source.as_deref())
                     .await
                     .map(Value::String)
                     .map_err(err_val)
@@ -138,11 +147,12 @@ async fn apply(spec: &GuestMountSpec) -> Result<String, String> {
     apply_with(&io, vmid, spec, plan).await
 }
 
-async fn remove(guest: &str, target: &str) -> Result<String, String> {
+async fn remove(guest: &str, target: &str, source: Option<&str>) -> Result<String, String> {
     let vmid = parse_vmid(guest)?;
     check_target(target)?;
     let io = PveIo::locate(vmid).await?;
-    remove_with(&io, vmid, target).await
+    let msg = remove_with(&io, vmid, target, source).await?;
+    Ok(with_sweep(&io, msg).await)
 }
 
 /// Reconcile the guest's mount for `spec` to present. Idempotent: writes only
@@ -153,10 +163,73 @@ async fn apply_with<I: GuestMountIo>(
     spec: &GuestMountSpec,
     plan: Plan<'_>,
 ) -> Result<String, String> {
-    match plan {
+    let msg = match plan {
         Plan::Bind { src, ro } => apply_bind(io, vmid, src, &spec.target, ro).await,
         Plan::Staged { ro } => apply_staged(io, vmid, spec, ro).await,
+    }?;
+    Ok(with_sweep(io, msg).await)
+}
+
+/// Append the stale-stage sweep's outcome; a failed sweep never fails the call.
+async fn with_sweep<I: GuestMountIo>(io: &I, msg: String) -> String {
+    match sweep_stages(io).await {
+        Ok(released) if released.is_empty() => msg,
+        Ok(released) => format!(
+            "{msg} Released stale host staging mount(s) {}.",
+            released.join(", ")
+        ),
+        Err(e) => format!("{msg} Stale staging sweep failed: {e}"),
     }
+}
+
+/// Release this host's staging placements for CTs on this node that no
+/// enabled guest placement stages and no `mpN` (current or pending) binds.
+/// Catches stages a remove kept while a bind delete was pending.
+async fn sweep_stages<I: GuestMountIo>(io: &I) -> Result<Vec<String>, String> {
+    let local = io.local_host().await?;
+    let placements = io.placements().await?;
+    let prefix = format!("guest-{}-", io.node());
+    let wanted = |vmid: u64, name: &str| {
+        placements.iter().any(|g| {
+            g.enabled
+                && g.host == local
+                && g.guest.as_deref().map(str::trim) == Some(vmid.to_string().as_str())
+                && stage_name(io.node(), vmid, &g.target) == name
+        })
+    };
+    let mut confs: Vec<(u64, Option<CtConf>)> = Vec::new();
+    let mut released = Vec::new();
+    for p in &placements {
+        if p.guest.is_some() || p.host != local {
+            continue;
+        }
+        let Some(vmid) = p
+            .name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.split_once('-'))
+            .and_then(|(v, _)| v.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if !p.target.starts_with(&format!("{HOST_STAGE_DIR}/{vmid}/")) || wanted(vmid, &p.name) {
+            continue;
+        }
+        let conf = match confs.iter().find(|(v, _)| *v == vmid) {
+            Some((_, c)) => c.clone(),
+            None => {
+                // An unreadable CT config keeps the stage: a bind may still use it.
+                let c = io.conf(vmid).await.ok();
+                confs.push((vmid, c.clone()));
+                c
+            }
+        };
+        if conf.is_none_or(|c| c.binds_source(&p.target)) {
+            continue;
+        }
+        io.delete_placement(&p.id).await?;
+        released.push(p.target.clone());
+    }
+    Ok(released)
 }
 
 /// A cifs/nfs share: ensure a host placement for the guest placement's share at
@@ -184,6 +257,14 @@ async fn apply_staged<I: GuestMountIo>(
                 spec.target
             )
         })?;
+    let local = io.local_host().await?;
+    if guest_row.host != local {
+        return Err(format!(
+            "CT {vmid}: guest placement for {} targets host '{}', not this orca host '{local}'; \
+             the staging mount must land on the host running the CT",
+            spec.target, guest_row.host
+        ));
+    }
     let existing = placements
         .iter()
         .find(|p| p.host == guest_row.host && p.name == name);
@@ -197,9 +278,12 @@ async fn apply_staged<I: GuestMountIo>(
         }
         Some(p) if p.enabled && p.share_id == guest_row.share_id => p.clone(),
         Some(p) => {
+            // The old health describes the previous share or a disabled mount;
+            // the bind waits for the next convergence report.
             let fixed = Placement {
                 share_id: guest_row.share_id.clone(),
                 enabled: true,
+                health: MountHealth::Missing,
                 ..p.clone()
             };
             io.update_placement(&fixed).await?;
@@ -220,7 +304,7 @@ async fn apply_staged<I: GuestMountIo>(
                 id: plugin_toolkit::mint_uuidv7(),
                 name,
                 share_id: guest_row.share_id.clone(),
-                host: guest_row.host.clone(),
+                host: local,
                 target: host_path.clone(),
                 guest: None,
                 enabled: true,
@@ -257,9 +341,11 @@ async fn apply_bind<I: GuestMountIo>(
     target: &str,
     ro: bool,
 ) -> Result<String, String> {
-    let conf = io.conf(vmid).await?;
+    let mut conf = io.conf(vmid).await?;
+    let mut notes = Vec::new();
     if conf.has_raw_entry(target) {
-        return Err(legacy_entry_error(vmid, target));
+        notes.push(drop_raw_entry(io, vmid, target).await?);
+        conf = io.conf(vmid).await?;
     }
     let on_target = conf.mps_on(target);
     if let Some(vol) = on_target.iter().find(|s| !s.is_bind()) {
@@ -312,7 +398,7 @@ async fn apply_bind<I: GuestMountIo>(
              until the CT restarts."
         ),
     };
-    Ok(if pending_deletes.is_empty() {
+    let msg = if pending_deletes.is_empty() {
         msg
     } else {
         format!(
@@ -320,32 +406,52 @@ async fn apply_bind<I: GuestMountIo>(
              [pve:pending] until the CT restarts.",
             pending_deletes.join(",")
         )
-    })
+    };
+    notes.push(msg);
+    Ok(notes.join(" "))
 }
 
-/// Releases up to v0.1.1-rc.13 wrote raw `lxc.mount.entry` lines for guest
-/// mounts. PVE has no API to drop an `lxc.*` key, so such a line is refused
-/// rather than stacked under a new `mpN`.
-fn legacy_entry_error(vmid: u64, target: &str) -> String {
-    format!(
-        "CT {vmid}: its config carries a legacy raw lxc.mount.entry for {target}; orca no longer \
-         writes or removes raw entries, so delete that line from /etc/pve/lxc/{vmid}.conf before \
-         this mount can be placed"
-    )
+/// Remove a raw `lxc.mount.entry` for `target`, so it is not stacked under an
+/// `mpN`. lxc reads it only at start, so a running CT keeps it until restart.
+async fn drop_raw_entry<I: GuestMountIo>(
+    io: &I,
+    vmid: u64,
+    target: &str,
+) -> Result<String, String> {
+    io.drop_raw_entry(vmid, target).await?;
+    Ok(format!(
+        "Removed the raw lxc.mount.entry for {target} from CT {vmid}; a running CT keeps that \
+         mount until it restarts."
+    ))
 }
 
 /// Remove the mount at `target` inside the CT. Idempotent: absent ⇒ `Ok`.
-/// Deletes every host-path bind `mpN` on `target` through the API, then the
-/// host staging placement once no bind of it is left pending.
-async fn remove_with<I: GuestMountIo>(io: &I, vmid: u64, target: &str) -> Result<String, String> {
-    let conf = io.conf(vmid).await?;
+/// Deletes the bind `mpN`s on `target` whose source is the staging path or
+/// `source`, then the host staging placement once no bind of it is left
+/// pending. Other binds at `target` are left alone.
+async fn remove_with<I: GuestMountIo>(
+    io: &I,
+    vmid: u64,
+    target: &str,
+    source: Option<&str>,
+) -> Result<String, String> {
+    let host_path = host_stage_path(vmid, target);
+    let mut msgs = Vec::new();
+    let mut conf = io.conf(vmid).await?;
+    if conf.has_raw_entry(target) {
+        msgs.push(drop_raw_entry(io, vmid, target).await?);
+        conf = io.conf(vmid).await?;
+    }
     let keys: Vec<String> = conf
         .mps_on(target)
         .iter()
         .filter(|s| s.is_bind())
+        .filter(|s| {
+            let src = s.effective().and_then(|v| parse_mp(v).src);
+            src == Some(host_path.as_str()) || (src.is_some() && src == source)
+        })
         .map(|s| s.key.clone())
         .collect();
-    let mut msgs = Vec::new();
     let mut bind_pending = false;
     if !keys.is_empty() {
         io.set_mps(vmid, &conf.digest, None, &keys).await?;
@@ -361,7 +467,6 @@ async fn remove_with<I: GuestMountIo>(io: &I, vmid: u64, target: &str) -> Result
             format!("Removed {joined} bind mount {target} from CT {vmid}.")
         });
     }
-    let host_path = host_stage_path(vmid, target);
     let name = stage_name(io.node(), vmid, target);
     let staged: Vec<Placement> = io
         .placements()
@@ -380,9 +485,6 @@ async fn remove_with<I: GuestMountIo>(io: &I, vmid: u64, target: &str) -> Result
             }
             msgs.push(format!("Released host staging mount {host_path}."));
         }
-    }
-    if conf.has_raw_entry(target) {
-        msgs.push(legacy_entry_error(vmid, target));
     }
     if msgs.is_empty() {
         msgs.push(format!("Guest mount {target} not present on CT {vmid}."));
@@ -504,6 +606,10 @@ pub(crate) trait GuestMountIo {
     async fn insert_placement(&self, p: &Placement) -> Result<(), String>;
     async fn update_placement(&self, p: &Placement) -> Result<(), String>;
     async fn delete_placement(&self, id: &str) -> Result<(), String>;
+    /// This orca host's system id, the `host` of placements it converges.
+    async fn local_host(&self) -> Result<String, String>;
+    /// Remove the CT's raw `lxc.mount.entry` for `target` ([`OP_DROP_RAW_ENTRY`]).
+    async fn drop_raw_entry(&self, vmid: u64, target: &str) -> Result<(), String>;
 }
 
 /// The columns of an orca `mounts` row guest mounts read or author.
@@ -543,10 +649,19 @@ impl MpSlot {
         self.delete || self.pending.is_some()
     }
 
+    /// A host-path bind; storage volume ids and `/dev/` device mounts are not.
     fn is_bind(&self) -> bool {
         self.effective()
             .and_then(|v| parse_mp(v).src)
-            .is_some_and(|s| s.starts_with('/'))
+            .is_some_and(|s| s.starts_with('/') && !s.starts_with("/dev/"))
+    }
+
+    /// Whether the current or pending value binds `src`.
+    fn binds(&self, src: &str) -> bool {
+        [self.value.as_deref(), self.pending.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|v| parse_mp(v).src == Some(src))
     }
 }
 
@@ -567,6 +682,10 @@ impl CtConf {
             .iter()
             .filter(|s| s.effective().and_then(|v| parse_mp(v).mp) == Some(target))
             .collect()
+    }
+
+    fn binds_source(&self, src: &str) -> bool {
+        self.mps.iter().any(|s| s.binds(src))
     }
 
     fn slot(&self, key: &str) -> Option<&MpSlot> {
@@ -834,11 +953,26 @@ impl GuestMountIo for PveIo {
     async fn delete_placement(&self, id: &str) -> Result<(), String> {
         placement_db::remove(id).map_err(|e| format!("delete host placement {id}: {e:#}"))
     }
+
+    async fn local_host(&self) -> Result<String, String> {
+        placement_db::local_host_id().map_err(|e| format!("read orca host id: {e:#}"))
+    }
+
+    async fn drop_raw_entry(&self, vmid: u64, target: &str) -> Result<(), String> {
+        let op = DropRawEntryOp {
+            vmid,
+            target: target.to_string(),
+        };
+        privileged(OP_DROP_RAW_ENTRY, &op).await.map(|_| ())
+    }
 }
 
 /// orca core's `mounts` table over `db_op`, mirroring the row `storage.mount`
 /// writes. Only config columns are written; `health` and the other per-tick
 /// columns keep their defaults and belong to the convergence loop.
+///
+/// Plugins have no plugin→core tool call yet, so rows are written directly;
+/// this moves to `tool.call storage.mount.*` with orca #794.
 mod placement_db {
     use super::*;
     use plugin_toolkit::anyhow::Result;
@@ -881,6 +1015,23 @@ mod placement_db {
             table: MOUNTS_TABLE.to_string(),
         })?;
         reply.rows.iter().map(from_dbrow).collect()
+    }
+
+    pub(super) fn local_host_id() -> Result<String> {
+        let reply = db_op(&DbOp::List {
+            namespace: String::new(),
+            table: SETTINGS_TABLE.to_string(),
+        })?;
+        for row in &reply.rows {
+            let key: String = field_from_row(row, "key")?;
+            if key == LOCAL_SYSTEM_ID_SETTING {
+                let id: String = field_from_row(row, "value")?;
+                if !id.trim().is_empty() {
+                    return Ok(id);
+                }
+            }
+        }
+        plugin_toolkit::anyhow::bail!("setting '{LOCAL_SYSTEM_ID_SETTING}' is not set")
     }
 
     pub(super) fn insert(p: &Placement) -> Result<()> {
@@ -1097,11 +1248,48 @@ pub(crate) async fn shm_resize(op: &ShmResizeOp) -> Result<RawEdit, String> {
 
 /// The closed op set this plugin serves as root in `--privileged-op` mode.
 pub fn privileged_ops() -> PrivilegedOps {
-    PrivilegedOps::new().op(OP_SHM_RESIZE, |op: ShmResizeOp| async move {
-        root_shm_resize(Path::new("/"), &op)
-            .map(|e| e.detail().to_string())
-            .map_err(plugin_toolkit::anyhow::Error::msg)
-    })
+    PrivilegedOps::new()
+        .op(OP_SHM_RESIZE, |op: ShmResizeOp| async move {
+            root_shm_resize(Path::new("/"), &op)
+                .map(|e| e.detail().to_string())
+                .map_err(plugin_toolkit::anyhow::Error::msg)
+        })
+        .op(OP_DROP_RAW_ENTRY, |op: DropRawEntryOp| async move {
+            root_drop_raw_entry(Path::new("/"), &op)
+                .map(|e| e.detail().to_string())
+                .map_err(plugin_toolkit::anyhow::Error::msg)
+        })
+}
+
+/// Payload of [`OP_DROP_RAW_ENTRY`]: `target` is the absolute guest mountpoint.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct DropRawEntryOp {
+    pub(crate) vmid: u64,
+    pub(crate) target: String,
+}
+
+/// Root side of [`OP_DROP_RAW_ENTRY`].
+fn root_drop_raw_entry(root: &Path, op: &DropRawEntryOp) -> Result<RawEdit, String> {
+    check_target(&op.target)?;
+    sweep_stale_temps_in(root, pid_alive);
+    let rel = relative_mountpoint(&op.target);
+    edit_raw_conf_in(root, op.vmid, |live| drop_mount_entry(live, &rel))
+}
+
+/// `live` without its `lxc.mount.entry` lines mounting at `rel`; `None` if none.
+fn drop_mount_entry(live: &str, rel: &str) -> Option<String> {
+    let mut dropped = false;
+    let out: String = live
+        .split_inclusive('\n')
+        .filter(|line| {
+            let hit = line
+                .strip_prefix("lxc.mount.entry:")
+                .is_some_and(|e| e.split_whitespace().nth(1) == Some(rel));
+            dropped |= hit;
+            !hit
+        })
+        .collect();
+    dropped.then_some(out)
 }
 
 /// Root side of [`OP_SHM_RESIZE`]. The memory cap is checked by the edit itself,
@@ -1547,6 +1735,15 @@ mod tests {
             self.placements.lock().unwrap().retain(|r| r.id != id);
             Ok(())
         }
+
+        async fn local_host(&self) -> Result<String, String> {
+            Ok("host-a".to_string())
+        }
+
+        async fn drop_raw_entry(&self, _vmid: u64, target: &str) -> Result<(), String> {
+            self.log(format!("drop_raw {target}"));
+            Ok(())
+        }
     }
 
     fn spec(fstype: &str, src: &str, target: &str, options: &str) -> GuestMountSpec {
@@ -1727,18 +1924,49 @@ mod tests {
     }
 
     #[test]
-    fn bind_refuses_a_legacy_raw_entry_and_surfaces_api_errors() {
+    fn bind_drops_a_raw_entry_first_and_surfaces_api_errors() {
         let raw = ["//w/a mnt/a cifs create=dir 0 0"];
-        let fake = Fake::new(vec![ct_conf(&[], &raw)]);
-        let err = bind(&fake, "/srv/a", "/mnt/a", false).unwrap_err();
-        assert!(err.contains("legacy raw lxc.mount.entry"), "{err}");
-        assert!(fake.calls().is_empty());
+        let fake = Fake::new(vec![ct_conf(&[], &raw), ct_conf(&[], &[])]);
+        let msg = bind(&fake, "/srv/a", "/mnt/a", false).unwrap();
+        assert_eq!(
+            fake.calls(),
+            [
+                "drop_raw /mnt/a",
+                r#"put [("digest", "d1"), ("mp0", "/srv/a,mp=/mnt/a")]"#
+            ]
+        );
+        assert!(msg.starts_with("Removed the raw lxc.mount.entry"), "{msg}");
 
         let mut fake = Fake::new(vec![ct_conf(&[], &[])]);
         fake.set_err = Some("HTTP 403: Permission check failed".to_string());
         let err = bind(&fake, "/srv/a", "/mnt/a", false).unwrap_err();
         assert!(err.contains("403"), "{err}");
         assert_eq!(fake.calls().len(), 1);
+    }
+
+    #[test]
+    fn device_and_volume_slots_are_not_binds() {
+        let c = ct_conf(
+            &[
+                ("mp0", Some("/dev/sdb1,mp=/mnt/a"), None, false),
+                (
+                    "mp1",
+                    Some("local-lvm:vm-110-disk-1,mp=/mnt/b"),
+                    None,
+                    false,
+                ),
+                ("mp2", Some("/srv/c,mp=/mnt/c"), None, false),
+            ],
+            &[],
+        );
+        assert!(!c.mps[0].is_bind());
+        assert!(!c.mps[1].is_bind());
+        assert!(c.mps[2].is_bind());
+
+        let fake = Fake::new(vec![c]);
+        let err = bind(&fake, "/srv/a", "/mnt/a", false).unwrap_err();
+        assert!(err.contains("/dev/sdb1"), "{err}");
+        assert!(fake.calls().is_empty());
     }
 
     #[test]
@@ -1835,9 +2063,122 @@ mod tests {
         let mut stage = placement("s1", STAGE_NAME, STAGE_PATH, None);
         stage.enabled = false;
         stage.share_id = "share-old".to_string();
+        stage.health = MountHealth::Ok;
         let fake = Fake::new(vec![ct_conf(&[], &[])]).with_placements(vec![guest_row(), stage]);
-        staged(&fake, "").unwrap();
+        let msg = staged(&fake, "").unwrap();
         assert_eq!(fake.calls(), ["update s1 share-1 true"]);
+        assert!(msg.starts_with("Staging /mnt/media"), "{msg}");
+        assert!(msg.contains("missing"), "{msg}");
+    }
+
+    #[test]
+    fn staged_refuses_a_guest_placement_for_another_host() {
+        let mut row = guest_row();
+        row.host = "host-b".to_string();
+        let fake = Fake::new(vec![ct_conf(&[], &[])]).with_placements(vec![row]);
+        let err = staged(&fake, "").unwrap_err();
+        assert!(
+            err.contains("'host-b', not this orca host 'host-a'"),
+            "{err}"
+        );
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn sweep_releases_only_unreferenced_stages_of_this_host() {
+        let stage = |id: &str, t: &str| {
+            placement(
+                id,
+                &stage_name("pve1", 110, t),
+                &host_stage_path(110, t),
+                None,
+            )
+        };
+        let referenced = host_stage_path(110, "/mnt/held");
+        let mut foreign = stage("f1", "/mnt/foreign");
+        foreign.host = "host-b".to_string();
+        let mut other_node = stage("n1", "/mnt/other");
+        other_node.name = stage_name("pve2", 110, "/mnt/other");
+        let fake = Fake::new(vec![ct_conf(
+            &[(
+                "mp0",
+                Some(format!("{referenced},mp=/mnt/held").as_str()),
+                None,
+                true,
+            )],
+            &[],
+        )])
+        .with_placements(vec![
+            guest_row(),
+            stage("s1", "/mnt/media"),
+            stage("s2", "/mnt/gone"),
+            stage("s3", "/mnt/held"),
+            foreign,
+            other_node,
+        ]);
+        let released = rt().block_on(sweep_stages(&fake)).unwrap();
+        assert_eq!(released, [host_stage_path(110, "/mnt/gone")]);
+        assert_eq!(fake.calls(), ["delete s2"]);
+    }
+
+    #[test]
+    fn remove_drops_a_raw_entry_and_leaves_foreign_binds() {
+        let before = ct_conf(
+            &[
+                (
+                    "mp0",
+                    Some(format!("{STAGE_PATH},mp=/mnt/media").as_str()),
+                    None,
+                    false,
+                ),
+                ("mp1", Some("/srv/other,mp=/mnt/media"), None, false),
+                ("mp2", Some("/srv/mine,mp=/mnt/media"), None, false),
+            ],
+            &["//w/m mnt/media cifs create=dir 0 0"],
+        );
+        let fake = Fake::new(vec![before.clone(), before.clone(), before]);
+        rt().block_on(remove_with(&fake, 110, "/mnt/media", Some("/srv/mine")))
+            .unwrap();
+        assert_eq!(
+            fake.calls(),
+            [
+                "drop_raw /mnt/media",
+                r#"put [("digest", "d1"), ("delete", "mp0,mp2")]"#
+            ]
+        );
+    }
+
+    #[test]
+    fn root_drop_raw_entry_removes_only_the_live_target_line() {
+        let conf = "arch: amd64\n\
+                    lxc.mount.entry: //w/a mnt/a cifs create=dir 0 0\n\
+                    lxc.mount.entry: //w/b mnt/ab cifs create=dir 0 0\n\
+                    [snap1]\n\
+                    lxc.mount.entry: //w/a mnt/a cifs create=dir 0 0\n";
+        let root = pve_root("dropraw", 120, conf);
+        let op = |target: &str| DropRawEntryOp {
+            vmid: 120,
+            target: target.to_string(),
+        };
+        assert_eq!(
+            root_drop_raw_entry(&root, &op("/mnt/a")).unwrap(),
+            RawEdit::Written
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("etc/pve/lxc/120.conf")).unwrap(),
+            "arch: amd64\n\
+             lxc.mount.entry: //w/b mnt/ab cifs create=dir 0 0\n\
+             [snap1]\n\
+             lxc.mount.entry: //w/a mnt/a cifs create=dir 0 0\n"
+        );
+        assert_eq!(
+            root_drop_raw_entry(&root, &op("/mnt/a")).unwrap(),
+            RawEdit::Unchanged
+        );
+        for bad in ["mnt/a", "/mnt/../etc", "/mnt/a b", ""] {
+            assert!(root_drop_raw_entry(&root, &op(bad)).is_err(), "{bad}");
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -1879,7 +2220,7 @@ mod tests {
             placement("s1", STAGE_NAME, STAGE_PATH, None),
         ]);
         let msg = rt()
-            .block_on(remove_with(&fake, 110, "/mnt/media"))
+            .block_on(remove_with(&fake, 110, "/mnt/media", None))
             .unwrap();
         assert_eq!(
             fake.calls(),
@@ -1892,7 +2233,9 @@ mod tests {
         assert!(msg.contains("Released host staging mount"), "{msg}");
 
         let fake = Fake::new(vec![ct_conf(&[], &[])]);
-        let msg = rt().block_on(remove_with(&fake, 110, "/mnt/a")).unwrap();
+        let msg = rt()
+            .block_on(remove_with(&fake, 110, "/mnt/a", None))
+            .unwrap();
         assert!(fake.calls().is_empty());
         assert!(msg.contains("not present"), "{msg}");
     }
@@ -1905,7 +2248,7 @@ mod tests {
         let fake = Fake::new(vec![before, after])
             .with_placements(vec![placement("s1", STAGE_NAME, STAGE_PATH, None)]);
         let msg = rt()
-            .block_on(remove_with(&fake, 110, "/mnt/media"))
+            .block_on(remove_with(&fake, 110, "/mnt/media", None))
             .unwrap();
         assert_eq!(fake.calls().len(), 1);
         assert_eq!(fake.rows().len(), 1);
