@@ -92,7 +92,7 @@ struct GuestApplyArgs {
 struct GuestRemoveArgs {
     guest: String,
     target: String,
-    /// The spec's host-path source; without it only the staging bind is removed.
+    /// The spec's host-path source; without it every path bind at `target` is removed.
     #[serde(default)]
     source: Option<String>,
 }
@@ -197,7 +197,7 @@ async fn sweep_stages<I: GuestMountIo>(io: &I) -> Result<Vec<String>, String> {
                 && stage_name(io.node(), vmid, &g.target) == name
         })
     };
-    let mut confs: Vec<(u64, Option<CtConf>)> = Vec::new();
+    let mut confs: Vec<(u64, Result<Option<CtConf>, ()>)> = Vec::new();
     let mut released = Vec::new();
     for p in &placements {
         if p.guest.is_some() || p.host != local {
@@ -217,14 +217,21 @@ async fn sweep_stages<I: GuestMountIo>(io: &I) -> Result<Vec<String>, String> {
         let conf = match confs.iter().find(|(v, _)| *v == vmid) {
             Some((_, c)) => c.clone(),
             None => {
-                // An unreadable CT config keeps the stage: a bind may still use it.
-                let c = io.conf(vmid).await.ok();
+                // Only a CT PVE says is gone frees its stage; any other read
+                // failure keeps it, since a bind may still use it.
+                let c = match io.conf(vmid).await {
+                    Ok(c) => Ok(Some(c)),
+                    Err(e) if ct_missing(&e) => Ok(None),
+                    Err(_) => Err(()),
+                };
                 confs.push((vmid, c.clone()));
                 c
             }
         };
-        if conf.is_none_or(|c| c.binds_source(&p.target)) {
-            continue;
+        match conf {
+            Err(()) => continue,
+            Ok(Some(c)) if c.binds_source(&p.target) => continue,
+            Ok(_) => {}
         }
         io.delete_placement(&p.id).await?;
         released.push(p.target.clone());
@@ -344,8 +351,18 @@ async fn apply_bind<I: GuestMountIo>(
     let mut conf = io.conf(vmid).await?;
     let mut notes = Vec::new();
     if conf.has_raw_entry(target) {
-        notes.push(drop_raw_entry(io, vmid, target).await?);
-        conf = io.conf(vmid).await?;
+        let (after, edit, note) = drop_raw_entry(io, vmid, target).await?;
+        conf = after;
+        notes.push(note);
+        // lxc keeps a dropped raw mount live until the CT restarts; an mpN set
+        // now would stack over it.
+        if edit == RawEdit::Written && io.running(vmid).await? {
+            notes.push(format!(
+                "Restart required: CT {vmid} is running, so {target} is bound on the next \
+                 apply after it restarts."
+            ));
+            return Ok(notes.join(" "));
+        }
     }
     let on_target = conf.mps_on(target);
     if let Some(vol) = on_target.iter().find(|s| !s.is_bind()) {
@@ -412,35 +429,54 @@ async fn apply_bind<I: GuestMountIo>(
 }
 
 /// Remove a raw `lxc.mount.entry` for `target`, so it is not stacked under an
-/// `mpN`. lxc reads it only at start, so a running CT keeps it until restart.
+/// `mpN`, and return the re-read config. lxc reads it only at start, so a
+/// running CT keeps it until restart.
 async fn drop_raw_entry<I: GuestMountIo>(
     io: &I,
     vmid: u64,
     target: &str,
-) -> Result<String, String> {
-    io.drop_raw_entry(vmid, target).await?;
-    Ok(format!(
-        "Removed the raw lxc.mount.entry for {target} from CT {vmid}; a running CT keeps that \
-         mount until it restarts."
-    ))
+) -> Result<(CtConf, RawEdit, String), String> {
+    let edit = io.drop_raw_entry(vmid, target).await?;
+    let conf = io.conf(vmid).await?;
+    if conf.has_raw_entry(target) {
+        return Err(format!(
+            "CT {vmid}: a raw lxc.mount.entry for {target} is still in the config after the \
+             drop ({}); remove it by hand",
+            edit.detail()
+        ));
+    }
+    let note = match edit {
+        RawEdit::Written => format!(
+            "Removed the raw lxc.mount.entry for {target} from CT {vmid}; a running CT keeps \
+             that mount until it restarts."
+        ),
+        RawEdit::Unchanged => format!(
+            "The raw lxc.mount.entry for {target} on CT {vmid} was already gone from its config."
+        ),
+    };
+    Ok((conf, edit, note))
 }
 
 /// Remove the mount at `target` inside the CT. Idempotent: absent ⇒ `Ok`.
 /// Deletes the bind `mpN`s on `target` whose source is the staging path or
-/// `source`, then the host staging placement once no bind of it is left
-/// pending. Other binds at `target` are left alone.
+/// `source` (every path bind there when `source` is `None`), then the host
+/// staging placement once no bind of it is left pending.
 async fn remove_with<I: GuestMountIo>(
     io: &I,
     vmid: u64,
     target: &str,
     source: Option<&str>,
 ) -> Result<String, String> {
+    if let Some(src) = source {
+        check_abs_path("source", src)?;
+    }
     let host_path = host_stage_path(vmid, target);
     let mut msgs = Vec::new();
     let mut conf = io.conf(vmid).await?;
     if conf.has_raw_entry(target) {
-        msgs.push(drop_raw_entry(io, vmid, target).await?);
-        conf = io.conf(vmid).await?;
+        let (after, _, note) = drop_raw_entry(io, vmid, target).await?;
+        conf = after;
+        msgs.push(note);
     }
     let keys: Vec<String> = conf
         .mps_on(target)
@@ -448,7 +484,7 @@ async fn remove_with<I: GuestMountIo>(
         .filter(|s| s.is_bind())
         .filter(|s| {
             let src = s.effective().and_then(|v| parse_mp(v).src);
-            src == Some(host_path.as_str()) || (src.is_some() && src == source)
+            src.is_some() && (source.is_none() || src == Some(host_path.as_str()) || src == source)
         })
         .map(|s| s.key.clone())
         .collect();
@@ -609,7 +645,9 @@ pub(crate) trait GuestMountIo {
     /// This orca host's system id, the `host` of placements it converges.
     async fn local_host(&self) -> Result<String, String>;
     /// Remove the CT's raw `lxc.mount.entry` for `target` ([`OP_DROP_RAW_ENTRY`]).
-    async fn drop_raw_entry(&self, vmid: u64, target: &str) -> Result<(), String>;
+    async fn drop_raw_entry(&self, vmid: u64, target: &str) -> Result<RawEdit, String>;
+    /// Whether the CT is running.
+    async fn running(&self, vmid: u64) -> Result<bool, String>;
 }
 
 /// The columns of an orca `mounts` row guest mounts read or author.
@@ -686,6 +724,10 @@ impl CtConf {
 
     fn binds_source(&self, src: &str) -> bool {
         self.mps.iter().any(|s| s.binds(src))
+            || self
+                .raw_entries
+                .iter()
+                .any(|e| e.split_whitespace().next().map(|f| f.trim_end_matches('/')) == Some(src))
     }
 
     fn slot(&self, key: &str) -> Option<&MpSlot> {
@@ -703,7 +745,7 @@ impl CtConf {
         let rel = relative_mountpoint(target);
         self.raw_entries
             .iter()
-            .any(|e| e.split_whitespace().nth(1) == Some(rel.as_str()))
+            .any(|e| entry_mountpoint(e) == Some(rel.as_str()))
     }
 }
 
@@ -958,12 +1000,18 @@ impl GuestMountIo for PveIo {
         placement_db::local_host_id().map_err(|e| format!("read orca host id: {e:#}"))
     }
 
-    async fn drop_raw_entry(&self, vmid: u64, target: &str) -> Result<(), String> {
+    async fn drop_raw_entry(&self, vmid: u64, target: &str) -> Result<RawEdit, String> {
         let op = DropRawEntryOp {
             vmid,
             target: target.to_string(),
         };
-        privileged(OP_DROP_RAW_ENTRY, &op).await.map(|_| ())
+        privileged(OP_DROP_RAW_ENTRY, &op).await
+    }
+
+    async fn running(&self, vmid: u64) -> Result<bool, String> {
+        let http = self.cfg.build_reqwest_client().map_err(|e| e.to_string())?;
+        let status = get_data(&http, &format!("{}/status/current", self.ct_url(vmid))).await?;
+        Ok(status.get("status").and_then(Value::as_str) == Some("running"))
     }
 }
 
@@ -1130,6 +1178,12 @@ fn config_put_pairs(
     pairs
 }
 
+/// Whether a [`get_data`] error is PVE saying the CT does not exist: 404, or
+/// the 500 its config loader answers for a missing vmid.
+fn ct_missing(err: &str) -> bool {
+    err.contains(": HTTP 404:") || (err.contains(": HTTP 500:") && err.contains("does not exist"))
+}
+
 /// `GET url` and return its `data`.
 async fn get_data(http: &reqwest::Client, url: &str) -> Result<Value, String> {
     let resp = http
@@ -1282,9 +1336,7 @@ fn drop_mount_entry(live: &str, rel: &str) -> Option<String> {
     let out: String = live
         .split_inclusive('\n')
         .filter(|line| {
-            let hit = line
-                .strip_prefix("lxc.mount.entry:")
-                .is_some_and(|e| e.split_whitespace().nth(1) == Some(rel));
+            let hit = raw_mount_entry_value(line).and_then(entry_mountpoint) == Some(rel);
             dropped |= hit;
             !hit
         })
@@ -1393,6 +1445,31 @@ fn slug(target: &str) -> String {
 /// `lxc.mount.entry` mountpoint is relative to the guest rootfs.
 fn relative_mountpoint(target: &str) -> String {
     target.trim_start_matches('/').to_string()
+}
+
+/// The value of a conf line PVE parses as `lxc.mount.entry`
+/// (`^\s*lxc.mount.entry\s*[:=]`).
+fn raw_mount_entry_value(line: &str) -> Option<&str> {
+    let rest = line
+        .trim_start()
+        .strip_prefix("lxc.mount.entry")?
+        .trim_start();
+    rest.strip_prefix([':', '='])
+}
+
+/// An `lxc.mount.entry`'s mountpoint field, normalized: lxc resolves it
+/// against the rootfs, so `./mnt/a`, `/mnt/a` and `mnt/a/` all name `mnt/a`.
+fn entry_mountpoint(entry: &str) -> Option<&str> {
+    let mut mp = entry.split_whitespace().nth(1)?;
+    loop {
+        let next = mp.trim_start_matches('/');
+        let next = next.strip_prefix("./").unwrap_or(next);
+        if next == mp {
+            break;
+        }
+        mp = next;
+    }
+    Some(mp.trim_end_matches('/'))
 }
 
 // ── Safe file writes ────────────────────────────────────────────────────────
@@ -1654,6 +1731,9 @@ mod tests {
         confs: Mutex<Vec<CtConf>>,
         placements: Mutex<Vec<Placement>>,
         set_err: Option<String>,
+        conf_err: Option<String>,
+        running: bool,
+        drop_result: RawEdit,
         calls: Mutex<Vec<String>>,
     }
 
@@ -1663,6 +1743,9 @@ mod tests {
                 confs: Mutex::new(confs),
                 placements: Mutex::new(Vec::new()),
                 set_err: None,
+                conf_err: None,
+                running: false,
+                drop_result: RawEdit::Written,
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -1691,6 +1774,9 @@ mod tests {
         }
 
         async fn conf(&self, _vmid: u64) -> Result<CtConf, String> {
+            if let Some(e) = &self.conf_err {
+                return Err(e.clone());
+            }
             let mut confs = self.confs.lock().unwrap();
             Ok(if confs.len() > 1 {
                 confs.remove(0)
@@ -1740,9 +1826,17 @@ mod tests {
             Ok("host-a".to_string())
         }
 
-        async fn drop_raw_entry(&self, _vmid: u64, target: &str) -> Result<(), String> {
+        async fn drop_raw_entry(&self, _vmid: u64, target: &str) -> Result<RawEdit, String> {
             self.log(format!("drop_raw {target}"));
-            Ok(())
+            Ok(if self.drop_result == RawEdit::Written {
+                RawEdit::Written
+            } else {
+                RawEdit::Unchanged
+            })
+        }
+
+        async fn running(&self, _vmid: u64) -> Result<bool, String> {
+            Ok(self.running)
         }
     }
 
@@ -2136,7 +2230,11 @@ mod tests {
             ],
             &["//w/m mnt/media cifs create=dir 0 0"],
         );
-        let fake = Fake::new(vec![before.clone(), before.clone(), before]);
+        let dropped = CtConf {
+            raw_entries: Vec::new(),
+            ..before.clone()
+        };
+        let fake = Fake::new(vec![before, dropped]);
         rt().block_on(remove_with(&fake, 110, "/mnt/media", Some("/srv/mine")))
             .unwrap();
         assert_eq!(
@@ -2146,6 +2244,151 @@ mod tests {
                 r#"put [("digest", "d1"), ("delete", "mp0,mp2")]"#
             ]
         );
+    }
+
+    #[test]
+    fn remove_without_source_deletes_every_path_bind_at_the_target() {
+        let c = ct_conf(
+            &[
+                (
+                    "mp0",
+                    Some(format!("{STAGE_PATH},mp=/mnt/media").as_str()),
+                    None,
+                    false,
+                ),
+                ("mp1", Some("/srv/other,mp=/mnt/media"), None, false),
+                (
+                    "mp2",
+                    Some("local-lvm:vm-110-disk-1,mp=/mnt/media"),
+                    None,
+                    false,
+                ),
+            ],
+            &[],
+        );
+        let fake = Fake::new(vec![c, ct_conf(&[], &[])]);
+        let msg = rt()
+            .block_on(remove_with(&fake, 110, "/mnt/media", None))
+            .unwrap();
+        assert_eq!(
+            fake.calls(),
+            [r#"put [("digest", "d1"), ("delete", "mp0,mp1")]"#]
+        );
+        assert!(!msg.contains("not present"), "{msg}");
+
+        for bad in ["srv/x", "/srv/../etc", "/srv/x/"] {
+            let fake = Fake::new(vec![ct_conf(&[], &[])]);
+            assert!(
+                rt().block_on(remove_with(&fake, 110, "/mnt/media", Some(bad)))
+                    .is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_entry_forms_match_on_both_sides() {
+        for e in [
+            "//w/a mnt/a cifs 0 0",
+            "//w/a ./mnt/a cifs 0 0",
+            "//w/a /mnt/a/ cifs 0 0",
+            "  //w/a .//mnt/a cifs 0 0",
+        ] {
+            assert!(ct_conf(&[], &[e]).has_raw_entry("/mnt/a"), "{e}");
+        }
+        assert!(!ct_conf(&[], &["//w/a mnt/ab cifs 0 0"]).has_raw_entry("/mnt/a"));
+        for line in [
+            "lxc.mount.entry: //w/a mnt/a cifs 0 0\n",
+            "  lxc.mount.entry = //w/a ./mnt/a cifs 0 0\n",
+            "lxc.mount.entry=//w/a /mnt/a/ cifs 0 0\n",
+            "\tlxc.mount.entry  :  //w/a mnt/a/ cifs 0 0\n",
+        ] {
+            assert_eq!(
+                drop_mount_entry(&format!("arch: amd64\n{line}"), "mnt/a").as_deref(),
+                Some("arch: amd64\n"),
+                "{line}"
+            );
+        }
+        assert_eq!(
+            drop_mount_entry("lxc.mount.entry.x: a mnt/a b 0 0\n", "mnt/a"),
+            None
+        );
+    }
+
+    #[test]
+    fn bind_surfaces_an_unchanged_drop_and_errors_if_the_entry_stays() {
+        let raw = ["//w/a mnt/a cifs 0 0"];
+        let mut fake = Fake::new(vec![ct_conf(&[], &raw), ct_conf(&[], &[])]);
+        fake.drop_result = RawEdit::Unchanged;
+        let msg = bind(&fake, "/srv/a", "/mnt/a", false).unwrap();
+        assert!(msg.contains("already gone"), "{msg}");
+        assert!(!msg.contains("Removed the raw"), "{msg}");
+
+        let fake = Fake::new(vec![ct_conf(&[], &raw)]);
+        let err = bind(&fake, "/srv/a", "/mnt/a", false).unwrap_err();
+        assert!(err.contains("still in the config"), "{err}");
+        assert_eq!(fake.calls(), ["drop_raw /mnt/a"]);
+    }
+
+    #[test]
+    fn bind_waits_for_a_restart_after_dropping_a_running_cts_raw_entry() {
+        let raw = ["//w/a mnt/a cifs 0 0"];
+        let mut fake = Fake::new(vec![ct_conf(&[], &raw), ct_conf(&[], &[])]);
+        fake.running = true;
+        let msg = bind(&fake, "/srv/a", "/mnt/a", false).unwrap();
+        assert_eq!(fake.calls(), ["drop_raw /mnt/a"]);
+        assert!(msg.contains("Restart required"), "{msg}");
+
+        fake.calls.lock().unwrap().clear();
+        let msg = bind(&fake, "/srv/a", "/mnt/a", false).unwrap();
+        assert_eq!(
+            fake.calls(),
+            [r#"put [("digest", "d1"), ("mp0", "/srv/a,mp=/mnt/a")]"#]
+        );
+        assert!(msg.starts_with("Set mp0"), "{msg}");
+    }
+
+    #[test]
+    fn sweep_releases_a_stage_only_when_its_ct_is_gone() {
+        let rows = || {
+            vec![placement(
+                "s1",
+                &stage_name("pve1", 110, "/mnt/x"),
+                &host_stage_path(110, "/mnt/x"),
+                None,
+            )]
+        };
+        let sweep = |err: &str| {
+            let mut fake = Fake::new(vec![ct_conf(&[], &[])]).with_placements(rows());
+            fake.conf_err = Some(err.to_string());
+            rt().block_on(sweep_stages(&fake)).unwrap()
+        };
+        assert_eq!(
+            sweep("GET u: HTTP 500: Configuration file 'nodes/pve1/lxc/110.conf' does not exist"),
+            [host_stage_path(110, "/mnt/x")]
+        );
+        assert_eq!(
+            sweep("GET u: HTTP 404: no such"),
+            [host_stage_path(110, "/mnt/x")]
+        );
+        assert!(sweep("GET u: HTTP 401: no ticket").is_empty());
+        assert!(sweep("GET u: HTTP 500: proxy timeout").is_empty());
+        assert!(sweep("GET u: error sending request").is_empty());
+    }
+
+    #[test]
+    fn sweep_counts_a_raw_entry_on_the_stage_as_a_reference() {
+        let path = host_stage_path(110, "/mnt/x");
+        let rows = vec![placement(
+            "s1",
+            &stage_name("pve1", 110, "/mnt/x"),
+            &path,
+            None,
+        )];
+        let entry = format!("{path} mnt/x none bind 0 0");
+        let fake = Fake::new(vec![ct_conf(&[], &[entry.as_str()])]).with_placements(rows);
+        assert!(rt().block_on(sweep_stages(&fake)).unwrap().is_empty());
+        assert!(fake.calls().is_empty());
     }
 
     #[test]
