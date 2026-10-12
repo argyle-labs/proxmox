@@ -146,16 +146,31 @@ fn err_val(msg: impl Into<String>) -> serde_json::Value {
 async fn apply(spec: &GuestMountSpec) -> Result<String, String> {
     let vmid = parse_vmid(&spec.guest)?;
     let plan = classify(spec)?;
-    let io = PveIo::locate(vmid).await?;
+    let io = PveIo::locate(vmid)
+        .await?
+        .ok_or_else(|| format!("guest {vmid}: no enabled proxmox endpoint hosts this LXC"))?;
     apply_with(&io, vmid, spec, plan).await
 }
 
+/// Idempotent: a guest that is not an LXC vmid, or that no endpoint hosts
+/// (destroyed), has nothing mounted to remove.
 async fn remove(guest: &str, target: &str, source: Option<&str>) -> Result<String, String> {
-    let vmid = parse_vmid(guest)?;
     check_target(target)?;
-    let io = PveIo::locate(vmid).await?;
-    let msg = remove_with(&io, vmid, target, source).await?;
+    let Ok(vmid) = parse_vmid(guest) else {
+        return Ok(not_present(guest, target));
+    };
+    let Some(io) = PveIo::locate(vmid).await? else {
+        return Ok(not_present(guest, target));
+    };
+    let msg = match remove_with(&io, vmid, target, source).await {
+        Err(e) if ct_missing(&e) => return Ok(not_present(guest, target)),
+        r => r?,
+    };
     Ok(with_sweep(&io, msg).await)
+}
+
+fn not_present(guest: &str, target: &str) -> String {
+    format!("guest {guest} not present; no mount at {target} to remove")
 }
 
 /// Reconcile the guest's mount for `spec` to present. Idempotent: writes only
@@ -536,10 +551,19 @@ async fn remove_with<I: GuestMountIo>(
     target: &str,
     source: Option<&str>,
 ) -> Result<String, String> {
-    if let Some(src) = source {
-        check_abs_path("source", src)?;
-    }
     let host_path = host_stage_path(vmid, target);
+    let source = match source {
+        // A network share address names what is staged, which only the staging bind carries.
+        Some(src) if is_share_addr(src) => {
+            check_token("source", src)?;
+            Some(host_path.as_str())
+        }
+        Some(src) => {
+            check_abs_path("source", src)?;
+            Some(src)
+        }
+        None => None,
+    };
     let mut msgs = Vec::new();
     let mut conf = io.conf(vmid).await?;
     let mut held = false;
@@ -677,6 +701,11 @@ fn check_abs_path(what: &str, p: &str) -> Result<(), String> {
         return Err(format!("{what} '{p}' is not a normalized absolute path"));
     }
     Ok(())
+}
+
+/// `host:/export` (NFS) or `//host/share` (SMB).
+fn is_share_addr(s: &str) -> bool {
+    s.starts_with("//") || (!s.starts_with('/') && s.contains(':'))
 }
 
 fn check_target(target: &str) -> Result<(), String> {
@@ -895,19 +924,22 @@ struct EndpointHit<C> {
     cfg: C,
 }
 
-/// The one endpoint to use for a CT on `local`.
+/// The one endpoint to use for a CT on `local`; `None` when every endpoint
+/// answered and none has the CT. An endpoint that failed may still host it, so
+/// any failure without a hit is an error.
 fn pick_endpoint<C>(
     vmid: u64,
     local: &str,
     hits: Vec<EndpointHit<C>>,
     errors: &[String],
-) -> Result<EndpointHit<C>, String> {
+) -> Result<Option<EndpointHit<C>>, String> {
     let (mut here, elsewhere): (Vec<_>, Vec<_>) = hits.into_iter().partition(|h| h.node == local);
     if here.len() > 1 && here.iter().any(|h| h.url_local) {
         here.retain(|h| h.url_local);
     }
     match here.len() {
-        1 => Ok(here.remove(0)),
+        1 => Ok(Some(here.remove(0))),
+        0 if elsewhere.is_empty() && errors.is_empty() => Ok(None),
         0 => match elsewhere.first() {
             Some(h) => Err(format!(
                 "CT {vmid} runs on node '{}' but this proxmox plugin runs on '{local}'; apply \
@@ -966,19 +998,25 @@ impl PveIo {
     /// Find the endpoint that hosts LXC `vmid` on this node: the staging mount
     /// lands on this host. Endpoints that see the CT on another node are
     /// skipped; when several see it here, the one whose URL is this host wins.
-    async fn locate(vmid: u64) -> Result<Self, String> {
+    async fn locate(vmid: u64) -> Result<Option<Self>, String> {
         let local = crate::diagnostics::local_node();
+        let names = crate::tools::enabled_endpoint_names();
+        if names.is_empty() {
+            return Err(format!("guest {vmid}: no enabled proxmox endpoint"));
+        }
         let mut hits = Vec::new();
         let mut errors = Vec::new();
-        for name in crate::tools::enabled_endpoint_names() {
+        for name in names {
             let found = async {
                 let cfg = crate::tools::resolve_config(&name).await?;
-                let ct = crate::lxc_guest::find_ct(&cfg.build_generated_client()?, vmid).await?;
+                let ct =
+                    crate::lxc_guest::find_ct_opt(&cfg.build_generated_client()?, vmid).await?;
                 Ok::<_, plugin_toolkit::anyhow::Error>((cfg, ct))
             }
             .await;
             match found {
-                Ok((cfg, ct)) => hits.push(EndpointHit {
+                Ok((_, None)) => {}
+                Ok((cfg, Some(ct))) => hits.push(EndpointHit {
                     url_local: url_is_this_host(&cfg.base_url).await,
                     endpoint: name,
                     node: ct.node,
@@ -987,12 +1025,11 @@ impl PveIo {
                 Err(e) => errors.push(format!("{name}: {e:#}")),
             }
         }
-        let hit = pick_endpoint(vmid, &local, hits, &errors)?;
-        Ok(Self {
+        Ok(pick_endpoint(vmid, &local, hits, &errors)?.map(|hit| Self {
             endpoint: hit.endpoint,
             cfg: hit.cfg,
             node: hit.node,
-        })
+        }))
     }
 
     fn ct_url(&self, vmid: u64) -> String {
@@ -2989,7 +3026,7 @@ mod tests {
 
     #[test]
     fn locate_skips_remote_hits_and_prefers_a_local_url() {
-        let pick = |hits| pick_endpoint(110, "pve1", hits, &[]).map(|h| h.endpoint);
+        let pick = |hits| pick_endpoint(110, "pve1", hits, &[]).map(|h| h.unwrap().endpoint);
         assert_eq!(
             pick(vec![
                 hit("remote", "pve2", false),
@@ -3009,9 +3046,69 @@ mod tests {
         let err = pick(vec![hit("remote", "pve2", false)]).unwrap_err();
         assert!(err.contains("runs on node 'pve2'"), "{err}");
         let err = pick_endpoint::<()>(110, "pve1", vec![], &["x: down".to_string()])
-            .map(|h| h.endpoint)
+            .map(|h| h.is_some())
             .unwrap_err();
         assert!(err.contains("x: down"), "{err}");
+    }
+
+    #[test]
+    fn pick_endpoint_reports_absent_only_when_every_endpoint_answered() {
+        assert!(
+            pick_endpoint::<()>(110, "pve1", vec![], &[])
+                .unwrap()
+                .is_none()
+        );
+        let err = pick_endpoint::<()>(110, "pve1", vec![], &["x: HTTP 401".to_string()])
+            .map(|h| h.is_some())
+            .unwrap_err();
+        assert!(err.contains("HTTP 401"), "{err}");
+        let err = pick_endpoint(110, "pve1", vec![hit("remote", "pve2", false)], &[])
+            .map(|h| h.is_some())
+            .unwrap_err();
+        assert!(err.contains("orca instance on 'pve2'"), "{err}");
+    }
+
+    #[test]
+    fn remove_of_a_non_lxc_guest_is_not_present() {
+        let msg = rt()
+            .block_on(remove("my-host", "/mnt/media", None))
+            .unwrap();
+        assert!(msg.contains("not present"), "{msg}");
+        assert!(rt().block_on(remove("my-host", "mnt", None)).is_err());
+    }
+
+    #[test]
+    fn remove_with_a_share_source_matches_the_staging_bind() {
+        let c = ct_conf(
+            &[
+                (
+                    "mp0",
+                    Some(format!("{STAGE_PATH},mp=/mnt/media").as_str()),
+                    None,
+                    false,
+                ),
+                ("mp1", Some("/srv/mine,mp=/mnt/media"), None, false),
+            ],
+            &[],
+        );
+        let fake = Fake::new(vec![c, ct_conf(&[], &[])]);
+        rt().block_on(remove_with(
+            &fake,
+            110,
+            "/mnt/media",
+            Some("10.0.0.1:/export"),
+        ))
+        .unwrap();
+        assert_eq!(
+            fake.calls(),
+            [r#"put [("digest", "d1"), ("delete", "mp0")]"#]
+        );
+        for addr in ["//10.0.0.1/share", "10.0.0.1:/export"] {
+            assert!(is_share_addr(addr), "{addr}");
+        }
+        for path in ["/srv/x", "srv/x"] {
+            assert!(!is_share_addr(path), "{path}");
+        }
     }
 
     #[test]

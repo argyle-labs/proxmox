@@ -377,27 +377,33 @@ pub struct CtRef {
 
 /// Find LXC `vmid` in the cluster; an id that is a VM is an error.
 pub async fn find_ct(client: &generated::Client, vmid: u64) -> Result<CtRef> {
+    find_ct_opt(client, vmid)
+        .await?
+        .ok_or_else(|| anyhow!("no guest {vmid} in the cluster"))
+}
+
+/// [`find_ct`], with `None` when the cluster has no guest `vmid`.
+pub async fn find_ct_opt(client: &generated::Client, vmid: u64) -> Result<Option<CtRef>> {
     use gtypes::GetResourcesClusterResourcesResponseItemType as Kind;
     let items = client
         .get_resources_cluster_resources(Some(gtypes::GetResourcesClusterResourcesType::Vm))
         .await
         .map_err(|e| anyhow!("cluster resources: {e}"))?
         .into_inner();
-    let item = items
-        .into_iter()
-        .find(|i| i.vmid == Some(vmid as i64))
-        .ok_or_else(|| anyhow!("no guest {vmid} in the cluster"))?;
+    let Some(item) = items.into_iter().find(|i| i.vmid == Some(vmid as i64)) else {
+        return Ok(None);
+    };
     if item.type_ != Kind::Lxc {
         bail!("guest {vmid} is not an LXC container; this operation is LXC-only");
     }
-    Ok(CtRef {
+    Ok(Some(CtRef {
         node: item
             .node
             .ok_or_else(|| anyhow!("guest {vmid} reports no node"))?,
         vmid,
         name: item.name,
         running: item.status.as_deref() == Some("running"),
-    })
+    }))
 }
 
 /// In-container ops run `pct` on this node, so the container must live here.
