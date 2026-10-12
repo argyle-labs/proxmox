@@ -25,7 +25,7 @@
 //!   CLI) for `lxc.*` keys, so this is the escape hatch: the plugin runs as the
 //!   unprivileged orca user, so the edit of `/etc/pve/lxc/<vmid>.conf` (and the
 //!   root-owned creds file) runs as root through orca's verified `admin
-//!   plugin-apply` seam ([`privileged_ops`]). There [`edit_raw_conf`] holds PVE's
+//!   plugin-apply` seam ([`privileged_ops`]). There [`edit_raw_conf_in`] holds PVE's
 //!   own per-CT config flock, re-reads the file under it, edits only the live
 //!   section, and replaces it atomically. A changed line on a running CT takes
 //!   effect on its next restart; that is reported as pending, never forced.
@@ -75,6 +75,7 @@ const ROOT_USER: &str = "root@pam";
 /// Privileged-seam op names (`<plugin> --privileged-op`).
 pub const OP_SET_ENTRY: &str = "guest_mount.set_entry";
 pub const OP_STRIP_ENTRY: &str = "guest_mount.strip_entry";
+pub const OP_SHM_RESIZE: &str = "guest_mount.shm_resize";
 
 /// Option keys that carry a credential and must never be rendered inline into
 /// the config — resolved into the root-owned creds file instead.
@@ -916,6 +917,33 @@ pub(crate) struct StripEntryOp {
     target: String,
 }
 
+/// Payload of [`OP_SHM_RESIZE`]: the `size=` of a CT's tmpfs `lxc.mount.entry`,
+/// which has no PVE API. `target` is the entry's relative mountpoint (`dev/shm`).
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ShmResizeOp {
+    pub(crate) vmid: u64,
+    pub(crate) target: String,
+    pub(crate) size_mb: u64,
+}
+
+impl ShmResizeOp {
+    fn validate(&self) -> Result<(), String> {
+        if self.target.starts_with('/') {
+            return Err(format!("tmpfs target '{}' must be relative", self.target));
+        }
+        check_abs_path("tmpfs target", &format!("/{}", self.target))?;
+        if self.size_mb == 0 {
+            return Err("tmpfs size must be > 0 MiB".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Resize a CT's tmpfs through orca's privileged seam.
+pub(crate) async fn shm_resize(op: &ShmResizeOp) -> Result<RawEdit, String> {
+    privileged(OP_SHM_RESIZE, op).await
+}
+
 /// The closed op set this plugin serves as root in `--privileged-op` mode.
 pub fn privileged_ops() -> PrivilegedOps {
     PrivilegedOps::new()
@@ -926,6 +954,11 @@ pub fn privileged_ops() -> PrivilegedOps {
         })
         .op(OP_STRIP_ENTRY, |op: StripEntryOp| async move {
             root_strip_entry(Path::new("/"), &op)
+                .map(|e| e.detail().to_string())
+                .map_err(plugin_toolkit::anyhow::Error::msg)
+        })
+        .op(OP_SHM_RESIZE, |op: ShmResizeOp| async move {
+            root_shm_resize(Path::new("/"), &op)
                 .map(|e| e.detail().to_string())
                 .map_err(plugin_toolkit::anyhow::Error::msg)
         })
@@ -967,6 +1000,17 @@ fn root_strip_entry(root: &Path, op: &StripEntryOp) -> Result<RawEdit, String> {
     remove_creds_if_unreferenced(root, &guest_creds_path(op.vmid, &op.target));
     sweep_orphan_creds_in(root);
     Ok(edit)
+}
+
+/// Root side of [`OP_SHM_RESIZE`].
+fn root_shm_resize(root: &Path, op: &ShmResizeOp) -> Result<RawEdit, String> {
+    op.validate()?;
+    sweep_stale_temps_in(root, pid_alive);
+    edit_raw_conf_in(root, op.vmid, |conf| {
+        let (rewritten, changed) =
+            crate::shm_trap::rewrite_tmpfs_size(conf, &op.target, op.size_mb);
+        changed.then_some(rewritten)
+    })
 }
 
 // ── Node-local paths ────────────────────────────────────────────────────────
@@ -1260,7 +1304,7 @@ fn sweep_stale_temps_in(root: &Path, alive: impl Fn(u32) -> bool) {
 
 // ── Raw conf edits ──────────────────────────────────────────────────────────
 
-/// Result of [`edit_raw_conf`].
+/// Result of [`edit_raw_conf_in`].
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RawEdit {
     Unchanged,
@@ -1351,13 +1395,6 @@ fn read_conf(path: &str) -> Result<String, String> {
 /// root. The edit runs under PVE's own config flock, re-reads the file under it,
 /// touches only the live section, and replaces the file atomically. `edit`
 /// returns the new live section, or `None` for no change. Errors for a VM vmid.
-pub(crate) fn edit_raw_conf<F>(vmid: u64, edit: F) -> Result<RawEdit, String>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    edit_raw_conf_in(Path::new("/"), vmid, edit)
-}
-
 fn edit_raw_conf_in<F>(root: &Path, vmid: u64, edit: F) -> Result<RawEdit, String>
 where
     F: Fn(&str) -> Option<String>,
@@ -2226,6 +2263,42 @@ mod tests {
         std::fs::write(root.join("etc/pve/qemu-server/200.conf"), "").unwrap();
         let err = edit_raw_conf_in(&root, 200, |_| Some(String::new())).unwrap_err();
         assert!(err.contains("is a VM"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn root_shm_resize_rewrites_the_tmpfs_size_and_validates() {
+        let root = pve_root(
+            "shm",
+            120,
+            "arch: amd64\nlxc.mount.entry: tmpfs dev/shm tmpfs size=6g,mode=1777 0 0\n",
+        );
+        let op = |target: &str, size_mb| ShmResizeOp {
+            vmid: 120,
+            target: target.to_string(),
+            size_mb,
+        };
+        assert_eq!(
+            root_shm_resize(&root, &op("dev/shm", 512)).unwrap(),
+            RawEdit::Written
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("etc/pve/lxc/120.conf")).unwrap(),
+            "arch: amd64\nlxc.mount.entry: tmpfs dev/shm tmpfs size=512m,mode=1777 0 0\n"
+        );
+        assert_eq!(
+            root_shm_resize(&root, &op("dev/shm", 512)).unwrap(),
+            RawEdit::Unchanged
+        );
+        for (target, mb) in [
+            ("/dev/shm", 512),
+            ("dev/../etc", 512),
+            ("dev/shm x", 512),
+            ("", 512),
+            ("dev/shm", 0),
+        ] {
+            assert!(root_shm_resize(&root, &op(target, mb)).is_err(), "{target}");
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 

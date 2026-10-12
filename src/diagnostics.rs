@@ -461,15 +461,16 @@ fn finding_shm_trap(node: &str, vmid: u64, name: &str, trap: &crate::shm_trap::S
 
 /// Apply an `shm-resize::<vmid>::<target>::<new_mb>` repair by rewriting the
 /// tmpfs `size=` in the CT's conf. The tmpfs is a raw `lxc.mount.entry` with no
-/// PVE API, so it goes through the locked, live-section-only atomic edit of
-/// [`crate::guest_mount::edit_raw_conf`].
-fn repair_shm_resize(vmid: u64, target: &str, new_mb: u64) -> Result<String, String> {
+/// PVE API, and `/etc/pve` is root-only, so the edit runs as root through the
+/// [`crate::guest_mount::OP_SHM_RESIZE`] privileged op.
+async fn repair_shm_resize(vmid: u64, target: &str, new_mb: u64) -> Result<String, String> {
     let path = crate::guest_mount::lxc_conf_path(vmid)?;
-    let outcome = crate::guest_mount::edit_raw_conf(vmid, |conf| {
-        let (rewritten, changed) = crate::shm_trap::rewrite_tmpfs_size(conf, target, new_mb);
-        changed.then_some(rewritten)
-    })?;
-    if outcome == crate::guest_mount::RawEdit::Unchanged {
+    let op = crate::guest_mount::ShmResizeOp {
+        vmid,
+        target: target.to_string(),
+        size_mb: new_mb,
+    };
+    if crate::guest_mount::shm_resize(&op).await? == crate::guest_mount::RawEdit::Unchanged {
         return Err(format!(
             "no tmpfs /{target} entry with a size= found in {path} (already fixed?)"
         ));
@@ -573,7 +574,7 @@ pub async fn repair(args: RepairArgs) -> RepairOutcome {
                 format!("malformed shm-resize repair id '{}'", args.repair_id),
             );
         };
-        return match repair_shm_resize(vmid, &target, new_mb) {
+        return match repair_shm_resize(vmid, &target, new_mb).await {
             Ok(msg) => outcome(&args.repair_id, true, msg),
             Err(e) => outcome(&args.repair_id, false, e),
         };

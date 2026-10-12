@@ -13,6 +13,7 @@
 //! * `cluster_roster` — fleet cluster grouping. A **tool-backed** backend: its op
 //!   IS the `proxmox.list_clusters` `#[orca_tool]`, so it advertises a def only
 //!   and dispatch falls through to the tool surface.
+//! * `guest_mount` — network-share mounts inside LXCs, via the `.backend` hatch.
 //! * `backup` (3 KINDs) + `deploy_target` (one per configured row) — dynamic,
 //!   config-derived backend sets with no single-instance typed builder facet, so
 //!   they ride the builder's `.backend(def, dispatcher)` escape hatch, reusing the
@@ -43,6 +44,10 @@ fn main() -> plugin_toolkit::anyhow::Result<()> {
         .host_facts(proxmox::cluster_roster_impl::ProxmoxHostFacts)
         .diagnostics(proxmox::diagnostics::ProxmoxDiagnostics)
         .guest_exec(proxmox::guest_exec::ProxmoxGuestExec)
+        .backend(
+            proxmox::guest_mount::guest_mount_backend_def(),
+            Box::new(proxmox::guest_mount::dispatch),
+        )
         // cluster_roster: def only — its op is the `proxmox.list_clusters` tool,
         // so dispatch falls through to the `#[orca_tool]` surface.
         .tool_backend(BackendDef {
