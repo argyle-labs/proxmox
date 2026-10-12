@@ -31,7 +31,9 @@ use plugin_toolkit::plugin::Plugin;
 use proxmox::tools as _;
 
 fn main() -> plugin_toolkit::anyhow::Result<()> {
-    proxmox::guest_mount::sweep_stale_conf_temps();
+    if plugin_toolkit::privileged::requested() {
+        proxmox::guest_mount::privileged_ops().serve_stdin();
+    }
     let mut plugin = Plugin::named("proxmox")
         .version(env!("CARGO_PKG_VERSION"))
         .tools(["proxmox."])
