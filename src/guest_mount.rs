@@ -152,13 +152,11 @@ async fn apply(spec: &GuestMountSpec) -> Result<String, String> {
     apply_with(&io, vmid, spec, plan).await
 }
 
-/// Idempotent: a guest that is not an LXC vmid, or that no endpoint hosts
-/// (destroyed), has nothing mounted to remove.
+/// Idempotent: a guest no endpoint hosts (destroyed) has nothing mounted to
+/// remove.
 async fn remove(guest: &str, target: &str, source: Option<&str>) -> Result<String, String> {
+    let vmid = parse_vmid(guest)?;
     check_target(target)?;
-    let Ok(vmid) = parse_vmid(guest) else {
-        return Ok(not_present(guest, target));
-    };
     let Some(io) = PveIo::locate(vmid).await? else {
         return Ok(not_present(guest, target));
     };
@@ -553,7 +551,8 @@ async fn remove_with<I: GuestMountIo>(
 ) -> Result<String, String> {
     let host_path = host_stage_path(vmid, target);
     let source = match source {
-        // A network share address names what is staged, which only the staging bind carries.
+        // The share address is not recorded in the bind; the staging path is
+        // per-target, so a share matches the staging bind by target alone.
         Some(src) if is_share_addr(src) => {
             check_token("source", src)?;
             Some(host_path.as_str())
@@ -703,9 +702,19 @@ fn check_abs_path(what: &str, p: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `host:/export` (NFS) or `//host/share` (SMB).
+/// `host:/export` (NFS, `[v6]:/export` allowed) or `//host/share` (SMB).
 fn is_share_addr(s: &str) -> bool {
-    s.starts_with("//") || (!s.starts_with('/') && s.contains(':'))
+    if let Some(rest) = s.strip_prefix("//") {
+        return rest
+            .split_once('/')
+            .is_some_and(|(host, share)| !host.is_empty() && !share.is_empty());
+    }
+    let host_end = if s.starts_with('[') {
+        s.find("]:").map(|i| i + 1)
+    } else {
+        s.find(':').filter(|&i| !s[..i].contains('/'))
+    };
+    host_end.is_some_and(|i| i > 0 && s[i + 1..].starts_with('/'))
 }
 
 fn check_target(target: &str) -> Result<(), String> {
@@ -3069,12 +3078,26 @@ mod tests {
     }
 
     #[test]
-    fn remove_of_a_non_lxc_guest_is_not_present() {
-        let msg = rt()
+    fn remove_of_a_non_numeric_guest_is_an_error() {
+        let err = rt()
             .block_on(remove("my-host", "/mnt/media", None))
-            .unwrap();
-        assert!(msg.contains("not present"), "{msg}");
-        assert!(rt().block_on(remove("my-host", "mnt", None)).is_err());
+            .unwrap_err();
+        assert!(err.contains("not a numeric LXC vmid"), "{err}");
+    }
+
+    #[test]
+    fn ct_missing_matches_get_data_errors() {
+        let url = "https://pve:8006/api2/json/nodes/pve1/lxc/110/config";
+        assert!(ct_missing(&format!(
+            "GET {url}: HTTP 404: {{\"data\":null}}"
+        )));
+        assert!(ct_missing(&format!(
+            "GET {url}: HTTP 500: {{\"data\":null,\"message\":\"Configuration file 'nodes/pve1/lxc/110.conf' does not exist\\n\"}}"
+        )));
+        assert!(!ct_missing(&format!(
+            "GET {url}: HTTP 500: {{\"data\":null}}"
+        )));
+        assert!(!ct_missing(&format!("GET {url}: HTTP 403: does not exist")));
     }
 
     #[test]
@@ -3103,10 +3126,12 @@ mod tests {
             fake.calls(),
             [r#"put [("digest", "d1"), ("delete", "mp0")]"#]
         );
-        for addr in ["//10.0.0.1/share", "10.0.0.1:/export"] {
+        for addr in ["//10.0.0.1/share", "10.0.0.1:/export", "[::1]:/x"] {
             assert!(is_share_addr(addr), "{addr}");
         }
-        for path in ["/srv/x", "srv/x"] {
+        for path in [
+            "/srv/x", "srv/x", "host:rel", "C:\\x", "///x", "foo:bar", "//host/", ":/x", "a/b:/x",
+        ] {
             assert!(!is_share_addr(path), "{path}");
         }
     }

@@ -391,6 +391,14 @@ pub async fn find_ct_opt(client: &generated::Client, vmid: u64) -> Result<Option
         .map_err(|e| anyhow!("cluster resources: {e}"))?
         .into_inner();
     let Some(item) = items.into_iter().find(|i| i.vmid == Some(vmid as i64)) else {
+        // /cluster/resources silently omits guests the token cannot audit.
+        let path = format!("/vms/{vmid}");
+        let perms = client
+            .get_permissions_access_permissions(Some(&path), None)
+            .await
+            .map_err(|e| anyhow!("access permissions {path}: {e}"))?
+            .into_inner();
+        require_audit(vmid, &perms)?;
         return Ok(None);
     };
     if item.type_ != Kind::Lxc {
@@ -404,6 +412,22 @@ pub async fn find_ct_opt(client: &generated::Client, vmid: u64) -> Result<Option
         name: item.name,
         running: item.status.as_deref() == Some("running"),
     }))
+}
+
+/// `perms` is the `/access/permissions?path=/vms/{vmid}` body.
+fn require_audit(vmid: u64, perms: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+    let path = format!("/vms/{vmid}");
+    let audit = perms
+        .get(&path)
+        .and_then(|p| p.get("VM.Audit"))
+        .is_some_and(|v| v.as_u64().is_some_and(|n| n != 0) || v.as_bool() == Some(true));
+    if !audit {
+        bail!(
+            "guest {vmid} not listed and the token lacks VM.Audit on {path}; cannot tell whether \
+             it exists"
+        );
+    }
+    Ok(())
 }
 
 /// In-container ops run `pct` on this node, so the container must live here.
@@ -597,6 +621,18 @@ mod tests {
             assert!(needs_allowlist(cmd).is_some(), "{cmd} is already allowed");
             assert!(!why.is_empty());
         }
+    }
+
+    #[test]
+    fn an_empty_listing_is_absent_only_with_vm_audit() {
+        let check = |body: &str| require_audit(110, &serde_json::from_str(body).unwrap());
+        let err = check(r#"{"/vms/110":{"VM.Console":1}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("lacks VM.Audit"), "{err}");
+        assert!(check("{}").is_err());
+        assert!(check(r#"{"/vms/110":{"VM.Audit":0}}"#).is_err());
+        assert!(check(r#"{"/vms/110":{"VM.Audit":1}}"#).is_ok());
     }
 
     fn ct(node: &str, running: bool) -> CtRef {
