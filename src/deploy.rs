@@ -37,7 +37,7 @@ use crate::unit_provider::{ProvisionPayload, ProxmoxUnitProvider};
 
 /// Plugin data namespace for proxmox-owned tables — the isolation key core
 /// derives `plug__proxmox__<table>` from.
-const NAMESPACE: &str = "proxmox";
+pub(crate) const NAMESPACE: &str = "proxmox";
 const TABLE: &str = "deploy_target";
 
 /// Invoke-prefix root the loader routes a registered deploy target's

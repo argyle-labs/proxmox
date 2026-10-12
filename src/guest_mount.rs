@@ -83,7 +83,6 @@ const MOUNTS_TABLE: &str = "mounts";
 /// Plugin table (`plug__proxmox__raw_drop`) of raw entries dropped from a
 /// running CT, keyed `{node}/{vmid}/{target}`.
 const RAW_DROP_TABLE: &str = "raw_drop";
-const PLUGIN_NAMESPACE: &str = "proxmox";
 
 /// Wire args for `guest_mount_apply` — the whole spec crosses the boundary.
 #[derive(Deserialize)]
@@ -221,8 +220,8 @@ async fn sweep_stages<I: GuestMountIo>(io: &I) -> Result<Vec<String>, String> {
         let conf = match confs.iter().find(|(v, _)| *v == vmid) {
             Some((_, c)) => c.clone(),
             None => {
-                // Only a CT PVE says is gone frees its stage; any other read
-                // failure keeps it, since a bind may still use it.
+                // Only a CT PVE says is gone from this node frees its stage;
+                // any other read failure keeps it, since a bind may still use it.
                 let c = match io.conf(vmid).await {
                     Ok(c) => Ok(Some(c)),
                     Err(e) if ct_missing(&e) => Ok(None),
@@ -239,6 +238,24 @@ async fn sweep_stages<I: GuestMountIo>(io: &I) -> Result<Vec<String>, String> {
         }
         io.delete_placement(&p.id).await?;
         released.push(p.target.clone());
+    }
+    for (vmid, target) in io.raw_drop_targets().await? {
+        let gone = match confs.iter().find(|(v, _)| *v == vmid) {
+            Some((_, c)) => matches!(c, Ok(None)),
+            None => {
+                let c = match io.conf(vmid).await {
+                    Ok(c) => Ok(Some(c)),
+                    Err(e) if ct_missing(&e) => Ok(None),
+                    Err(_) => Err(()),
+                };
+                let gone = matches!(c, Ok(None));
+                confs.push((vmid, c));
+                gone
+            }
+        };
+        if gone {
+            io.clear_raw_drop(vmid, &target).await?;
+        }
     }
     Ok(released)
 }
@@ -361,12 +378,10 @@ async fn apply_bind<I: GuestMountIo>(
          after it restarts."
     );
     let dropped_at = if conf.has_raw_entry(target) {
-        let (after, edit, note) = drop_raw_entry(io, vmid, target).await?;
+        let (after, held, note) = drop_raw_recorded(io, vmid, target).await?;
         conf = after;
         notes.push(note);
-        if edit == RawEdit::Written && io.uptime_secs(vmid).await?.is_some() {
-            io.record_raw_drop(vmid, target, plugin_toolkit::now_millis_since_epoch())
-                .await?;
+        if held {
             notes.push(restart_required);
             return Ok(notes.join(" "));
         }
@@ -374,13 +389,10 @@ async fn apply_bind<I: GuestMountIo>(
     } else {
         io.raw_drop_at(vmid, target).await?
     };
-    if let Some(at) = dropped_at {
-        let since_drop_ms = plugin_toolkit::now_millis_since_epoch().saturating_sub(at);
-        if io.uptime_secs(vmid).await?.is_some_and(|up| {
-            i64::try_from(up.saturating_mul(1000)).unwrap_or(i64::MAX) > since_drop_ms
-        }) {
-            return Ok(restart_required);
-        }
+    if let Some(at) = dropped_at
+        && raw_drop_live(io, vmid, at).await?
+    {
+        return Ok(restart_required);
     }
     let on_target = conf.mps_on(target);
     if let Some(vol) = on_target.iter().find(|s| !s.is_bind()) {
@@ -449,6 +461,36 @@ async fn apply_bind<I: GuestMountIo>(
     Ok(notes.join(" "))
 }
 
+/// [`drop_raw_entry`] with its record: stamped before the edit so a failure or
+/// restart between the two can never leave a live raw mount unrecorded.
+/// Returns whether the running CT still holds the dropped mount.
+async fn drop_raw_recorded<I: GuestMountIo>(
+    io: &I,
+    vmid: u64,
+    target: &str,
+) -> Result<(CtConf, bool, String), String> {
+    let running = io.uptime_secs(vmid).await?.is_some();
+    if running {
+        io.record_raw_drop(vmid, target, plugin_toolkit::now_millis_since_epoch())
+            .await?;
+    }
+    let (conf, edit, note) = drop_raw_entry(io, vmid, target).await?;
+    let held = running && edit == RawEdit::Written;
+    if !held {
+        io.clear_raw_drop(vmid, target).await?;
+    }
+    Ok((conf, held, note))
+}
+
+/// Whether the CT has been up since the drop at `at` (ms epoch), so lxc still
+/// holds the dropped raw mount.
+async fn raw_drop_live<I: GuestMountIo>(io: &I, vmid: u64, at: i64) -> Result<bool, String> {
+    let since_drop_ms = plugin_toolkit::now_millis_since_epoch().saturating_sub(at);
+    Ok(io.uptime_secs(vmid).await?.is_some_and(|up| {
+        i64::try_from(up.saturating_mul(1000)).unwrap_or(i64::MAX) > since_drop_ms
+    }))
+}
+
 /// Remove a raw `lxc.mount.entry` for `target`, so it is not stacked under an
 /// `mpN`, and return the re-read config. lxc reads it only at start, so a
 /// running CT keeps it until restart.
@@ -494,9 +536,11 @@ async fn remove_with<I: GuestMountIo>(
     let host_path = host_stage_path(vmid, target);
     let mut msgs = Vec::new();
     let mut conf = io.conf(vmid).await?;
+    let mut held = false;
     if conf.has_raw_entry(target) {
-        let (after, _, note) = drop_raw_entry(io, vmid, target).await?;
+        let (after, h, note) = drop_raw_recorded(io, vmid, target).await?;
         conf = after;
+        held = h;
         msgs.push(note);
     }
     let keys: Vec<String> = conf
@@ -513,6 +557,7 @@ async fn remove_with<I: GuestMountIo>(
     if !keys.is_empty() {
         io.set_mps(vmid, &conf.digest, None, &keys).await?;
         let after = io.conf(vmid).await?;
+        conf = after.clone();
         let joined = keys.join(",");
         bind_pending = keys.iter().any(|k| after.slot(k).is_some());
         msgs.push(if bind_pending {
@@ -542,6 +587,15 @@ async fn remove_with<I: GuestMountIo>(
             }
             msgs.push(format!("Released host staging mount {host_path}."));
         }
+    }
+    // A record still live gates a later re-apply, so only a stale one goes.
+    if !held
+        && !conf.has_raw_entry(target)
+        && conf.mps_on(target).iter().all(|s| !s.is_bind())
+        && let Some(at) = io.raw_drop_at(vmid, target).await?
+        && !raw_drop_live(io, vmid, at).await?
+    {
+        io.clear_raw_drop(vmid, target).await?;
     }
     if msgs.is_empty() {
         msgs.push(format!("Guest mount {target} not present on CT {vmid}."));
@@ -668,11 +722,14 @@ pub(crate) trait GuestMountIo {
     /// Remove the CT's raw `lxc.mount.entry` for `target` ([`OP_DROP_RAW_ENTRY`]).
     async fn drop_raw_entry(&self, vmid: u64, target: &str) -> Result<RawEdit, String>;
     /// The CT's uptime in seconds while running; `None` when it is not.
+    /// A running CT reporting no uptime answers `u64::MAX`.
     async fn uptime_secs(&self, vmid: u64) -> Result<Option<u64>, String>;
     /// When a raw entry for `target` was dropped from the running CT (ms epoch).
     async fn raw_drop_at(&self, vmid: u64, target: &str) -> Result<Option<i64>, String>;
     async fn record_raw_drop(&self, vmid: u64, target: &str, at_ms: i64) -> Result<(), String>;
     async fn clear_raw_drop(&self, vmid: u64, target: &str) -> Result<(), String>;
+    /// Every recorded raw-entry drop on this node, as `(vmid, target)`.
+    async fn raw_drop_targets(&self) -> Result<Vec<(u64, String)>, String>;
 }
 
 /// The columns of an orca `mounts` row guest mounts read or author.
@@ -1040,7 +1097,10 @@ impl GuestMountIo for PveIo {
             return Ok(None);
         }
         Ok(Some(
-            status.get("uptime").and_then(Value::as_u64).unwrap_or(0),
+            status
+                .get("uptime")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX),
         ))
     }
 
@@ -1057,6 +1117,18 @@ impl GuestMountIo for PveIo {
     async fn clear_raw_drop(&self, vmid: u64, target: &str) -> Result<(), String> {
         raw_drop_db::remove(&raw_drop_key(self.node(), vmid, target))
             .map_err(|e| format!("clear raw-entry drop for CT {vmid} {target}: {e:#}"))
+    }
+
+    async fn raw_drop_targets(&self) -> Result<Vec<(u64, String)>, String> {
+        let prefix = format!("{}/", self.node());
+        Ok(raw_drop_db::ids()
+            .map_err(|e| format!("list raw-entry drops: {e:#}"))?
+            .iter()
+            .filter_map(|id| {
+                let (vmid, target) = id.strip_prefix(&prefix)?.split_once('/')?;
+                Some((vmid.parse().ok()?, target.to_string()))
+            })
+            .collect())
     }
 }
 
@@ -1094,7 +1166,7 @@ mod raw_drop_db {
 
     pub(super) fn get(id: &str) -> Result<Option<i64>> {
         let reply = db_op(&DbOp::Get {
-            namespace: PLUGIN_NAMESPACE.to_string(),
+            namespace: crate::deploy::NAMESPACE.to_string(),
             table: RAW_DROP_TABLE.to_string(),
             key_col: "id".to_string(),
             key: id.to_string(),
@@ -1111,16 +1183,24 @@ mod raw_drop_db {
         row.insert("id".to_string(), DbValue::Text(id.to_string()));
         row.insert("dropped_at".to_string(), DbValue::Int(at_ms));
         db_op(&DbOp::Upsert {
-            namespace: PLUGIN_NAMESPACE.to_string(),
+            namespace: crate::deploy::NAMESPACE.to_string(),
             table: RAW_DROP_TABLE.to_string(),
             row,
         })?;
         Ok(())
     }
 
+    pub(super) fn ids() -> Result<Vec<String>> {
+        let reply = db_op(&DbOp::List {
+            namespace: crate::deploy::NAMESPACE.to_string(),
+            table: RAW_DROP_TABLE.to_string(),
+        })?;
+        reply.rows.iter().map(|r| field_from_row(r, "id")).collect()
+    }
+
     pub(super) fn remove(id: &str) -> Result<()> {
         db_op(&DbOp::Delete {
-            namespace: PLUGIN_NAMESPACE.to_string(),
+            namespace: crate::deploy::NAMESPACE.to_string(),
             table: RAW_DROP_TABLE.to_string(),
             key_col: "id".to_string(),
             key: id.to_string(),
@@ -1849,6 +1929,7 @@ mod tests {
         uptime: Option<u64>,
         raw_drops: Mutex<Vec<(String, i64)>>,
         drop_result: RawEdit,
+        drop_err: Option<String>,
         calls: Mutex<Vec<String>>,
     }
 
@@ -1862,6 +1943,7 @@ mod tests {
                 uptime: None,
                 raw_drops: Mutex::new(Vec::new()),
                 drop_result: RawEdit::Written,
+                drop_err: None,
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -1944,6 +2026,9 @@ mod tests {
 
         async fn drop_raw_entry(&self, _vmid: u64, target: &str) -> Result<RawEdit, String> {
             self.log(format!("drop_raw {target}"));
+            if let Some(e) = &self.drop_err {
+                return Err(e.clone());
+            }
             Ok(if self.drop_result == RawEdit::Written {
                 RawEdit::Written
             } else {
@@ -1975,6 +2060,11 @@ mod tests {
         async fn clear_raw_drop(&self, _vmid: u64, target: &str) -> Result<(), String> {
             self.raw_drops.lock().unwrap().retain(|(t, _)| t != target);
             Ok(())
+        }
+
+        async fn raw_drop_targets(&self) -> Result<Vec<(u64, String)>, String> {
+            let drops = self.raw_drops.lock().unwrap();
+            Ok(drops.iter().map(|(t, _)| (110, t.clone())).collect())
         }
     }
 
@@ -2505,6 +2595,88 @@ mod tests {
         ));
         let msg = bind(&fake, "/srv/a", "/mnt/a", false).unwrap();
         assert!(msg.starts_with("Set mp0"), "{msg}");
+        assert!(fake.raw_drops.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_drop_keeps_its_record_so_the_next_apply_waits() {
+        let raw = ["//w/a mnt/a cifs 0 0"];
+        let mut fake = Fake::new(vec![ct_conf(&[], &raw)]);
+        fake.uptime = Some(3600);
+        fake.drop_err = Some("privileged op failed".to_string());
+        assert!(bind(&fake, "/srv/a", "/mnt/a", false).is_err());
+        assert_eq!(fake.raw_drops.lock().unwrap().len(), 1);
+
+        // The edit landed despite the error: the entry is gone but still live.
+        let fake = Fake {
+            drop_err: None,
+            confs: Mutex::new(vec![ct_conf(&[], &[])]),
+            ..fake
+        };
+        let msg = bind(&fake, "/srv/a", "/mnt/a", false).unwrap();
+        assert!(msg.starts_with("Restart required"), "{msg}");
+    }
+
+    #[test]
+    fn an_unchanged_drop_on_a_running_ct_clears_its_record() {
+        let raw = ["//w/a mnt/a cifs 0 0"];
+        let mut fake = Fake::new(vec![ct_conf(&[], &raw), ct_conf(&[], &[])]);
+        fake.uptime = Some(3600);
+        fake.drop_result = RawEdit::Unchanged;
+        let msg = bind(&fake, "/srv/a", "/mnt/a", false).unwrap();
+        assert!(msg.contains("Set mp0"), "{msg}");
+        assert!(fake.raw_drops.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_then_reapply_on_a_running_ct_waits_for_a_restart() {
+        let raw = ["//w/a mnt/a cifs 0 0"];
+        let mut fake = Fake::new(vec![ct_conf(&[], &raw), ct_conf(&[], &[])]);
+        fake.uptime = Some(3600);
+        rt().block_on(remove_with(&fake, 110, "/mnt/a", None))
+            .unwrap();
+        assert_eq!(fake.raw_drops.lock().unwrap().len(), 1);
+        let msg = bind(&fake, "/srv/a", "/mnt/a", false).unwrap();
+        assert!(msg.starts_with("Restart required"), "{msg}");
+    }
+
+    #[test]
+    fn remove_clears_a_stale_record_once_the_target_is_empty() {
+        let mut fake = Fake::new(vec![ct_conf(&[], &[])]);
+        fake.raw_drops
+            .lock()
+            .unwrap()
+            .push(("/mnt/a".to_string(), 0));
+        fake.uptime = Some(10);
+        rt().block_on(remove_with(&fake, 110, "/mnt/a", None))
+            .unwrap();
+        assert!(fake.raw_drops.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_running_ct_without_an_uptime_waits_for_a_restart() {
+        let mut fake = Fake::new(vec![ct_conf(&[], &[])]);
+        fake.uptime = Some(u64::MAX);
+        fake.raw_drops
+            .lock()
+            .unwrap()
+            .push(("/mnt/a".to_string(), 0));
+        let msg = bind(&fake, "/srv/a", "/mnt/a", false).unwrap();
+        assert!(msg.starts_with("Restart required"), "{msg}");
+    }
+
+    #[test]
+    fn sweep_prunes_records_for_cts_gone_from_this_node() {
+        let mut fake = Fake::new(vec![ct_conf(&[], &[])]);
+        fake.raw_drops
+            .lock()
+            .unwrap()
+            .push(("/mnt/a".to_string(), 0));
+        fake.conf_err = Some("GET u: HTTP 500: proxy timeout".to_string());
+        rt().block_on(sweep_stages(&fake)).unwrap();
+        assert_eq!(fake.raw_drops.lock().unwrap().len(), 1);
+        fake.conf_err = Some("GET u: HTTP 404: no such".to_string());
+        rt().block_on(sweep_stages(&fake)).unwrap();
         assert!(fake.raw_drops.lock().unwrap().is_empty());
     }
 
