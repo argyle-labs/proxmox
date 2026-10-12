@@ -377,27 +377,56 @@ pub struct CtRef {
 
 /// Find LXC `vmid` in the cluster; an id that is a VM is an error.
 pub async fn find_ct(client: &generated::Client, vmid: u64) -> Result<CtRef> {
+    find_ct_opt(client, vmid)
+        .await?
+        .ok_or_else(|| anyhow!("no guest {vmid} in the cluster"))
+}
+
+/// [`find_ct`], with `None` when the cluster has no guest `vmid`; errors if the
+/// token cannot audit that path.
+pub async fn find_ct_opt(client: &generated::Client, vmid: u64) -> Result<Option<CtRef>> {
     use gtypes::GetResourcesClusterResourcesResponseItemType as Kind;
     let items = client
         .get_resources_cluster_resources(Some(gtypes::GetResourcesClusterResourcesType::Vm))
         .await
         .map_err(|e| anyhow!("cluster resources: {e}"))?
         .into_inner();
-    let item = items
-        .into_iter()
-        .find(|i| i.vmid == Some(vmid as i64))
-        .ok_or_else(|| anyhow!("no guest {vmid} in the cluster"))?;
+    let Some(item) = items.into_iter().find(|i| i.vmid == Some(vmid as i64)) else {
+        // /cluster/resources silently omits guests the token cannot audit.
+        let path = format!("/vms/{vmid}");
+        let perms = client
+            .get_permissions_access_permissions(Some(&path), None)
+            .await
+            .map_err(|e| anyhow!("access permissions {path}: {e}"))?
+            .into_inner();
+        require_audit(vmid, &perms)?;
+        return Ok(None);
+    };
     if item.type_ != Kind::Lxc {
         bail!("guest {vmid} is not an LXC container; this operation is LXC-only");
     }
-    Ok(CtRef {
+    Ok(Some(CtRef {
         node: item
             .node
             .ok_or_else(|| anyhow!("guest {vmid} reports no node"))?,
         vmid,
         name: item.name,
         running: item.status.as_deref() == Some("running"),
-    })
+    }))
+}
+
+/// `perms` is the `/access/permissions?path=/vms/{vmid}` body. A listed
+/// privilege is held; its value is the propagate flag, not a grant.
+fn require_audit(vmid: u64, perms: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+    let path = format!("/vms/{vmid}");
+    let audit = perms.get(&path).and_then(|p| p.get("VM.Audit")).is_some();
+    if !audit {
+        bail!(
+            "guest {vmid} not listed and the token lacks VM.Audit on {path}; cannot tell whether \
+             it exists"
+        );
+    }
+    Ok(())
 }
 
 /// In-container ops run `pct` on this node, so the container must live here.
@@ -591,6 +620,18 @@ mod tests {
             assert!(needs_allowlist(cmd).is_some(), "{cmd} is already allowed");
             assert!(!why.is_empty());
         }
+    }
+
+    #[test]
+    fn an_empty_listing_is_absent_only_with_vm_audit() {
+        let check = |body: &str| require_audit(110, &serde_json::from_str(body).unwrap());
+        let err = check(r#"{"/vms/110":{"VM.Console":1}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("lacks VM.Audit"), "{err}");
+        assert!(check("{}").is_err());
+        assert!(check(r#"{"/vms/110":{"VM.Audit":0}}"#).is_ok());
+        assert!(check(r#"{"/vms/110":{"VM.Audit":1}}"#).is_ok());
     }
 
     fn ct(node: &str, running: bool) -> CtRef {
