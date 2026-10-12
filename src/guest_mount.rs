@@ -200,6 +200,15 @@ async fn sweep_stages<I: GuestMountIo>(io: &I) -> Result<Vec<String>, String> {
                 && stage_name(io.node(), vmid, &g.target) == name
         })
     };
+    // Only a CT PVE says is gone from this node frees its stage; any other
+    // read failure keeps it, since a bind may still use it.
+    let lookup = |vmid: u64| async move {
+        match io.conf(vmid).await {
+            Ok(c) => Ok(Some(c)),
+            Err(e) if ct_missing(&e) => Ok(None),
+            Err(_) => Err(()),
+        }
+    };
     let mut confs: Vec<(u64, Result<Option<CtConf>, ()>)> = Vec::new();
     let mut released = Vec::new();
     for p in &placements {
@@ -220,13 +229,7 @@ async fn sweep_stages<I: GuestMountIo>(io: &I) -> Result<Vec<String>, String> {
         let conf = match confs.iter().find(|(v, _)| *v == vmid) {
             Some((_, c)) => c.clone(),
             None => {
-                // Only a CT PVE says is gone from this node frees its stage;
-                // any other read failure keeps it, since a bind may still use it.
-                let c = match io.conf(vmid).await {
-                    Ok(c) => Ok(Some(c)),
-                    Err(e) if ct_missing(&e) => Ok(None),
-                    Err(_) => Err(()),
-                };
+                let c = lookup(vmid).await;
                 confs.push((vmid, c.clone()));
                 c
             }
@@ -243,11 +246,7 @@ async fn sweep_stages<I: GuestMountIo>(io: &I) -> Result<Vec<String>, String> {
         let gone = match confs.iter().find(|(v, _)| *v == vmid) {
             Some((_, c)) => matches!(c, Ok(None)),
             None => {
-                let c = match io.conf(vmid).await {
-                    Ok(c) => Ok(Some(c)),
-                    Err(e) if ct_missing(&e) => Ok(None),
-                    Err(_) => Err(()),
-                };
+                let c = lookup(vmid).await;
                 let gone = matches!(c, Ok(None));
                 confs.push((vmid, c));
                 gone
@@ -470,14 +469,21 @@ async fn drop_raw_recorded<I: GuestMountIo>(
     target: &str,
 ) -> Result<(CtConf, bool, String), String> {
     let running = io.uptime_secs(vmid).await?.is_some();
-    if running {
+    let prior = if running {
+        let prior = io.raw_drop_at(vmid, target).await?;
         io.record_raw_drop(vmid, target, plugin_toolkit::now_millis_since_epoch())
             .await?;
-    }
+        prior
+    } else {
+        None
+    };
     let (conf, edit, note) = drop_raw_entry(io, vmid, target).await?;
     let held = running && edit == RawEdit::Written;
-    if !held {
-        io.clear_raw_drop(vmid, target).await?;
+    match prior {
+        // An earlier drop the running CT may still hold keeps its own stamp.
+        Some(at) if running => io.record_raw_drop(vmid, target, at).await?,
+        _ if !held => io.clear_raw_drop(vmid, target).await?,
+        _ => {}
     }
     Ok((conf, held, note))
 }
@@ -1120,16 +1126,19 @@ impl GuestMountIo for PveIo {
     }
 
     async fn raw_drop_targets(&self) -> Result<Vec<(u64, String)>, String> {
-        let prefix = format!("{}/", self.node());
         Ok(raw_drop_db::ids()
             .map_err(|e| format!("list raw-entry drops: {e:#}"))?
             .iter()
-            .filter_map(|id| {
-                let (vmid, target) = id.strip_prefix(&prefix)?.split_once('/')?;
-                Some((vmid.parse().ok()?, target.to_string()))
-            })
+            .filter_map(|id| parse_raw_drop_key(self.node(), id))
             .collect())
     }
+}
+
+/// Inverse of [`raw_drop_key`] for `node`'s rows; `None` for other nodes or
+/// malformed keys.
+fn parse_raw_drop_key(node: &str, id: &str) -> Option<(u64, String)> {
+    let (vmid, target) = id.strip_prefix(node)?.strip_prefix('/')?.split_once('/')?;
+    Some((vmid.parse().ok()?, target.to_string()))
 }
 
 fn raw_drop_key(node: &str, vmid: u64, target: &str) -> String {
@@ -2626,6 +2635,42 @@ mod tests {
         let msg = bind(&fake, "/srv/a", "/mnt/a", false).unwrap();
         assert!(msg.contains("Set mp0"), "{msg}");
         assert!(fake.raw_drops.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unchanged_drop_on_a_running_ct_keeps_a_prior_record() {
+        let mut fake = Fake::new(vec![ct_conf(&[], &[])]);
+        fake.uptime = Some(3600);
+        fake.drop_result = RawEdit::Unchanged;
+        fake.raw_drops
+            .lock()
+            .unwrap()
+            .push(("/mnt/a".to_string(), 42));
+        let (_, held, _) = rt()
+            .block_on(drop_raw_recorded(&fake, 110, "/mnt/a"))
+            .unwrap();
+        assert!(!held);
+        assert_eq!(
+            *fake.raw_drops.lock().unwrap(),
+            [("/mnt/a".to_string(), 42)]
+        );
+    }
+
+    #[test]
+    fn parse_raw_drop_key_keeps_only_this_nodes_well_formed_rows() {
+        assert_eq!(
+            parse_raw_drop_key("pve", "pve/110/mnt/a/b"),
+            Some((110, "mnt/a/b".to_string()))
+        );
+        assert_eq!(parse_raw_drop_key("pve", "other/110/mnt/a"), None);
+        assert_eq!(parse_raw_drop_key("pve", "pve-2/110/mnt/a"), None);
+        assert_eq!(
+            parse_raw_drop_key("pve-2", "pve-2/7/x"),
+            Some((7, "x".to_string()))
+        );
+        assert_eq!(parse_raw_drop_key("pve", "pve/abc/mnt/a"), None);
+        assert_eq!(parse_raw_drop_key("pve", "pve/110"), None);
+        assert_eq!(parse_raw_drop_key("pve", "pve"), None);
     }
 
     #[test]
