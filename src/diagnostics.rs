@@ -463,8 +463,8 @@ fn finding_shm_trap(node: &str, vmid: u64, name: &str, trap: &crate::shm_trap::S
 /// tmpfs `size=` in the CT's conf. The tmpfs is a raw `lxc.mount.entry` with no
 /// PVE API, so it goes through the locked, live-section-only atomic edit of
 /// [`crate::guest_mount::edit_raw_conf`].
-async fn repair_shm_resize(vmid: u64, target: &str, new_mb: u64) -> Result<String, String> {
-    let path = format!("/etc/pve/lxc/{vmid}.conf");
+fn repair_shm_resize(vmid: u64, target: &str, new_mb: u64) -> Result<String, String> {
+    let path = crate::guest_mount::lxc_conf_path(vmid)?;
     let outcome = crate::guest_mount::edit_raw_conf(vmid, |conf| {
         let (rewritten, changed) = crate::shm_trap::rewrite_tmpfs_size(conf, target, new_mb);
         changed.then_some(rewritten)
@@ -573,7 +573,7 @@ pub async fn repair(args: RepairArgs) -> RepairOutcome {
                 format!("malformed shm-resize repair id '{}'", args.repair_id),
             );
         };
-        return match repair_shm_resize(vmid, &target, new_mb).await {
+        return match repair_shm_resize(vmid, &target, new_mb) {
             Ok(msg) => outcome(&args.repair_id, true, msg),
             Err(e) => outcome(&args.repair_id, false, e),
         };
