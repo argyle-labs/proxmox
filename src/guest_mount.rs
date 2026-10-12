@@ -1,58 +1,50 @@
-//! `guest_mount` domain — render network mounts INTO a guest instead of on the
-//! Proxmox host.
+//! `guest_mount` domain — place storage mounts INTO a Proxmox LXC guest.
 //!
-//! An unprivileged LXC cannot mount a cifs/nfs share itself, and binding a
-//! host-side mount into it (`mpN:`) both requires the host to hold the mount and
-//! breaks under the container's uid mapping. The kernel-native answer is a raw
-//! `lxc.mount.entry:` line in the guest's config: at container start the host
-//! kernel performs the mount directly into the guest's mount namespace, so the
-//! LXC stays unprivileged and the mount re-establishes itself on every guest
-//! start — independent of the host's own mount state
-//! ([[proxmox per-guest mounts]]).
+//! Every guest mount is a PVE `mpN` bind of a host path, set through the PVE
+//! REST API:
 //!
-//! Everything goes through the PVE REST API except the one thing it cannot set:
+//! * Host-path binds (`fstype` `bind`/`none`) bind the given path directly.
+//! * cifs/nfs shares are staged on the host first: the plugin authors an
+//!   ordinary host placement for the same share at
+//!   `/mnt/orca-guest/<vmid>/<slug>` in orca's `mounts` table — the record
+//!   `storage.mount.create` writes — and orca's mount convergence mounts it
+//!   there with the share's own backend (credentials, `addr=`, failover). Once
+//!   that placement reports `ok`, the host path is bound into the CT. The CT
+//!   stays unprivileged and never sees the share's credentials.
 //!
-//! * Container state — run state from `status/current`, mount points and their
-//!   pending changes from `config` + `pending`, read with the endpoint's token.
-//! * Host-path binds (`fstype` `bind`/`none`) are `mpN` mount points, set with
-//!   `PUT /nodes/{node}/lxc/{vmid}/config` guarded by the config `digest`. PVE
-//!   allows a bind `mpN` only to `root@pam` and refuses API tokens
-//!   (`check_ct_modify_config_perm`), so that one call authenticates with a
-//!   `root@pam` ticket whose password is the orca secret
-//!   `proxmox.<endpoint>.root_password`. A change PVE cannot hotplug lands in
-//!   `[pve:pending]` and is reported as pending a restart.
-//! * cifs/nfs kernel mounts are raw `lxc.mount.entry` lines. PVE has no API (or
-//!   CLI) for `lxc.*` keys, so this is the escape hatch: the plugin runs as the
-//!   unprivileged orca user, so the edit of `/etc/pve/lxc/<vmid>.conf` (and the
-//!   root-owned creds file) runs as root through orca's verified `admin
-//!   plugin-apply` seam ([`privileged_ops`]). There [`edit_raw_conf_in`] holds PVE's
-//!   own per-CT config flock, re-reads the file under it, edits only the live
-//!   section, and replaces it atomically. A changed line on a running CT takes
-//!   effect on its next restart; that is reported as pending, never forced.
+//! Container state — mount points and their pending changes — comes from
+//! `config` + `pending`, read with the endpoint's token. Mount points are set
+//! with `PUT /nodes/{node}/lxc/{vmid}/config` guarded by the config `digest`.
+//! PVE allows a bind `mpN` only to `root@pam` and refuses API tokens
+//! (`check_ct_modify_config_perm`), so that call authenticates with a `root@pam`
+//! ticket whose password is the orca secret `proxmox.<endpoint>.root_password`.
+//! A change PVE cannot hotplug lands in `[pve:pending]` and is reported as
+//! pending a restart.
 //!
-//! Core routes a guest-targeted storage placement here as a
-//! [`GuestMountSpec`](plugin_toolkit::storage::GuestMountSpec): `guest` is the
-//! LXC vmid, `target` the mountpoint inside it, `sources` the share's routes,
-//! `options` its rendered `-o` string, and `credential` an opaque
-//! [`SecretRef`](plugin_toolkit::storage::SecretRef) string. For cifs the
-//! password is resolved through the secrets domain and written to a root-owned
-//! `0600` creds file in a `0700` [`SECRET_FILE_DIR`], referenced by
-//! `credentials=` in the entry — the password never sits inline in the config.
+//! The one raw config edit left is [`OP_SHM_RESIZE`]: a CT's tmpfs
+//! `lxc.mount.entry` `size=`, which has no PVE API or CLI. The plugin runs as
+//! the unprivileged orca user, so that edit of `/etc/pve/lxc/<vmid>.conf` runs
+//! as root through orca's verified `admin plugin-apply` seam
+//! ([`privileged_ops`]). There [`edit_raw_conf_in`] holds PVE's own per-CT
+//! config flock, re-reads the file under it, edits only the live section, and
+//! replaces it atomically.
 //!
 //! VM guests (their own kernel mounts via cloud-init/fstab) are a later phase;
 //! this domain handles LXC and returns a clear error for a VM vmid.
 
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::net::IpAddr;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use plugin_toolkit::abi::BackendDef;
+use plugin_toolkit::abi::{BackendDef, DbOp, DbRow, DbValue};
 use plugin_toolkit::privileged::PrivilegedOps;
 use plugin_toolkit::reqwest;
+use plugin_toolkit::runtime::{ToDbValue, db_op, field_from_row};
 use plugin_toolkit::serde_json::{self, Value};
-use plugin_toolkit::storage::{GuestMountSpec, SECRET_FILE_DIR, parse_option_string};
+use plugin_toolkit::storage::{GuestMountSpec, MountHealth, parse_option_string};
 use serde::{Deserialize, Serialize};
 
 use crate::Config;
@@ -61,37 +53,27 @@ use crate::generated::{self, types as gtypes};
 /// Invoke-name prefix for this domain's ops (`proxmox.__guest_mount.*`).
 pub const GM_PREFIX: &str = "proxmox.__guest_mount";
 const PROVIDER: &str = "proxmox";
-const CREDS_FILE_MODE: u32 = 0o600;
-const CREDS_DIR_MODE: u32 = 0o700;
 /// PVE's `lock_config` waits 10s for the config flock.
 const CONF_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 /// A temp file older than this is stale even if its pid has been reused.
 const TEMP_STALE_AGE: Duration = Duration::from_secs(600);
-/// An unreferenced creds file younger than this may belong to an in-flight
-/// apply that has written it but not yet its entry.
-const CREDS_ORPHAN_AGE: Duration = Duration::from_secs(600);
 /// The only PVE user allowed to set a bind `mpN`.
 const ROOT_USER: &str = "root@pam";
 /// Upper bound on a tmpfs resize, whatever the CT's memory.
 const SHM_MAX_MB: u64 = 64 * 1024;
-/// Privileged-seam op names (`<plugin> --privileged-op`).
-pub const OP_SET_ENTRY: &str = "guest_mount.set_entry";
-pub const OP_STRIP_ENTRY: &str = "guest_mount.strip_entry";
+/// PVE's `memory` when a CT config omits it.
+const CT_DEFAULT_MEMORY_MB: u64 = 512;
+/// Privileged-seam op name (`<plugin> --privileged-op`).
 pub const OP_SHM_RESIZE: &str = "guest_mount.shm_resize";
 
-/// Option keys that carry a credential and must never be rendered inline into
-/// the config — resolved into the root-owned creds file instead.
-const CREDENTIAL_KEYS: &[&str] = &[
-    "username",
-    "user",
-    "password",
-    "pass",
-    "credentials",
-    "cred",
-];
-
-/// Kernel network filesystems a raw `lxc.mount.entry` may carry.
+/// Kernel network filesystems staged on the host and bound into the CT.
 const NETWORK_FSTYPES: &[&str] = &["cifs", "smb3", "smb", "nfs", "nfs4"];
+/// Host directory network shares are staged under, per vmid.
+const HOST_STAGE_DIR: &str = "/mnt/orca-guest";
+/// Longest slug kept verbatim in a staging path; longer ones are hashed.
+const MAX_SLUG_LEN: usize = 64;
+/// orca core's mount-placement table (`storage.mount.*`).
+const MOUNTS_TABLE: &str = "mounts";
 
 /// Wire args for `guest_mount_apply` — the whole spec crosses the boundary.
 #[derive(Deserialize)]
@@ -164,7 +146,7 @@ async fn remove(guest: &str, target: &str) -> Result<String, String> {
 }
 
 /// Reconcile the guest's mount for `spec` to present. Idempotent: writes only
-/// when the mount (or, for cifs, its creds file) diverges.
+/// when the mount (or its host staging placement) diverges.
 async fn apply_with<I: GuestMountIo>(
     io: &I,
     vmid: u64,
@@ -173,77 +155,101 @@ async fn apply_with<I: GuestMountIo>(
 ) -> Result<String, String> {
     match plan {
         Plan::Bind { src, ro } => apply_bind(io, vmid, src, &spec.target, ro).await,
-        Plan::Raw { fs_spec } => apply_raw(io, vmid, spec, fs_spec).await,
+        Plan::Staged { ro } => apply_staged(io, vmid, spec, ro).await,
     }
 }
 
-/// A cifs/nfs mount as a raw `lxc.mount.entry`, written as root through the
-/// privileged seam.
-async fn apply_raw<I: GuestMountIo>(
+/// A cifs/nfs share: ensure a host placement for the guest placement's share at
+/// the staging path, then bind that path once orca reports it mounted. Binding
+/// before the host mount exists would pin the empty directory in the CT.
+async fn apply_staged<I: GuestMountIo>(
     io: &I,
     vmid: u64,
     spec: &GuestMountSpec,
-    fs_spec: &str,
+    ro: bool,
 ) -> Result<String, String> {
-    let target = spec.target.as_str();
-    let conf = io.conf(vmid).await?;
-    if let Some(slot) = conf.mps_on(target).first() {
-        return Err(format!(
-            "CT {vmid}: {} already mounts {} at {target}; remove it before placing a {} mount \
-             there",
-            slot.key,
-            slot.effective().unwrap_or_default(),
-            spec.fstype
+    let host_path = host_stage_path(vmid, &spec.target);
+    let name = stage_name(io.node(), vmid, &spec.target);
+    let placements = io.placements().await?;
+    let guest_row = placements
+        .iter()
+        .find(|p| {
+            p.enabled
+                && p.guest.as_deref().map(str::trim) == Some(spec.guest.trim())
+                && p.target == spec.target
+        })
+        .ok_or_else(|| {
+            format!(
+                "CT {vmid}: orca has no enabled guest placement for {}; nothing to stage",
+                spec.target
+            )
+        })?;
+    let existing = placements
+        .iter()
+        .find(|p| p.host == guest_row.host && p.name == name);
+    let stage = match existing {
+        Some(p) if p.guest.is_some() || p.target != host_path => {
+            return Err(format!(
+                "host placement '{name}' already exists for {} and is not CT {vmid}'s staging \
+                 mount; remove it with storage.mount.delete",
+                p.guest.as_deref().unwrap_or(&p.target)
+            ));
+        }
+        Some(p) if p.enabled && p.share_id == guest_row.share_id => p.clone(),
+        Some(p) => {
+            let fixed = Placement {
+                share_id: guest_row.share_id.clone(),
+                enabled: true,
+                ..p.clone()
+            };
+            io.update_placement(&fixed).await?;
+            fixed
+        }
+        None => {
+            if let Some(other) = placements
+                .iter()
+                .find(|p| p.enabled && p.host == guest_row.host && p.target == host_path)
+            {
+                return Err(format!(
+                    "host placement '{}' already mounts {host_path}; stacking two mounts at one \
+                     target is blocked",
+                    other.name
+                ));
+            }
+            let p = Placement {
+                id: plugin_toolkit::mint_uuidv7(),
+                name,
+                share_id: guest_row.share_id.clone(),
+                host: guest_row.host.clone(),
+                target: host_path.clone(),
+                guest: None,
+                enabled: true,
+                health: MountHealth::Missing,
+            };
+            io.insert_placement(&p).await?;
+            p
+        }
+    };
+    if stage.health != MountHealth::Ok {
+        return Ok(format!(
+            "Staging {} for CT {vmid} at {host_path} on the host (mount health: {}); it is bound \
+             into the CT once orca reports that mount ok.",
+            spec.target,
+            health_label(stage.health)
         ));
     }
-    let creds = if is_cifs(&spec.fstype) {
-        spec.credential
-            .as_deref()
-            .map(|r| resolve_creds(r, &spec.options))
-            .transpose()?
-    } else {
-        None
-    };
-    let op = SetEntryOp {
-        vmid,
-        target: target.to_string(),
-        fs_spec: fs_spec.to_string(),
-        fstype: spec.fstype.clone(),
-        options: spec.options.clone(),
-        creds,
-    };
-    // Without a creds file the rendered line is fully known here, so an identical
-    // entry needs no root round-trip.
-    let line = op.entry_line(None);
-    let present = conf
-        .raw_entries
-        .iter()
-        .any(|e| format!("lxc.mount.entry: {e}") == line);
-    let edit = if op.creds.is_none() && present {
-        RawEdit::Unchanged
-    } else {
-        io.set_entry(&op).await?
-    };
-    Ok(match raw_outcome(io, vmid, edit).await {
-        Outcome::Unchanged => format!("Guest mount {target} already present on CT {vmid}."),
-        Outcome::Written => {
-            format!("Set guest mount {target} on CT {vmid}; mounts on its next start.")
-        }
-        Outcome::PendingRestart => format!(
-            "Pending restart: set guest mount {target} on CT {vmid}; it is running and mounts \
-             it after a restart."
-        ),
-        Outcome::Unverified(e) => format!(
-            "Pending restart, verify: set guest mount {target} on CT {vmid}; its run state is \
-             unknown ({e}), so if it is running it mounts it after a restart."
-        ),
-    })
+    apply_bind(io, vmid, &host_path, &spec.target, ro).await
+}
+
+fn health_label(h: MountHealth) -> String {
+    serde_json::to_value(h)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{h:?}"))
 }
 
 /// A host-path bind as one `mpN`. An existing bind for the target is reused
 /// (keeping its other options); duplicates for it are deleted in the same call.
-/// A raw entry an older release wrote for the target is stripped only after the
-/// API call succeeds.
 async fn apply_bind<I: GuestMountIo>(
     io: &I,
     vmid: u64,
@@ -252,6 +258,9 @@ async fn apply_bind<I: GuestMountIo>(
     ro: bool,
 ) -> Result<String, String> {
     let conf = io.conf(vmid).await?;
+    if conf.has_raw_entry(target) {
+        return Err(legacy_entry_error(vmid, target));
+    }
     let on_target = conf.mps_on(target);
     if let Some(vol) = on_target.iter().find(|s| !s.is_bind()) {
         return Err(format!(
@@ -288,13 +297,6 @@ async fn apply_bind<I: GuestMountIo>(
         )
         .await?;
     }
-    if conf.has_raw_entry(target) {
-        io.strip_entry(&StripEntryOp {
-            vmid,
-            target: target.to_string(),
-        })
-        .await?;
-    }
     let after = io.conf(vmid).await?;
     let pending = after.slot(&key).is_some_and(MpSlot::is_pending);
     let pending_deletes: Vec<&str> = delete
@@ -321,9 +323,20 @@ async fn apply_bind<I: GuestMountIo>(
     })
 }
 
+/// Releases up to v0.1.1-rc.13 wrote raw `lxc.mount.entry` lines for guest
+/// mounts. PVE has no API to drop an `lxc.*` key, so such a line is refused
+/// rather than stacked under a new `mpN`.
+fn legacy_entry_error(vmid: u64, target: &str) -> String {
+    format!(
+        "CT {vmid}: its config carries a legacy raw lxc.mount.entry for {target}; orca no longer \
+         writes or removes raw entries, so delete that line from /etc/pve/lxc/{vmid}.conf before \
+         this mount can be placed"
+    )
+}
+
 /// Remove the mount at `target` inside the CT. Idempotent: absent ⇒ `Ok`.
-/// Deletes every host-path bind `mpN` on `target` through the API, then strips
-/// any raw `lxc.mount.entry` for it (which also drops its unreferenced creds).
+/// Deletes every host-path bind `mpN` on `target` through the API, then the
+/// host staging placement once no bind of it is left pending.
 async fn remove_with<I: GuestMountIo>(io: &I, vmid: u64, target: &str) -> Result<String, String> {
     let conf = io.conf(vmid).await?;
     let keys: Vec<String> = conf
@@ -333,11 +346,13 @@ async fn remove_with<I: GuestMountIo>(io: &I, vmid: u64, target: &str) -> Result
         .map(|s| s.key.clone())
         .collect();
     let mut msgs = Vec::new();
+    let mut bind_pending = false;
     if !keys.is_empty() {
         io.set_mps(vmid, &conf.digest, None, &keys).await?;
         let after = io.conf(vmid).await?;
         let joined = keys.join(",");
-        msgs.push(if keys.iter().any(|k| after.slot(k).is_some()) {
+        bind_pending = keys.iter().any(|k| after.slot(k).is_some());
+        msgs.push(if bind_pending {
             format!(
                 "Pending restart: removed {joined} bind mount {target} from CT {vmid}; PVE \
                  holds the delete in [pve:pending] until the CT restarts."
@@ -346,50 +361,33 @@ async fn remove_with<I: GuestMountIo>(io: &I, vmid: u64, target: &str) -> Result
             format!("Removed {joined} bind mount {target} from CT {vmid}.")
         });
     }
-    if conf.has_raw_entry(target) {
-        let edit = io
-            .strip_entry(&StripEntryOp {
-                vmid,
-                target: target.to_string(),
-            })
-            .await?;
-        msgs.push(match raw_outcome(io, vmid, edit).await {
-            Outcome::Unchanged | Outcome::Written => {
-                format!("Removed guest mount {target} from CT {vmid}.")
+    let host_path = host_stage_path(vmid, target);
+    let name = stage_name(io.node(), vmid, target);
+    let staged: Vec<Placement> = io
+        .placements()
+        .await?
+        .into_iter()
+        .filter(|p| p.guest.is_none() && p.name == name && p.target == host_path)
+        .collect();
+    if !staged.is_empty() {
+        if bind_pending {
+            msgs.push(format!(
+                "Kept host staging mount {host_path} until the CT restarts and releases it."
+            ));
+        } else {
+            for p in &staged {
+                io.delete_placement(&p.id).await?;
             }
-            Outcome::PendingRestart => format!(
-                "Pending restart: removed guest mount {target} from CT {vmid}; it is running \
-                 and keeps the mount until a restart."
-            ),
-            Outcome::Unverified(e) => format!(
-                "Pending restart, verify: removed guest mount {target} from CT {vmid}; its run \
-                 state is unknown ({e}), so if it is running it keeps the mount until a restart."
-            ),
-        });
+            msgs.push(format!("Released host staging mount {host_path}."));
+        }
+    }
+    if conf.has_raw_entry(target) {
+        msgs.push(legacy_entry_error(vmid, target));
     }
     if msgs.is_empty() {
         msgs.push(format!("Guest mount {target} not present on CT {vmid}."));
     }
     Ok(msgs.join(" "))
-}
-
-/// What a raw-entry write means for the CT, read from the API run state.
-enum Outcome {
-    Unchanged,
-    Written,
-    PendingRestart,
-    Unverified(String),
-}
-
-async fn raw_outcome<I: GuestMountIo>(io: &I, vmid: u64, edit: RawEdit) -> Outcome {
-    if edit == RawEdit::Unchanged {
-        return Outcome::Unchanged;
-    }
-    match io.running(vmid).await {
-        Ok(true) => Outcome::PendingRestart,
-        Ok(false) => Outcome::Written,
-        Err(e) => Outcome::Unverified(e),
-    }
 }
 
 // ── Validation ──────────────────────────────────────────────────────────────
@@ -398,12 +396,13 @@ async fn raw_outcome<I: GuestMountIo>(io: &I, vmid: u64, edit: RawEdit) -> Outco
 #[derive(Debug, PartialEq, Eq)]
 enum Plan<'a> {
     Bind { src: &'a str, ro: bool },
-    Raw { fs_spec: &'a str },
+    Staged { ro: bool },
 }
 
 /// Validate every field of `spec` and pick how it is placed.
 fn classify(spec: &GuestMountSpec) -> Result<Plan<'_>, String> {
     check_target(&spec.target)?;
+    check_mp_field("target", &spec.target)?;
     check_token("fstype", &spec.fstype)?;
     if !spec.options.is_empty() {
         check_token("options", &spec.options)?;
@@ -414,6 +413,7 @@ fn classify(spec: &GuestMountSpec) -> Result<Plan<'_>, String> {
         .ok_or_else(|| format!("guest {}: share has no enabled source route", spec.guest))?;
     check_token("source", src)?;
     let opts = || parse_option_string(&spec.options);
+    let ro = opts().any(|o| o.key == "ro" && o.value.is_none_or(truthy));
     match spec.fstype.as_str() {
         "rbind" => Err("rbind mounts are not supported; a PVE mpN is a plain bind".to_string()),
         "bind" | "none" => {
@@ -425,14 +425,9 @@ fn classify(spec: &GuestMountSpec) -> Result<Plan<'_>, String> {
             }
             check_abs_path("bind source", src)?;
             check_mp_field("bind source", src)?;
-            check_mp_field("target", &spec.target)?;
-            let ro = opts().any(|o| o.key == "ro" && o.value.is_none_or(truthy));
             Ok(Plan::Bind { src, ro })
         }
-        t if NETWORK_FSTYPES.contains(&t) => {
-            check_network_mount(t, src, &spec.options)?;
-            Ok(Plan::Raw { fs_spec: src })
-        }
+        t if NETWORK_FSTYPES.contains(&t) => Ok(Plan::Staged { ro }),
         other => Err(format!(
             "unsupported guest mount fstype '{other}' (expected bind, cifs or nfs)"
         )),
@@ -477,146 +472,6 @@ fn check_mp_field(what: &str, s: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Mount options that would turn a network entry into a host bind or change
-/// mount propagation; refused by name so the error says why.
-const DENIED_OPTION_KEYS: &[&str] = &[
-    "bind",
-    "rbind",
-    "remount",
-    "move",
-    "shared",
-    "rshared",
-    "slave",
-    "rslave",
-    "private",
-    "rprivate",
-    "unbindable",
-    "runbindable",
-];
-
-/// Option keys any network entry may carry.
-const COMMON_OPTION_KEYS: &[&str] = &[
-    "ro",
-    "rw",
-    "vers",
-    "sec",
-    "soft",
-    "hard",
-    "_netdev",
-    "nofail",
-    "create",
-    "noexec",
-    "nosuid",
-    "nodev",
-    "noatime",
-    "nodiratime",
-    "relatime",
-];
-
-const CIFS_OPTION_KEYS: &[&str] = &[
-    "uid",
-    "gid",
-    "forceuid",
-    "forcegid",
-    "file_mode",
-    "dir_mode",
-    "noperm",
-    "nobrl",
-    "domain",
-    "iocharset",
-    "noserverino",
-    "cache",
-    "actimeo",
-    "mfsymlinks",
-    "seal",
-    "echo_interval",
-];
-
-const NFS_OPTION_KEYS: &[&str] = &[
-    "nfsvers",
-    "timeo",
-    "retrans",
-    "rsize",
-    "wsize",
-    "proto",
-    "port",
-    "nolock",
-    "lookupcache",
-    "actimeo",
-];
-
-/// A raw network entry: the source is a remote share in its fstype's grammar
-/// (never a local path) and every option is on the fstype's allowlist, so the
-/// entry cannot bind a host path into the guest.
-fn check_network_mount(fstype: &str, fs_spec: &str, options: &str) -> Result<(), String> {
-    check_token("source", fs_spec)?;
-    let fstype_keys = if is_cifs(fstype) {
-        check_cifs_spec(fs_spec)?;
-        CIFS_OPTION_KEYS
-    } else if NETWORK_FSTYPES.contains(&fstype) {
-        check_nfs_spec(fs_spec)?;
-        NFS_OPTION_KEYS
-    } else {
-        return Err(format!("raw guest mount fstype '{fstype}' refused"));
-    };
-    if options.is_empty() {
-        return Ok(());
-    }
-    check_token("options", options)?;
-    for opt in parse_option_string(options) {
-        if DENIED_OPTION_KEYS.contains(&opt.key) {
-            return Err(format!("{fstype} mount option '{}' is refused", opt.key));
-        }
-        if opt.key == "create" && opt.value != Some("dir") {
-            return Err(format!(
-                "{fstype} mount option 'create={}' is refused; only create=dir",
-                opt.value.unwrap_or_default()
-            ));
-        }
-        let allowed = COMMON_OPTION_KEYS.contains(&opt.key)
-            || fstype_keys.contains(&opt.key)
-            || (is_cifs(fstype) && CREDENTIAL_KEYS.contains(&opt.key));
-        if !allowed {
-            return Err(format!(
-                "{fstype} mount option '{}' is not on the allowlist",
-                opt.key
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// `//host/share[/path]`.
-fn check_cifs_spec(fs_spec: &str) -> Result<(), String> {
-    let bad = || format!("cifs source '{fs_spec}' is not //host/share[/path]");
-    let rest = fs_spec.strip_prefix("//").ok_or_else(bad)?;
-    let mut parts = rest.split('/');
-    let host = parts.next().unwrap_or_default();
-    if host.is_empty() || parts.clone().next().is_none() {
-        return Err(bad());
-    }
-    if parts.any(|c| c.is_empty() || c == "." || c == "..") {
-        return Err(bad());
-    }
-    Ok(())
-}
-
-/// `host:/path`.
-fn check_nfs_spec(fs_spec: &str) -> Result<(), String> {
-    let bad = || format!("nfs source '{fs_spec}' is not host:/path");
-    let (host, path) = fs_spec
-        .find(":/")
-        .map(|i| (&fs_spec[..i], &fs_spec[i + 1..]))
-        .ok_or_else(bad)?;
-    if host.is_empty() || host.contains('/') {
-        return Err(bad());
-    }
-    if path != "/" {
-        check_abs_path("nfs export path", path).map_err(|_| bad())?;
-    }
-    Ok(())
-}
-
 fn truthy(v: &str) -> bool {
     matches!(v, "1" | "true" | "on" | "yes")
 }
@@ -629,12 +484,14 @@ fn parse_vmid(guest: &str) -> Result<u64, String> {
         .map_err(|_| format!("guest '{guest}' is not a numeric LXC vmid"))
 }
 
-// ── PVE API ─────────────────────────────────────────────────────────────────
+// ── PVE API + orca placements ───────────────────────────────────────────────
 
-/// The CT state and writes guest mounts need; [`PveIo`] is the real one.
+/// The CT state, placements and writes guest mounts need; [`PveIo`] is the
+/// real one.
 pub(crate) trait GuestMountIo {
+    /// The PVE node the CT runs on.
+    fn node(&self) -> &str;
     async fn conf(&self, vmid: u64) -> Result<CtConf, String>;
-    async fn running(&self, vmid: u64) -> Result<bool, String>;
     /// `PUT .../config` with `set`, `delete` and `digest`.
     async fn set_mps(
         &self,
@@ -643,8 +500,24 @@ pub(crate) trait GuestMountIo {
         set: Option<(&str, &str)>,
         delete: &[String],
     ) -> Result<(), String>;
-    async fn set_entry(&self, op: &SetEntryOp) -> Result<RawEdit, String>;
-    async fn strip_entry(&self, op: &StripEntryOp) -> Result<RawEdit, String>;
+    async fn placements(&self) -> Result<Vec<Placement>, String>;
+    async fn insert_placement(&self, p: &Placement) -> Result<(), String>;
+    async fn update_placement(&self, p: &Placement) -> Result<(), String>;
+    async fn delete_placement(&self, id: &str) -> Result<(), String>;
+}
+
+/// The columns of an orca `mounts` row guest mounts read or author.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Placement {
+    id: String,
+    name: String,
+    share_id: String,
+    host: String,
+    target: String,
+    guest: Option<String>,
+    enabled: bool,
+    /// Host-local, written by orca's convergence tick; never authored here.
+    health: MountHealth,
 }
 
 /// One `mpN` as `GET .../pending` reports it.
@@ -807,23 +680,30 @@ fn pick_endpoint<C>(
     }
 }
 
-/// Whether `base_url`'s host resolves to an address bound on this machine.
-fn url_is_this_host(base_url: &str) -> bool {
-    use std::net::ToSocketAddrs;
-    let Some(authority) = base_url
-        .split_once("://")
-        .and_then(|(_, rest)| rest.split('/').next())
-    else {
+/// Whether `base_url`'s host is an address bound on this machine.
+async fn url_is_this_host(base_url: &str) -> bool {
+    let Ok(url) = url::Url::parse(base_url) else {
         return false;
     };
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if !p.contains(']') => (h, p.parse().unwrap_or(443)),
-        _ => (authority, 443),
+    let ips: Vec<IpAddr> = match url.host() {
+        Some(url::Host::Ipv4(ip)) => vec![ip.into()],
+        Some(url::Host::Ipv6(ip)) => vec![ip.into()],
+        Some(url::Host::Domain(d)) => {
+            let port = url.port_or_known_default().unwrap_or(443);
+            match tokio::net::lookup_host((d, port)).await {
+                Ok(addrs) => addrs.map(|a| a.ip()).collect(),
+                Err(_) => return false,
+            }
+        }
+        None => return false,
     };
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    (host, port).to_socket_addrs().is_ok_and(|mut addrs| {
-        addrs.any(|a| a.ip().is_loopback() || std::net::UdpSocket::bind((a.ip(), 0)).is_ok())
-    })
+    ips.into_iter().any(ip_is_local)
+}
+
+/// An unspecified address (`0.0.0.0`, `::`) binds anywhere, so it says nothing
+/// about which host a URL names.
+fn ip_is_local(ip: IpAddr) -> bool {
+    !ip.is_unspecified() && (ip.is_loopback() || std::net::UdpSocket::bind((ip, 0)).is_ok())
 }
 
 /// The API for one CT, on the enabled endpoint whose cluster hosts it.
@@ -834,9 +714,9 @@ struct PveIo {
 }
 
 impl PveIo {
-    /// Find the endpoint that hosts LXC `vmid` on this node: a raw entry and its
-    /// creds file are written locally. Endpoints that see the CT on another node
-    /// are skipped; when several see it here, the one whose URL is this host wins.
+    /// Find the endpoint that hosts LXC `vmid` on this node: the staging mount
+    /// lands on this host. Endpoints that see the CT on another node are
+    /// skipped; when several see it here, the one whose URL is this host wins.
     async fn locate(vmid: u64) -> Result<Self, String> {
         let local = crate::diagnostics::local_node();
         let mut hits = Vec::new();
@@ -850,7 +730,7 @@ impl PveIo {
             .await;
             match found {
                 Ok((cfg, ct)) => hits.push(EndpointHit {
-                    url_local: url_is_this_host(&cfg.base_url),
+                    url_local: url_is_this_host(&cfg.base_url).await,
                     endpoint: name,
                     node: ct.node,
                     cfg,
@@ -910,26 +790,16 @@ impl PveIo {
 }
 
 impl GuestMountIo for PveIo {
+    fn node(&self) -> &str {
+        &self.node
+    }
+
     async fn conf(&self, vmid: u64) -> Result<CtConf, String> {
         let http = self.cfg.build_reqwest_client().map_err(|e| e.to_string())?;
         let base = self.ct_url(vmid);
         let config = get_data(&http, &format!("{base}/config")).await?;
         let pending = get_data(&http, &format!("{base}/pending")).await?;
         parse_ct_conf(&config, &pending)
-    }
-
-    async fn running(&self, vmid: u64) -> Result<bool, String> {
-        use gtypes::GetVmStatusNodesNodeLxcVmidStatusCurrentResponseStatus as Status;
-        let status = self
-            .cfg
-            .build_generated_client()
-            .map_err(|e| e.to_string())?
-            .get_vm_status_nodes_node_lxc_vmid_status_current(&self.node, vmid as i64)
-            .await
-            .map_err(|e| format!("CT {vmid} status: {e}"))?
-            .into_inner()
-            .status;
-        Ok(status == Status::Running)
     }
 
     async fn set_mps(
@@ -949,12 +819,97 @@ impl GuestMountIo for PveIo {
         .map_err(|e| format!("CT {vmid} config: {e:#}"))
     }
 
-    async fn set_entry(&self, op: &SetEntryOp) -> Result<RawEdit, String> {
-        privileged(OP_SET_ENTRY, op).await
+    async fn placements(&self) -> Result<Vec<Placement>, String> {
+        placement_db::list().map_err(|e| format!("read orca mounts: {e:#}"))
     }
 
-    async fn strip_entry(&self, op: &StripEntryOp) -> Result<RawEdit, String> {
-        privileged(OP_STRIP_ENTRY, op).await
+    async fn insert_placement(&self, p: &Placement) -> Result<(), String> {
+        placement_db::insert(p).map_err(|e| format!("author host placement {}: {e:#}", p.target))
+    }
+
+    async fn update_placement(&self, p: &Placement) -> Result<(), String> {
+        placement_db::update(p).map_err(|e| format!("update host placement {}: {e:#}", p.target))
+    }
+
+    async fn delete_placement(&self, id: &str) -> Result<(), String> {
+        placement_db::remove(id).map_err(|e| format!("delete host placement {id}: {e:#}"))
+    }
+}
+
+/// orca core's `mounts` table over `db_op`, mirroring the row `storage.mount`
+/// writes. Only config columns are written; `health` and the other per-tick
+/// columns keep their defaults and belong to the convergence loop.
+mod placement_db {
+    use super::*;
+    use plugin_toolkit::anyhow::Result;
+
+    fn to_dbrow(p: &Placement) -> DbRow {
+        let mut m = DbRow::new();
+        m.insert("id".to_string(), DbValue::Text(p.id.clone()));
+        m.insert("name".to_string(), DbValue::Text(p.name.clone()));
+        m.insert("share_id".to_string(), DbValue::Text(p.share_id.clone()));
+        m.insert("host".to_string(), DbValue::Text(p.host.clone()));
+        m.insert("target".to_string(), DbValue::Text(p.target.clone()));
+        m.insert("guest".to_string(), ToDbValue::to_dbvalue(&p.guest));
+        m.insert("enabled".to_string(), DbValue::Bool(p.enabled));
+        m.insert(
+            "updated_at".to_string(),
+            DbValue::Int(plugin_toolkit::now_millis_since_epoch()),
+        );
+        m
+    }
+
+    fn from_dbrow(m: &DbRow) -> Result<Placement> {
+        let health: Option<String> = field_from_row(m, "health")?;
+        Ok(Placement {
+            id: field_from_row(m, "id")?,
+            name: field_from_row(m, "name")?,
+            share_id: field_from_row(m, "share_id")?,
+            host: field_from_row(m, "host")?,
+            target: field_from_row(m, "target")?,
+            guest: field_from_row::<Option<String>>(m, "guest")?.filter(|g| !g.trim().is_empty()),
+            enabled: field_from_row(m, "enabled")?,
+            health: health
+                .and_then(|h| serde_json::from_value(Value::String(h)).ok())
+                .unwrap_or(MountHealth::Missing),
+        })
+    }
+
+    pub(super) fn list() -> Result<Vec<Placement>> {
+        let reply = db_op(&DbOp::List {
+            namespace: String::new(),
+            table: MOUNTS_TABLE.to_string(),
+        })?;
+        reply.rows.iter().map(from_dbrow).collect()
+    }
+
+    pub(super) fn insert(p: &Placement) -> Result<()> {
+        db_op(&DbOp::Insert {
+            namespace: String::new(),
+            table: MOUNTS_TABLE.to_string(),
+            row: to_dbrow(p),
+        })?;
+        Ok(())
+    }
+
+    pub(super) fn update(p: &Placement) -> Result<()> {
+        db_op(&DbOp::Update {
+            namespace: String::new(),
+            table: MOUNTS_TABLE.to_string(),
+            key_col: "id".to_string(),
+            row: to_dbrow(p),
+        })?;
+        Ok(())
+    }
+
+    pub(super) fn remove(id: &str) -> Result<()> {
+        db_op(&DbOp::Delete {
+            namespace: String::new(),
+            table: MOUNTS_TABLE.to_string(),
+            key_col: "id".to_string(),
+            key: id.to_string(),
+        })?;
+        Ok(())
     }
 }
 
@@ -1105,59 +1060,7 @@ fn render_mp_value(src: &str, target: &str, ro: bool, extras: &[&str]) -> String
     out
 }
 
-// ── Privileged raw-entry ops (run as root) ──────────────────────────────────
-
-/// Payload of [`OP_SET_ENTRY`]. Carries the cifs password, so it is never logged.
-#[derive(Serialize, Deserialize)]
-pub(crate) struct SetEntryOp {
-    vmid: u64,
-    target: String,
-    fs_spec: String,
-    fstype: String,
-    options: String,
-    creds: Option<CifsCreds>,
-}
-
-impl SetEntryOp {
-    /// The full `lxc.mount.entry:` line, referencing `cred_path` when given.
-    fn entry_line(&self, cred_path: Option<&str>) -> String {
-        render_lxc_mount_entry(
-            &self.fs_spec,
-            &relative_mountpoint(&self.target),
-            &self.fstype,
-            &render_entry_options(&self.options, cred_path),
-        )
-    }
-
-    fn validate(&self) -> Result<(), String> {
-        check_target(&self.target)?;
-        check_network_mount(&self.fstype, &self.fs_spec, &self.options)?;
-        if let Some(c) = &self.creds {
-            check_token("username", &c.username)?;
-            if let Some(d) = &c.domain {
-                check_token("domain", d)?;
-            }
-            if c.password.chars().any(char::is_control) {
-                return Err("cifs password contains a control character".to_string());
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-pub(crate) struct CifsCreds {
-    username: String,
-    password: String,
-    domain: Option<String>,
-}
-
-/// Payload of [`OP_STRIP_ENTRY`].
-#[derive(Serialize, Deserialize)]
-pub(crate) struct StripEntryOp {
-    vmid: u64,
-    target: String,
-}
+// ── Privileged tmpfs resize (runs as root) ──────────────────────────────────
 
 /// Payload of [`OP_SHM_RESIZE`]: the `size=` of a CT's tmpfs `lxc.mount.entry`,
 /// which has no PVE API. `target` is the entry's relative mountpoint (`dev/shm`).
@@ -1194,109 +1097,36 @@ pub(crate) async fn shm_resize(op: &ShmResizeOp) -> Result<RawEdit, String> {
 
 /// The closed op set this plugin serves as root in `--privileged-op` mode.
 pub fn privileged_ops() -> PrivilegedOps {
-    PrivilegedOps::new()
-        .op(OP_SET_ENTRY, |op: SetEntryOp| async move {
-            root_set_entry(Path::new("/"), &op)
-                .map(|e| e.detail().to_string())
-                .map_err(plugin_toolkit::anyhow::Error::msg)
-        })
-        .op(OP_STRIP_ENTRY, |op: StripEntryOp| async move {
-            root_strip_entry(Path::new("/"), &op)
-                .map(|e| e.detail().to_string())
-                .map_err(plugin_toolkit::anyhow::Error::msg)
-        })
-        .op(OP_SHM_RESIZE, |op: ShmResizeOp| async move {
-            root_shm_resize(Path::new("/"), &op)
-                .map(|e| e.detail().to_string())
-                .map_err(plugin_toolkit::anyhow::Error::msg)
-        })
-}
-
-/// Root side of [`OP_SET_ENTRY`]: write the creds file (if any), then upsert the
-/// entry under PVE's config lock.
-fn root_set_entry(root: &Path, op: &SetEntryOp) -> Result<RawEdit, String> {
-    op.validate()?;
-    let clash = |key: String| {
-        format!(
-            "CT {}: {key} already mounts {}; remove it before placing a {} mount there",
-            op.vmid, op.target, op.fstype
-        )
-    };
-    let path = lxc_conf_path_in(root, op.vmid)?;
-    if let Some(key) = mp_on_target(split_live_section(&read_conf(&path)?).0, &op.target) {
-        return Err(clash(key));
-    }
-    sweep_stale_temps_in(root, pid_alive);
-    let cred_path = op
-        .creds
-        .as_ref()
-        .map(|c| write_creds_file_in(root, op.vmid, &op.target, c))
-        .transpose()?;
-    let rel = relative_mountpoint(&op.target);
-    let line = op.entry_line(cred_path.as_deref());
-    let mp_clash = std::cell::RefCell::new(None);
-    let edit = edit_raw_conf_in(root, op.vmid, |conf| {
-        // Re-checked under the lock: an mpN may have landed since the read above.
-        if let Some(key) = mp_on_target(conf, &op.target) {
-            *mp_clash.borrow_mut() = Some(key);
-            return None;
-        }
-        let (rewritten, changed) = upsert_entry(conf, &rel, &line);
-        changed.then_some(rewritten)
-    });
-    if let Some(key) = mp_clash.into_inner() {
-        return Err(clash(key));
-    }
-    let edit = edit?;
-    if cred_path.is_none() {
-        remove_creds_if_unreferenced(root, &guest_creds_path(op.vmid, &op.target));
-    }
-    sweep_orphan_creds_in(root);
-    Ok(edit)
-}
-
-/// The `mpN` key in a live config section whose `mp=` is `target`.
-fn mp_on_target(live: &str, target: &str) -> Option<String> {
-    live.lines().find_map(|l| {
-        let (key, value) = l.split_once(':')?;
-        let key = key.trim();
-        (is_mp_key(key) && parse_mp(value.trim()).mp == Some(target)).then(|| key.to_string())
+    PrivilegedOps::new().op(OP_SHM_RESIZE, |op: ShmResizeOp| async move {
+        root_shm_resize(Path::new("/"), &op)
+            .map(|e| e.detail().to_string())
+            .map_err(plugin_toolkit::anyhow::Error::msg)
     })
 }
 
-/// Root side of [`OP_STRIP_ENTRY`]: drop the entry, then its creds file once no
-/// config references it.
-fn root_strip_entry(root: &Path, op: &StripEntryOp) -> Result<RawEdit, String> {
-    check_target(&op.target)?;
-    sweep_stale_temps_in(root, pid_alive);
-    let rel = relative_mountpoint(&op.target);
-    let edit = edit_raw_conf_in(root, op.vmid, |conf| {
-        let (rewritten, removed) = strip_entry(conf, &rel);
-        removed.then_some(rewritten)
-    })?;
-    remove_creds_if_unreferenced(root, &guest_creds_path(op.vmid, &op.target));
-    sweep_orphan_creds_in(root);
-    Ok(edit)
-}
-
-/// Root side of [`OP_SHM_RESIZE`].
+/// Root side of [`OP_SHM_RESIZE`]. The memory cap is checked by the edit itself,
+/// so it holds against the config re-read under the lock.
 fn root_shm_resize(root: &Path, op: &ShmResizeOp) -> Result<RawEdit, String> {
     op.validate()?;
     sweep_stale_temps_in(root, pid_alive);
-    let path = lxc_conf_path_in(root, op.vmid)?;
-    if let Some(mem) = ct_memory_mb(split_live_section(&read_conf(&path)?).0)
-        && op.size_mb > mem
-    {
+    let over = std::cell::Cell::new(None);
+    let edit = edit_raw_conf_in(root, op.vmid, |conf| {
+        let mem = ct_memory_mb(conf).unwrap_or(CT_DEFAULT_MEMORY_MB);
+        over.set((op.size_mb > mem).then_some(mem));
+        if op.size_mb > mem {
+            return None;
+        }
+        let (rewritten, changed) =
+            crate::shm_trap::rewrite_tmpfs_size(conf, &op.target, op.size_mb);
+        changed.then_some(rewritten)
+    });
+    if let Some(mem) = over.get() {
         return Err(format!(
             "tmpfs size {} MiB exceeds CT {} memory ({mem} MiB)",
             op.size_mb, op.vmid
         ));
     }
-    edit_raw_conf_in(root, op.vmid, |conf| {
-        let (rewritten, changed) =
-            crate::shm_trap::rewrite_tmpfs_size(conf, &op.target, op.size_mb);
-        changed.then_some(rewritten)
-    })
+    edit
 }
 
 /// The CT's `memory:` (MiB) from its live config section.
@@ -1307,11 +1137,6 @@ fn ct_memory_mb(live: &str) -> Option<u64> {
 }
 
 // ── Node-local paths ────────────────────────────────────────────────────────
-
-/// `abs` resolved under `root` (`/` in production, a scratch dir in tests).
-fn under(root: &Path, abs: &str) -> PathBuf {
-    root.join(abs.trim_start_matches('/'))
-}
 
 /// The LXC config path for `vmid`, erroring if it is not an LXC (e.g. a VM,
 /// whose config lives under `qemu-server/` and whose mounts are a later phase).
@@ -1338,12 +1163,26 @@ fn lxc_conf_path_in(root: &Path, vmid: u64) -> Result<String, String> {
     ))
 }
 
-/// Root-owned `0600` creds-file path for a guest's mount, under
-/// [`SECRET_FILE_DIR`] (so the privileged allowlist scopes writes there) and
-/// keyed by BOTH vmid and target — many guests can mount the same path, so the
-/// generic `secret_file_path` (target-only) would collide across guests.
-fn guest_creds_path(vmid: u64, target: &str) -> String {
-    format!("{SECRET_FILE_DIR}/guest-{vmid}-{}.secret", slug(target))
+/// Host path a CT's network share is staged at: `/mnt/orca-guest/<vmid>/<slug>`.
+fn host_stage_path(vmid: u64, target: &str) -> String {
+    format!("{HOST_STAGE_DIR}/{vmid}/{}", stage_slug(target))
+}
+
+/// Name of the host placement staging `target` for CT `vmid` on `node`. The
+/// node keeps CTs of separate clusters that share a vmid apart.
+fn stage_name(node: &str, vmid: u64, target: &str) -> String {
+    format!("guest-{node}-{vmid}-{}", stage_slug(target))
+}
+
+/// [`slug`], capped at [`MAX_SLUG_LEN`]: a longer one keeps its prefix and ends
+/// in a hash of the full target, so distinct targets stay distinct.
+fn stage_slug(target: &str) -> String {
+    let s = slug(target);
+    if s.len() <= MAX_SLUG_LEN {
+        return s;
+    }
+    let hash = plugin_toolkit::hash::sha256_hex(target.as_bytes());
+    format!("{}-{}", &s[..MAX_SLUG_LEN - 17], &hash[..16])
 }
 
 /// Filesystem-safe, reversible slug of a mountpoint: ASCII alphanumerics stay,
@@ -1362,138 +1201,10 @@ fn slug(target: &str) -> String {
         .collect()
 }
 
-// ── Credential handling ─────────────────────────────────────────────────────
-
-/// Resolve the credential ref to a password and pair it with the identity in
-/// the options. Runs plugin-side, where the secrets domain is reachable.
-fn resolve_creds(cred_ref: &str, options: &str) -> Result<CifsCreds, String> {
-    let password = plugin_toolkit::secrets::get_required(cred_ref)
-        .map_err(|e| format!("resolve credential '{cred_ref}': {e}"))?;
-    let (username, domain) = extract_identity(options);
-    let username =
-        username.ok_or("cifs mount has a credential but no `username=` in its options")?;
-    Ok(CifsCreds {
-        username,
-        password,
-        domain,
-    })
-}
-
-/// Write the creds file root-owned `0600`; returns its absolute path for the
-/// entry's `credentials=`.
-fn write_creds_file_in(
-    root: &Path,
-    vmid: u64,
-    target: &str,
-    creds: &CifsCreds,
-) -> Result<String, String> {
-    let contents = render_creds_file(&creds.username, &creds.password, creds.domain.as_deref());
-    let path = guest_creds_path(vmid, target);
-    let file = under(root, &path);
-    if let Some(parent) = file.parent() {
-        ensure_private_dir(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-    if creds_file_current(&file, contents.as_bytes()) {
-        return Ok(path);
-    }
-    atomic_write(&file, contents.as_bytes(), CREDS_FILE_MODE, Some((0, 0)))
-        .map_err(|e| format!("write creds file {path}: {e}"))?;
-    Ok(path)
-}
-
-/// Create `dir` (and parents) and force it to `0700`.
-fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(CREDS_DIR_MODE)
-        .create(dir)?;
-    if std::fs::metadata(dir)?.mode() & 0o7777 != CREDS_DIR_MODE {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(CREDS_DIR_MODE))?;
-    }
-    Ok(())
-}
-
-/// True when the creds file already holds `contents` with the expected mode, so
-/// an unchanged secret is not rewritten every converge tick.
-fn creds_file_current(path: &Path, contents: &[u8]) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    meta.mode() & 0o7777 == CREDS_FILE_MODE
-        && std::fs::read(path).is_ok_and(|existing| existing == contents)
-}
-
-/// Every `credentials=` path any LXC config on this node references, snapshots
-/// and pending sections included. `None` when the configs can't be read, so a
-/// caller never deletes on a partial view.
-fn referenced_creds(root: &Path) -> Option<Vec<String>> {
-    let mut refs = Vec::new();
-    for entry in std::fs::read_dir(root.join("etc/pve/lxc")).ok()? {
-        let path = entry.ok()?.path();
-        if path.extension().is_none_or(|e| e != "conf") {
-            continue;
-        }
-        let conf = std::fs::read_to_string(&path).ok()?;
-        refs.extend(
-            conf.split([',', ' ', '\t', '\n'])
-                .filter_map(|t| t.strip_prefix("credentials="))
-                .map(str::to_string),
-        );
-    }
-    Some(refs)
-}
-
-fn remove_creds_if_unreferenced(root: &Path, path: &str) {
-    if referenced_creds(root).is_some_and(|refs| !refs.iter().any(|r| r == path)) {
-        std::fs::remove_file(under(root, path)).ok();
-    }
-}
-
-/// Delete `guest-*.secret` files no LXC config references, past
-/// [`CREDS_ORPHAN_AGE`].
-fn sweep_orphan_creds_in(root: &Path) {
-    let Some(refs) = referenced_creds(root) else {
-        return;
-    };
-    let Ok(dir) = std::fs::read_dir(under(root, SECRET_FILE_DIR)) else {
-        return;
-    };
-    for entry in dir.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !(name.starts_with("guest-") && name.ends_with(".secret")) {
-            continue;
-        }
-        let abs = format!("{SECRET_FILE_DIR}/{name}");
-        if !refs.contains(&abs) && older_than(&entry.path(), CREDS_ORPHAN_AGE) {
-            std::fs::remove_file(entry.path()).ok();
-        }
-    }
-}
-
-/// Extract `username=` and `domain=` from a rendered option string (the inline
-/// identity a cifs creds-file needs). Password is never taken from options — it
-/// is the resolved secret.
-fn extract_identity(options: &str) -> (Option<String>, Option<String>) {
-    let mut username = None;
-    let mut domain = None;
-    for opt in parse_option_string(options) {
-        match (opt.key, opt.value) {
-            ("username" | "user", Some(v)) => username = Some(v.to_string()),
-            ("domain", Some(v)) => domain = Some(v.to_string()),
-            _ => {}
-        }
-    }
-    (username, domain)
-}
-
-/// The exact `mount.cifs` `credentials=` file grammar — `username=`, `password=`,
-/// and (when set) `domain=`, one per line.
-fn render_creds_file(username: &str, password: &str, domain: Option<&str>) -> String {
-    let mut out = format!("username={username}\npassword={password}\n");
-    if let Some(d) = domain {
-        out.push_str(&format!("domain={d}\n"));
-    }
-    out
+/// Strip the leading `/` from an absolute guest mountpoint — an
+/// `lxc.mount.entry` mountpoint is relative to the guest rootfs.
+fn relative_mountpoint(target: &str) -> String {
+    target.trim_start_matches('/').to_string()
 }
 
 // ── Safe file writes ────────────────────────────────────────────────────────
@@ -1570,33 +1281,30 @@ fn pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
-/// The pid in a `.<name>.tmp.<pid>.<seq>` temp name ending in `.conf` or
-/// `.secret`, or `None` if `name` is not one of ours.
+/// The pid in a `.<name>.conf.tmp.<pid>.<seq>` temp name, or `None` if `name`
+/// is not one of ours.
 fn temp_pid(name: &str) -> Option<u32> {
     let (head, seq) = name.strip_prefix('.')?.rsplit_once('.')?;
     let (head, pid) = head.rsplit_once('.')?;
     let base = head.strip_suffix(".tmp")?;
-    (seq.bytes().all(|b| b.is_ascii_digit())
-        && (base.ends_with(".conf") || base.ends_with(".secret")))
-    .then(|| pid.parse().ok())?
+    (seq.bytes().all(|b| b.is_ascii_digit()) && base.ends_with(".conf"))
+        .then(|| pid.parse().ok())?
 }
 
-/// Delete temp files a crashed write left in `/etc/pve/lxc` or the creds dir:
-/// those whose writer is gone, or that are older than [`TEMP_STALE_AGE`] (the
-/// pid may have been reused). A live writer's fresh temp is left alone.
+/// Delete temp files a crashed write left in `/etc/pve/lxc`: those whose writer
+/// is gone, or that are older than [`TEMP_STALE_AGE`] (the pid may have been
+/// reused). A live writer's fresh temp is left alone.
 fn sweep_stale_temps_in(root: &Path, alive: impl Fn(u32) -> bool) {
     let me = std::process::id();
-    for dir in [root.join("etc/pve/lxc"), under(root, SECRET_FILE_DIR)] {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    let Ok(entries) = std::fs::read_dir(root.join("etc/pve/lxc")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = temp_pid(&entry.file_name().to_string_lossy()) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let Some(pid) = temp_pid(&entry.file_name().to_string_lossy()) else {
-                continue;
-            };
-            if pid != me && (!alive(pid) || older_than(&entry.path(), TEMP_STALE_AGE)) {
-                std::fs::remove_file(entry.path()).ok();
-            }
+        if pid != me && (!alive(pid) || older_than(&entry.path(), TEMP_STALE_AGE)) {
+            std::fs::remove_file(entry.path()).ok();
         }
     }
 }
@@ -1714,107 +1422,6 @@ where
     Ok(RawEdit::Written)
 }
 
-// ── Pure entry rendering ────────────────────────────────────────────────────
-
-/// Strip the leading `/` from an absolute guest mountpoint — an
-/// `lxc.mount.entry` mountpoint is relative to the guest rootfs.
-fn relative_mountpoint(target: &str) -> String {
-    target.trim_start_matches('/').to_string()
-}
-
-/// True if the fstype is a cifs/smb kernel type.
-fn is_cifs(fstype: &str) -> bool {
-    fstype == "cifs" || fstype == "smb3" || fstype == "smb"
-}
-
-/// Build the option field of the entry: drop every inline credential key (moved
-/// to the creds file), add `credentials=<path>` when one was written, and ensure
-/// `create=dir` so lxc creates the mountpoint if it is missing.
-fn render_entry_options(options: &str, cred_path: Option<&str>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let mut has_create = false;
-    for opt in parse_option_string(options) {
-        if CREDENTIAL_KEYS.contains(&opt.key) {
-            continue;
-        }
-        if opt.key == "create" {
-            has_create = true;
-        }
-        match opt.value {
-            Some(v) => parts.push(format!("{}={}", opt.key, v)),
-            None => parts.push(opt.key.to_string()),
-        }
-    }
-    if let Some(p) = cred_path {
-        parts.push(format!("credentials={p}"));
-    }
-    if !has_create {
-        parts.push("create=dir".to_string());
-    }
-    parts.join(",")
-}
-
-/// Render a full `lxc.mount.entry:` line. `dump`/`pass` are always `0 0`.
-fn render_lxc_mount_entry(
-    fs_spec: &str,
-    mountpoint_rel: &str,
-    fstype: &str,
-    options: &str,
-) -> String {
-    format!("lxc.mount.entry: {fs_spec} {mountpoint_rel} {fstype} {options} 0 0")
-}
-
-/// The mountpoint field (2nd token after the key) of an `lxc.mount.entry` line,
-/// if this line is one.
-fn entry_mountpoint(line: &str) -> Option<&str> {
-    let rest = line.trim().strip_prefix("lxc.mount.entry:")?;
-    rest.split_whitespace().nth(1)
-}
-
-/// Replace the existing `lxc.mount.entry` for `mountpoint_rel` with `new_line`,
-/// or append it if none exists. Every other line is preserved byte-for-byte.
-/// Returns the rewritten config and whether it changed.
-fn upsert_entry(conf: &str, mountpoint_rel: &str, new_line: &str) -> (String, bool) {
-    let mut out = String::with_capacity(conf.len() + new_line.len() + 1);
-    let mut replaced = false;
-    let mut changed = false;
-    for line in conf.lines() {
-        if entry_mountpoint(line) == Some(mountpoint_rel) {
-            replaced = true;
-            if line.trim() != new_line {
-                changed = true;
-            }
-            out.push_str(new_line);
-            out.push('\n');
-        } else {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    if !replaced {
-        out.push_str(new_line);
-        out.push('\n');
-        changed = true;
-    }
-    (out, changed)
-}
-
-/// Remove the `lxc.mount.entry` for `mountpoint_rel`. Returns the rewritten
-/// config and whether a line was removed.
-fn strip_entry(conf: &str, mountpoint_rel: &str) -> (String, bool) {
-    let mut out = String::with_capacity(conf.len());
-    let mut removed = false;
-    for line in conf.lines() {
-        if entry_mountpoint(line) == Some(mountpoint_rel) {
-            removed = true;
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    (out, removed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1857,7 +1464,7 @@ mod tests {
     struct Fake {
         /// Successive `conf()` answers; the last one repeats.
         confs: Mutex<Vec<CtConf>>,
-        running: Result<bool, String>,
+        placements: Mutex<Vec<Placement>>,
         set_err: Option<String>,
         calls: Mutex<Vec<String>>,
     }
@@ -1866,18 +1473,35 @@ mod tests {
         fn new(confs: Vec<CtConf>) -> Self {
             Self {
                 confs: Mutex::new(confs),
-                running: Ok(false),
+                placements: Mutex::new(Vec::new()),
                 set_err: None,
                 calls: Mutex::new(Vec::new()),
             }
         }
 
+        fn with_placements(mut self, rows: Vec<Placement>) -> Self {
+            self.placements = Mutex::new(rows);
+            self
+        }
+
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn rows(&self) -> Vec<Placement> {
+            self.placements.lock().unwrap().clone()
+        }
+
+        fn log(&self, s: String) {
+            self.calls.lock().unwrap().push(s);
         }
     }
 
     impl GuestMountIo for Fake {
+        fn node(&self) -> &str {
+            "pve1"
+        }
+
         async fn conf(&self, _vmid: u64) -> Result<CtConf, String> {
             let mut confs = self.confs.lock().unwrap();
             Ok(if confs.len() > 1 {
@@ -1887,10 +1511,6 @@ mod tests {
             })
         }
 
-        async fn running(&self, _vmid: u64) -> Result<bool, String> {
-            self.running.clone()
-        }
-
         async fn set_mps(
             &self,
             _vmid: u64,
@@ -1898,27 +1518,34 @@ mod tests {
             set: Option<(&str, &str)>,
             delete: &[String],
         ) -> Result<(), String> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("put {:?}", config_put_pairs(digest, set, delete)));
+            self.log(format!("put {:?}", config_put_pairs(digest, set, delete)));
             self.set_err.clone().map_or(Ok(()), Err)
         }
 
-        async fn set_entry(&self, op: &SetEntryOp) -> Result<RawEdit, String> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("set_entry {}", op.entry_line(None)));
-            Ok(RawEdit::Written)
+        async fn placements(&self) -> Result<Vec<Placement>, String> {
+            Ok(self.rows())
         }
 
-        async fn strip_entry(&self, op: &StripEntryOp) -> Result<RawEdit, String> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("strip {}", op.target));
-            Ok(RawEdit::Written)
+        async fn insert_placement(&self, p: &Placement) -> Result<(), String> {
+            self.log(format!("insert {} {} {}", p.name, p.target, p.share_id));
+            self.placements.lock().unwrap().push(p.clone());
+            Ok(())
+        }
+
+        async fn update_placement(&self, p: &Placement) -> Result<(), String> {
+            self.log(format!("update {} {} {}", p.id, p.share_id, p.enabled));
+            for r in self.placements.lock().unwrap().iter_mut() {
+                if r.id == p.id {
+                    *r = p.clone();
+                }
+            }
+            Ok(())
+        }
+
+        async fn delete_placement(&self, id: &str) -> Result<(), String> {
+            self.log(format!("delete {id}"));
+            self.placements.lock().unwrap().retain(|r| r.id != id);
+            Ok(())
         }
     }
 
@@ -1937,6 +1564,32 @@ mod tests {
     fn bind(fake: &Fake, src: &str, target: &str, ro: bool) -> Result<String, String> {
         rt().block_on(apply_bind(fake, 110, src, target, ro))
     }
+
+    fn placement(id: &str, name: &str, target: &str, guest: Option<&str>) -> Placement {
+        Placement {
+            id: id.to_string(),
+            name: name.to_string(),
+            share_id: "share-1".to_string(),
+            host: "host-a".to_string(),
+            target: target.to_string(),
+            guest: guest.map(str::to_string),
+            enabled: true,
+            health: MountHealth::Missing,
+        }
+    }
+
+    fn guest_row() -> Placement {
+        placement("g1", "media", "/mnt/media", Some("110"))
+    }
+
+    fn staged(fake: &Fake, options: &str) -> Result<String, String> {
+        let s = spec("nfs4", "nas:/media", "/mnt/media", options);
+        let plan = classify(&s).unwrap();
+        rt().block_on(apply_with(fake, 110, &s, plan))
+    }
+
+    const STAGE_PATH: &str = "/mnt/orca-guest/110/mnt_2fmedia";
+    const STAGE_NAME: &str = "guest-pve1-110-mnt_2fmedia";
 
     // ── API config ──────────────────────────────────────────────────────────
 
@@ -2074,22 +1727,18 @@ mod tests {
     }
 
     #[test]
-    fn bind_strips_raw_entry_only_after_api_success() {
-        let raw = ["/srv/a mnt/a none bind,create=dir 0 0"];
-        let mut fake = Fake::new(vec![ct_conf(&[], &raw)]);
+    fn bind_refuses_a_legacy_raw_entry_and_surfaces_api_errors() {
+        let raw = ["//w/a mnt/a cifs create=dir 0 0"];
+        let fake = Fake::new(vec![ct_conf(&[], &raw)]);
+        let err = bind(&fake, "/srv/a", "/mnt/a", false).unwrap_err();
+        assert!(err.contains("legacy raw lxc.mount.entry"), "{err}");
+        assert!(fake.calls().is_empty());
+
+        let mut fake = Fake::new(vec![ct_conf(&[], &[])]);
         fake.set_err = Some("HTTP 403: Permission check failed".to_string());
         let err = bind(&fake, "/srv/a", "/mnt/a", false).unwrap_err();
         assert!(err.contains("403"), "{err}");
         assert_eq!(fake.calls().len(), 1);
-        assert!(fake.calls()[0].starts_with("put"));
-
-        fake.set_err = None;
-        fake.calls.lock().unwrap().clear();
-        bind(&fake, "/srv/a", "/mnt/a", false).unwrap();
-        let calls = fake.calls();
-        assert_eq!(calls.len(), 2);
-        assert!(calls[0].starts_with("put"));
-        assert_eq!(calls[1], "strip /mnt/a");
     }
 
     #[test]
@@ -2139,26 +1788,108 @@ mod tests {
         assert_eq!(config_put_pairs("d", None, &[]).len(), 1);
     }
 
+    // ── staged network shares ───────────────────────────────────────────────
+
     #[test]
-    fn remove_deletes_binds_then_strips_raw_entry() {
-        let before = ct_conf(
-            &[
-                ("mp0", Some("/srv/a,mp=/mnt/a"), None, false),
-                ("mp1", Some("/srv/x,mp=/mnt/x"), None, false),
-            ],
-            &["//w/a mnt/a cifs create=dir 0 0"],
-        );
-        let after = ct_conf(&[("mp1", Some("/srv/x,mp=/mnt/x"), None, false)], &[]);
-        let fake = Fake::new(vec![before, after]);
-        let msg = rt().block_on(remove_with(&fake, 110, "/mnt/a")).unwrap();
+    fn staged_first_apply_authors_a_host_placement_and_waits_for_it() {
+        let fake = Fake::new(vec![ct_conf(&[], &[])]).with_placements(vec![guest_row()]);
+        let msg = staged(&fake, "vers=4.2").unwrap();
         assert_eq!(
             fake.calls(),
-            [
-                r#"put [("digest", "d1"), ("delete", "mp0")]"#,
-                "strip /mnt/a"
-            ]
+            [format!("insert {STAGE_NAME} {STAGE_PATH} share-1")]
         );
-        assert!(msg.starts_with("Removed mp0 bind mount /mnt/a"), "{msg}");
+        let stage = fake
+            .rows()
+            .into_iter()
+            .find(|p| p.target == STAGE_PATH)
+            .unwrap();
+        assert_eq!(stage.host, "host-a");
+        assert_eq!(stage.guest, None);
+        assert!(stage.enabled);
+        assert!(plugin_toolkit::id::is_valid(&stage.id), "{}", stage.id);
+        assert!(msg.starts_with("Staging /mnt/media"), "{msg}");
+        assert!(msg.contains("missing"), "{msg}");
+
+        fake.calls.lock().unwrap().clear();
+        staged(&fake, "vers=4.2").unwrap();
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    }
+
+    #[test]
+    fn staged_binds_the_host_path_once_orca_reports_it_ok() {
+        let mut stage = placement("s1", STAGE_NAME, STAGE_PATH, None);
+        stage.health = MountHealth::Ok;
+        let fake = Fake::new(vec![ct_conf(&[], &[])]).with_placements(vec![guest_row(), stage]);
+        let msg = staged(&fake, "ro,vers=4.2").unwrap();
+        assert_eq!(
+            fake.calls(),
+            [format!(
+                r#"put [("digest", "d1"), ("mp0", "{STAGE_PATH},mp=/mnt/media,ro=1")]"#
+            )]
+        );
+        assert!(msg.starts_with("Set mp0 bind mount /mnt/media"), "{msg}");
+    }
+
+    #[test]
+    fn staged_repairs_a_disabled_or_repointed_stage() {
+        let mut stage = placement("s1", STAGE_NAME, STAGE_PATH, None);
+        stage.enabled = false;
+        stage.share_id = "share-old".to_string();
+        let fake = Fake::new(vec![ct_conf(&[], &[])]).with_placements(vec![guest_row(), stage]);
+        staged(&fake, "").unwrap();
+        assert_eq!(fake.calls(), ["update s1 share-1 true"]);
+    }
+
+    #[test]
+    fn staged_refuses_without_a_guest_placement_or_over_another_mount() {
+        let fake = Fake::new(vec![ct_conf(&[], &[])]);
+        let err = staged(&fake, "").unwrap_err();
+        assert!(err.contains("no enabled guest placement"), "{err}");
+
+        let other = placement("o1", "nas-media", STAGE_PATH, None);
+        let fake = Fake::new(vec![ct_conf(&[], &[])]).with_placements(vec![guest_row(), other]);
+        let err = staged(&fake, "").unwrap_err();
+        assert!(err.contains("'nas-media' already mounts"), "{err}");
+        assert!(fake.calls().is_empty());
+
+        let clash = placement("c1", STAGE_NAME, "/srv/elsewhere", None);
+        let fake = Fake::new(vec![ct_conf(&[], &[])]).with_placements(vec![guest_row(), clash]);
+        let err = staged(&fake, "").unwrap_err();
+        assert!(err.contains("not CT 110's staging mount"), "{err}");
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn remove_deletes_binds_then_releases_the_stage() {
+        let before = ct_conf(
+            &[
+                (
+                    "mp0",
+                    Some(format!("{STAGE_PATH},mp=/mnt/media").as_str()),
+                    None,
+                    false,
+                ),
+                ("mp1", Some("/srv/x,mp=/mnt/x"), None, false),
+            ],
+            &[],
+        );
+        let after = ct_conf(&[("mp1", Some("/srv/x,mp=/mnt/x"), None, false)], &[]);
+        let fake = Fake::new(vec![before, after]).with_placements(vec![
+            guest_row(),
+            placement("s1", STAGE_NAME, STAGE_PATH, None),
+        ]);
+        let msg = rt()
+            .block_on(remove_with(&fake, 110, "/mnt/media"))
+            .unwrap();
+        assert_eq!(
+            fake.calls(),
+            [r#"put [("digest", "d1"), ("delete", "mp0")]"#, "delete s1"]
+        );
+        assert!(
+            msg.starts_with("Removed mp0 bind mount /mnt/media"),
+            "{msg}"
+        );
+        assert!(msg.contains("Released host staging mount"), "{msg}");
 
         let fake = Fake::new(vec![ct_conf(&[], &[])]);
         let msg = rt().block_on(remove_with(&fake, 110, "/mnt/a")).unwrap();
@@ -2166,53 +1897,45 @@ mod tests {
         assert!(msg.contains("not present"), "{msg}");
     }
 
-    // ── raw entries ─────────────────────────────────────────────────────────
-
     #[test]
-    fn raw_mount_goes_through_the_seam_unless_identical() {
-        let s = spec("nfs4", "nas:/export", "/mnt/n", "vers=4.2");
-        let line = "nas:/export mnt/n nfs4 vers=4.2,create=dir 0 0";
-        let mut fake = Fake::new(vec![ct_conf(&[], &[])]);
-        fake.running = Ok(true);
+    fn remove_keeps_the_stage_while_the_bind_delete_is_pending() {
+        let value = format!("{STAGE_PATH},mp=/mnt/media");
+        let before = ct_conf(&[("mp0", Some(value.as_str()), None, false)], &[]);
+        let after = ct_conf(&[("mp0", Some(value.as_str()), None, true)], &[]);
+        let fake = Fake::new(vec![before, after])
+            .with_placements(vec![placement("s1", STAGE_NAME, STAGE_PATH, None)]);
         let msg = rt()
-            .block_on(apply_raw(&fake, 110, &s, "nas:/export"))
+            .block_on(remove_with(&fake, 110, "/mnt/media"))
             .unwrap();
-        assert_eq!(fake.calls(), [format!("set_entry lxc.mount.entry: {line}")]);
-        assert!(msg.starts_with("Pending restart:"), "{msg}");
-
-        let fake = Fake::new(vec![ct_conf(&[], &[line])]);
-        let msg = rt()
-            .block_on(apply_raw(&fake, 110, &s, "nas:/export"))
-            .unwrap();
-        assert!(fake.calls().is_empty());
-        assert!(msg.contains("already present"), "{msg}");
-
-        let mut fake = Fake::new(vec![ct_conf(&[], &[])]);
-        fake.running = Err("HTTP 500".to_string());
-        let msg = rt()
-            .block_on(apply_raw(&fake, 110, &s, "nas:/export"))
-            .unwrap();
-        assert!(msg.starts_with("Pending restart, verify"), "{msg}");
+        assert_eq!(fake.calls().len(), 1);
+        assert_eq!(fake.rows().len(), 1);
+        assert!(msg.contains("Kept host staging mount"), "{msg}");
     }
 
     #[test]
-    fn raw_mount_refuses_an_mp_on_the_target() {
-        let s = spec("cifs", "//w/a", "/mnt/a", "");
-        let fake = Fake::new(vec![ct_conf(
-            &[("mp0", Some("/srv/a,mp=/mnt/a"), None, false)],
-            &[],
-        )]);
-        let err = rt()
-            .block_on(apply_raw(&fake, 110, &s, "//w/a"))
-            .unwrap_err();
-        assert!(err.contains("mp0 already mounts"), "{err}");
-        assert!(fake.calls().is_empty());
+    fn stage_paths_are_deterministic_distinct_and_bounded() {
+        assert_eq!(host_stage_path(110, "/mnt/media"), STAGE_PATH);
+        assert_ne!(
+            host_stage_path(110, "/mnt/a-b"),
+            host_stage_path(110, "/mnt/a/b")
+        );
+        assert_ne!(
+            host_stage_path(110, "/mnt/b"),
+            host_stage_path(200, "/mnt/b")
+        );
+        let long_a = format!("/{}", "a/".repeat(60) + "x");
+        let long_b = format!("/{}", "a/".repeat(60) + "y");
+        let (sa, sb) = (stage_slug(&long_a), stage_slug(&long_b));
+        assert_eq!(sa.len(), MAX_SLUG_LEN);
+        assert_ne!(sa, sb);
+        assert_eq!(sa, stage_slug(&long_a));
+        assert_eq!(stage_slug("/mnt/media"), "mnt_2fmedia");
     }
 
     // ── validation ──────────────────────────────────────────────────────────
 
     #[test]
-    fn classify_routes_binds_and_network_mounts() {
+    fn classify_routes_binds_and_network_shares() {
         assert_eq!(
             classify(&spec("bind", "/srv/a", "/mnt/a", "ro")).unwrap(),
             Plan::Bind {
@@ -2228,8 +1951,12 @@ mod tests {
             }
         );
         assert_eq!(
-            classify(&spec("cifs", "//w/a", "/mnt/a", "vers=3.1.1")).unwrap(),
-            Plan::Raw { fs_spec: "//w/a" }
+            classify(&spec("cifs", "//w/a", "/mnt/a", "vers=3.1.1,ro=1")).unwrap(),
+            Plan::Staged { ro: true }
+        );
+        assert_eq!(
+            classify(&spec("nfs4", "nas:/a", "/mnt/a", "")).unwrap(),
+            Plan::Staged { ro: false }
         );
     }
 
@@ -2244,12 +1971,12 @@ mod tests {
             ),
             spec("cifs", "//w/a b", "/mnt/a", ""),
             spec("cifs", "//w/a", "/mnt/a", "vers=3 0 0\nx"),
-            spec("cifs", "//w/a", "/mnt/a", "a\u{7}"),
+            spec("cifs", "//w/a", "/mnt/a,ro=0", ""),
+            spec("nfs", "nas:/a", "/mnt/../etc", ""),
             spec("bind", "/srv/a,mp=/etc", "/mnt/a", ""),
             spec("bind", "/srv/a", "/mnt/a,ro=0", ""),
             spec("bind", "/srv/a=b", "/mnt/a", ""),
             spec("bind", "/srv/a", "mnt/a", ""),
-            spec("bind", "/srv/a", "/mnt/../etc", ""),
             spec("bind", "/srv/a", "/mnt/./a", ""),
             spec("bind", "/srv/a", "/mnt//a", ""),
             spec("bind", "/srv/a", "/mnt/a/", ""),
@@ -2277,101 +2004,6 @@ mod tests {
             })
             .is_err()
         );
-    }
-
-    #[test]
-    fn network_mounts_cannot_bind_a_host_path() {
-        let bad = [
-            spec("nfs", "/", "/mnt/a", "rbind,rw"),
-            spec("nfs", "/srv", "/mnt/a", ""),
-            spec("nfs", "nas:/srv", "/mnt/a", "bind"),
-            spec("nfs", "nas:/srv", "/mnt/a", "rshared"),
-            spec("nfs", "nas:/srv", "/mnt/a", "remount,rw"),
-            spec("nfs", "nas:/srv/../etc", "/mnt/a", ""),
-            spec("nfs", ":/srv", "/mnt/a", ""),
-            spec("nfs", "nas:srv", "/mnt/a", ""),
-            spec("nfs4", "nas:/srv", "/mnt/a", "create=file"),
-            spec("nfs4", "nas:/srv", "/mnt/a", "x-systemd.automount"),
-            spec("cifs", "/srv/a", "/mnt/a", ""),
-            spec("cifs", "//w", "/mnt/a", ""),
-            spec("cifs", "///a", "/mnt/a", ""),
-            spec("cifs", "//w/a/../b", "/mnt/a", ""),
-            spec("cifs", "//w/a", "/mnt/a", "move"),
-            spec("cifs", "//w/a", "/mnt/a", "private"),
-            spec("cifs", "//w/a", "/mnt/a", "timeo=5"),
-        ];
-        for s in &bad {
-            assert!(
-                classify(s).is_err(),
-                "accepted {} {:?} {:?}",
-                s.fstype,
-                s.sources,
-                s.options
-            );
-        }
-        for s in [
-            spec(
-                "nfs",
-                "nas:/",
-                "/mnt/a",
-                "ro,soft,timeo=50,retrans=3,_netdev,nofail",
-            ),
-            spec(
-                "nfs4",
-                "[fe80::1]:/srv/a",
-                "/mnt/a",
-                "vers=4.2,hard,create=dir",
-            ),
-            spec(
-                "cifs",
-                "//w/a/sub",
-                "/mnt/a",
-                "vers=3.1.1,uid=1000,gid=1000,file_mode=0644,dir_mode=0755,noperm,nobrl,\
-                 username=alice,credentials=/x",
-            ),
-        ] {
-            assert!(
-                classify(&s).is_ok(),
-                "refused {:?} {:?}",
-                s.sources,
-                s.options
-            );
-        }
-    }
-
-    #[test]
-    fn root_side_refuses_a_host_bind_payload() {
-        let op = SetEntryOp {
-            vmid: 110,
-            target: "/mnt/a".to_string(),
-            fs_spec: "/".to_string(),
-            fstype: "nfs".to_string(),
-            options: "rbind,rw".to_string(),
-            creds: None,
-        };
-        assert!(op.validate().is_err());
-        let root = pve_root("hostbind", 110, "arch: amd64\n");
-        assert!(root_set_entry(&root, &op).is_err());
-        assert_eq!(
-            std::fs::read_to_string(root.join("etc/pve/lxc/110.conf")).unwrap(),
-            "arch: amd64\n"
-        );
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn root_set_entry_refuses_a_target_an_mp_already_mounts() {
-        let conf = "arch: amd64\nmp2: /srv/a,mp=/mnt/a,ro=1\n";
-        let root = pve_root("mpclash", 110, conf);
-        let mut op = set_op("cifs", "pw");
-        op.creds = None;
-        let err = root_set_entry(&root, &op).unwrap_err();
-        assert!(err.contains("mp2"), "{err}");
-        assert_eq!(
-            std::fs::read_to_string(root.join("etc/pve/lxc/110.conf")).unwrap(),
-            conf
-        );
-        std::fs::remove_dir_all(&root).ok();
     }
 
     fn hit(endpoint: &str, node: &str, url_local: bool) -> EndpointHit<()> {
@@ -2427,28 +2059,26 @@ mod tests {
     }
 
     #[test]
-    fn bind_reports_a_pending_duplicate_delete() {
-        let before = ct_conf(
-            &[
-                ("mp3", Some("/srv/a,mp=/mnt/b"), None, false),
-                ("mp5", Some("/srv/dup,mp=/mnt/b"), None, false),
-            ],
-            &[],
-        );
-        let after = ct_conf(
-            &[
-                ("mp3", Some("/srv/a,mp=/mnt/b"), None, false),
-                ("mp5", Some("/srv/dup,mp=/mnt/b"), None, true),
-            ],
-            &[],
-        );
-        let fake = Fake::new(vec![before, after]);
-        let msg = bind(&fake, "/srv/a", "/mnt/b", false).unwrap();
-        assert!(msg.contains("delete of duplicate mp5"), "{msg}");
+    fn parse_vmid_rejects_non_numeric() {
+        assert_eq!(parse_vmid("110").unwrap(), 110);
+        assert!(parse_vmid("baldur").is_err());
     }
 
     #[test]
-    fn shm_resize_is_capped() {
+    fn url_host_check_parses_and_ignores_unspecified_addresses() {
+        let rt = rt();
+        assert!(rt.block_on(url_is_this_host("https://127.0.0.1:8006/api2/json")));
+        assert!(rt.block_on(url_is_this_host("https://[::1]:8006")));
+        assert!(!rt.block_on(url_is_this_host("https://0.0.0.0:8006")));
+        assert!(!rt.block_on(url_is_this_host("https://[::]:8006")));
+        assert!(!rt.block_on(url_is_this_host("not a url")));
+        assert!(!rt.block_on(url_is_this_host("https://192.0.2.1:8006")));
+        assert!(!ip_is_local("0.0.0.0".parse().unwrap()));
+        assert!(ip_is_local("127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn shm_resize_is_capped_by_ct_memory_or_its_default() {
         let op = |size_mb| ShmResizeOp {
             vmid: 120,
             target: "dev/shm".to_string(),
@@ -2456,70 +2086,44 @@ mod tests {
         };
         assert!(op(SHM_MAX_MB).validate().is_ok());
         assert!(op(SHM_MAX_MB + 1).validate().is_err());
-        let root = pve_root(
-            "shmcap",
-            120,
-            "memory: 2048\nlxc.mount.entry: tmpfs dev/shm tmpfs size=1g,mode=1777 0 0\n",
-        );
+        let entry = "lxc.mount.entry: tmpfs dev/shm tmpfs size=1g,mode=1777 0 0\n";
+        let root = pve_root("shmcap", 120, &format!("memory: 2048\n{entry}"));
         let err = root_shm_resize(&root, &op(4096)).unwrap_err();
         assert!(err.contains("2048"), "{err}");
         assert_eq!(root_shm_resize(&root, &op(1536)).unwrap(), RawEdit::Written);
         std::fs::remove_dir_all(&root).ok();
-    }
 
-    fn set_op(fstype: &str, password: &str) -> SetEntryOp {
-        SetEntryOp {
-            vmid: 110,
-            target: "/mnt/a".to_string(),
-            fs_spec: "//w/a".to_string(),
-            fstype: fstype.to_string(),
-            options: "vers=3.1.1".to_string(),
-            creds: Some(CifsCreds {
-                username: "alice".to_string(),
-                password: password.to_string(),
-                domain: None,
-            }),
-        }
+        let root = pve_root("shmdefault", 120, entry);
+        let err = root_shm_resize(&root, &op(1024)).unwrap_err();
+        assert!(err.contains("(512 MiB)"), "{err}");
+        assert_eq!(root_shm_resize(&root, &op(256)).unwrap(), RawEdit::Written);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn root_side_revalidates_the_payload() {
-        assert!(set_op("cifs", "p w").validate().is_ok());
-        assert!(set_op("cifs", "pw\nusername=root").validate().is_err());
-        assert!(set_op("bind", "pw").validate().is_err());
-        let mut op = set_op("cifs", "pw");
-        op.target = "/mnt/a\n".to_string();
-        assert!(op.validate().is_err());
-        let err = root_strip_entry(
-            Path::new("/nonexistent"),
-            &StripEntryOp {
-                vmid: 110,
-                target: "../etc".to_string(),
-            },
-        )
-        .unwrap_err();
-        assert!(err.contains("not absolute"), "{err}");
+    fn shm_cap_is_rechecked_against_the_config_under_the_lock() {
+        let root = pve_root("shmlock", 120, "memory: 4096\n");
+        let lxc = root.join("etc/pve/lxc/120.conf");
+        let calls = std::cell::Cell::new(0);
+        let edit = edit_raw_conf_in(&root, 120, |conf| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                std::fs::write(&lxc, "memory: 256\n").unwrap();
+            }
+            let mem = ct_memory_mb(conf).unwrap_or(CT_DEFAULT_MEMORY_MB);
+            (1024 <= mem).then(|| format!("{conf}x\n"))
+        })
+        .unwrap();
+        assert_eq!(edit, RawEdit::Unchanged);
+        assert_eq!(std::fs::read_to_string(&lxc).unwrap(), "memory: 256\n");
+        std::fs::remove_dir_all(&root).ok();
     }
-
-    #[test]
-    fn parse_vmid_rejects_non_numeric() {
-        assert_eq!(parse_vmid("110").unwrap(), 110);
-        assert!(parse_vmid("baldur").is_err());
-    }
-
-    // ── root-side files ─────────────────────────────────────────────────────
 
     fn pve_root(name: &str, vmid: u64, conf: &str) -> PathBuf {
         let root = scratch(name);
         std::fs::create_dir_all(root.join("etc/pve/lxc")).unwrap();
         std::fs::write(root.join(format!("etc/pve/lxc/{vmid}.conf")), conf).unwrap();
         root
-    }
-
-    fn creds_dir(root: &Path) -> PathBuf {
-        let d = under(root, SECRET_FILE_DIR);
-        std::fs::create_dir_all(&d).unwrap();
-        d
     }
 
     fn age(path: &Path, by: Duration) {
@@ -2532,64 +2136,9 @@ mod tests {
     }
 
     #[test]
-    fn root_set_entry_writes_entry_and_drops_unreferenced_creds() {
-        let root = pve_root("set", 110, "arch: amd64\n");
-        let creds = creds_dir(&root);
-        let mine = under(&root, &guest_creds_path(110, "/mnt/a"));
-        std::fs::write(&mine, "x").unwrap();
-        let orphan = creds.join("guest-999-mnt-x.secret");
-        std::fs::write(&orphan, "x").unwrap();
-        age(&orphan, CREDS_ORPHAN_AGE * 2);
-        let fresh = creds.join("guest-998-mnt-x.secret");
-        std::fs::write(&fresh, "x").unwrap();
-        let mut op = set_op("nfs4", "");
-        op.creds = None;
-        op.fs_spec = "w:/a".to_string();
-        op.options = "vers=4.2".to_string();
-
-        assert_eq!(root_set_entry(&root, &op).unwrap(), RawEdit::Written);
-        assert_eq!(
-            std::fs::read_to_string(root.join("etc/pve/lxc/110.conf")).unwrap(),
-            "arch: amd64\nlxc.mount.entry: w:/a mnt/a nfs4 vers=4.2,create=dir 0 0\n"
-        );
-        assert!(!mine.exists());
-        assert!(!orphan.exists());
-        assert!(
-            fresh.exists(),
-            "a fresh unreferenced creds file may be in flight"
-        );
-        assert_eq!(root_set_entry(&root, &op).unwrap(), RawEdit::Unchanged);
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn root_strip_keeps_creds_a_snapshot_still_references() {
-        let path = guest_creds_path(110, "/mnt/a");
-        let conf = format!(
-            "arch: amd64\nlxc.mount.entry: //w/a mnt/a cifs credentials={path},create=dir 0 0\n\
-             [snap1]\nlxc.mount.entry: //w/a mnt/a cifs credentials={path},create=dir 0 0\n"
-        );
-        let root = pve_root("strip", 110, &conf);
-        creds_dir(&root);
-        std::fs::write(under(&root, &path), "x").unwrap();
-        let op = StripEntryOp {
-            vmid: 110,
-            target: "/mnt/a".to_string(),
-        };
-        assert_eq!(root_strip_entry(&root, &op).unwrap(), RawEdit::Written);
-        assert!(under(&root, &path).exists());
-
-        let conf_path = root.join("etc/pve/lxc/110.conf");
-        std::fs::write(&conf_path, "arch: amd64\n").unwrap();
-        assert_eq!(root_strip_entry(&root, &op).unwrap(), RawEdit::Unchanged);
-        assert!(!under(&root, &path).exists());
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
     fn temp_names_parse_their_pid() {
         assert_eq!(temp_pid(".110.conf.tmp.42.0"), Some(42));
-        assert_eq!(temp_pid(".guest-110-mnt-a.secret.tmp.7.3"), Some(7));
+        assert_eq!(temp_pid(".guest-110-mnt-a.secret.tmp.7.3"), None);
         assert_eq!(temp_pid(".hidden"), None);
         assert_eq!(temp_pid("110.conf"), None);
         assert_eq!(temp_pid(".x.tmp.1.2"), None);
@@ -2600,7 +2149,6 @@ mod tests {
     fn sweep_removes_dead_or_old_temps_only() {
         let root = pve_root("sweep", 110, "arch: amd64\n");
         let lxc = root.join("etc/pve/lxc");
-        let creds = creds_dir(&root);
         let me = std::process::id();
         let files = [
             lxc.join(".110.conf.tmp.1000001.0"),
@@ -2608,7 +2156,6 @@ mod tests {
             lxc.join(".110.conf.tmp.1000003.0"),
             lxc.join(format!(".110.conf.tmp.{me}.0")),
             lxc.join(".hidden"),
-            creds.join(".guest-110-mnt-a.secret.tmp.1000001.1"),
         ];
         for f in &files {
             std::fs::write(f, "x").unwrap();
@@ -2616,94 +2163,56 @@ mod tests {
         age(&files[2], TEMP_STALE_AGE * 2);
         sweep_stale_temps_in(&root, |pid| pid != 1_000_001);
         let left: Vec<bool> = files.iter().map(|f| f.exists()).collect();
-        assert_eq!(left, [false, true, false, true, true, false]);
+        assert_eq!(left, [false, true, false, true, true]);
         std::fs::remove_dir_all(&root).ok();
     }
 
-    // ── rendering + conf edits ──────────────────────────────────────────────
-
     #[test]
-    fn relative_mountpoint_strips_leading_slash() {
-        assert_eq!(relative_mountpoint("/mnt/backups"), "mnt/backups");
-        assert_eq!(relative_mountpoint("mnt/backups"), "mnt/backups");
-    }
-
-    #[test]
-    fn entry_mountpoint_parses_second_field() {
-        let line =
-            "lxc.mount.entry: //willow/backups mnt/backups cifs credentials=/x,create=dir 0 0";
-        assert_eq!(entry_mountpoint(line), Some("mnt/backups"));
-        assert_eq!(entry_mountpoint("memory: 512"), None);
-    }
-
-    #[test]
-    fn render_entry_drops_inline_creds_and_adds_credentials_and_create() {
-        let opts = "vers=3.1.1,uid=1000,username=alice,password=secret,domain=WORK";
-        let got = render_entry_options(opts, Some("/etc/orca/secret-files/g.secret"));
-        assert!(!got.contains("username="));
-        assert!(!got.contains("password="));
-        assert!(got.contains("vers=3.1.1"));
-        assert!(got.contains("uid=1000"));
-        assert!(got.contains("credentials=/etc/orca/secret-files/g.secret"));
-        assert!(got.contains("create=dir"));
-    }
-
-    #[test]
-    fn render_entry_preserves_existing_create_and_omits_credentials_when_none() {
-        let got = render_entry_options("vers=4.2,hard,create=dir", None);
-        assert!(got.contains("hard"));
-        assert!(!got.contains("credentials="));
-        assert_eq!(got.matches("create=dir").count(), 1);
-    }
-
-    #[test]
-    fn upsert_and_strip_touch_only_the_matching_entry() {
-        let conf = "arch: amd64\nlxc.mount.entry: //old mnt/b cifs o 0 0\nmemory: 512\n";
-        let line = "lxc.mount.entry: //new mnt/b cifs o 0 0";
-        let (out, changed) = upsert_entry(conf, "mnt/b", line);
-        assert!(changed);
-        assert_eq!(out, format!("arch: amd64\n{line}\nmemory: 512\n"));
-        assert!(!upsert_entry(&out, "mnt/b", line).1);
-        let (stripped, removed) = strip_entry(&out, "mnt/b");
-        assert!(removed);
-        assert_eq!(stripped, "arch: amd64\nmemory: 512\n");
-        assert!(!strip_entry(&stripped, "mnt/b").1);
-    }
-
-    #[test]
-    fn extract_identity_and_creds_grammar() {
-        let (u, d) = extract_identity("vers=3.1.1,username=alice,domain=WORK,password=secret");
-        assert_eq!(u.as_deref(), Some("alice"));
-        assert_eq!(d.as_deref(), Some("WORK"));
-        assert_eq!(
-            render_creds_file("alice", "secret", Some("WORK")),
-            "username=alice\npassword=secret\ndomain=WORK\n"
-        );
-    }
-
-    #[test]
-    fn guest_creds_path_keys_by_vmid_and_target() {
-        assert!(guest_creds_path(110, "/mnt/b").starts_with(SECRET_FILE_DIR));
-        assert_ne!(
-            guest_creds_path(110, "/mnt/b"),
-            guest_creds_path(200, "/mnt/b")
-        );
-        assert_ne!(
-            guest_creds_path(110, "/mnt/a-b"),
-            guest_creds_path(110, "/mnt/a/b")
-        );
-        assert_ne!(
-            guest_creds_path(110, "/mnt/a_b"),
-            guest_creds_path(110, "/mnt/a/b")
-        );
-    }
-
-    #[test]
-    fn creds_temp_file_is_0600_at_creation() {
-        let dir = scratch("creds-mode");
-        let (file, _tmp) = create_temp_beside(&dir.join("x.secret"), CREDS_FILE_MODE).unwrap();
+    fn temp_file_mode_is_set_at_creation() {
+        let dir = scratch("temp-mode");
+        let (file, _tmp) = create_temp_beside(&dir.join("x.conf"), 0o600).unwrap();
         assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edit_never_touches_snapshot_sections() {
+        let snap = "[snap1]\nmemory: 512\n";
+        let conf = format!("arch: amd64\n{snap}");
+        let out = edit_live_section(&conf, |c| Some(format!("{c}memory: 1024\n"))).unwrap();
+        assert_eq!(out, format!("arch: amd64\nmemory: 1024\n{snap}"));
+    }
+
+    #[test]
+    fn edit_raw_conf_waits_on_the_pve_lock_and_refuses_a_vm() {
+        let root = pve_root("edit", 110, "arch: amd64\n[pve:pending]\nmemory: 1024\n");
+        let append = |c: &str| (!c.contains("swap")).then(|| format!("{c}swap: 0\n"));
+        let held = lock_exclusive(
+            &root.join("run/lock/lxc/pve-config-110.lock"),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let err = edit_raw_conf_in(&root, 110, append).unwrap_err();
+        assert!(err.contains("config lock"), "{err}");
+        drop(held);
+        assert_eq!(
+            edit_raw_conf_in(&root, 110, append).unwrap(),
+            RawEdit::Written
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("etc/pve/lxc/110.conf")).unwrap(),
+            "arch: amd64\nswap: 0\n[pve:pending]\nmemory: 1024\n"
+        );
+        assert_eq!(
+            edit_raw_conf_in(&root, 110, append).unwrap(),
+            RawEdit::Unchanged
+        );
+
+        std::fs::create_dir_all(root.join("etc/pve/qemu-server")).unwrap();
+        std::fs::write(root.join("etc/pve/qemu-server/200.conf"), "").unwrap();
+        let err = edit_raw_conf_in(&root, 200, |_| Some(String::new())).unwrap_err();
+        assert!(err.contains("is a VM"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2717,50 +2226,6 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o640);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn edit_never_touches_snapshot_sections() {
-        let snap = "[snap1]\nlxc.mount.entry: //old mnt/b cifs o 0 0\n";
-        let conf = format!("arch: amd64\n{snap}");
-        let line = "lxc.mount.entry: //new mnt/b cifs create=dir 0 0";
-        let out = edit_live_section(&conf, |c| {
-            let (r, changed) = upsert_entry(c, "mnt/b", line);
-            changed.then_some(r)
-        })
-        .unwrap();
-        assert_eq!(out, format!("arch: amd64\n{line}\n{snap}"));
-    }
-
-    #[test]
-    fn edit_raw_conf_waits_on_the_pve_lock_and_refuses_a_vm() {
-        let root = pve_root("edit", 110, "arch: amd64\n[pve:pending]\nmemory: 1024\n");
-        let upsert = |c: &str| {
-            let (r, changed) = upsert_entry(c, "mnt/b", "lxc.mount.entry: //w/b mnt/b cifs o 0 0");
-            changed.then_some(r)
-        };
-        let held = lock_exclusive(
-            &root.join("run/lock/lxc/pve-config-110.lock"),
-            Duration::ZERO,
-        )
-        .unwrap();
-        let err = edit_raw_conf_in(&root, 110, upsert).unwrap_err();
-        assert!(err.contains("config lock"), "{err}");
-        drop(held);
-        assert_eq!(
-            edit_raw_conf_in(&root, 110, upsert).unwrap(),
-            RawEdit::Written
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join("etc/pve/lxc/110.conf")).unwrap(),
-            "arch: amd64\nlxc.mount.entry: //w/b mnt/b cifs o 0 0\n[pve:pending]\nmemory: 1024\n"
-        );
-
-        std::fs::create_dir_all(root.join("etc/pve/qemu-server")).unwrap();
-        std::fs::write(root.join("etc/pve/qemu-server/200.conf"), "").unwrap();
-        let err = edit_raw_conf_in(&root, 200, |_| Some(String::new())).unwrap_err();
-        assert!(err.contains("is a VM"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
