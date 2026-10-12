@@ -382,7 +382,8 @@ pub async fn find_ct(client: &generated::Client, vmid: u64) -> Result<CtRef> {
         .ok_or_else(|| anyhow!("no guest {vmid} in the cluster"))
 }
 
-/// [`find_ct`], with `None` when the cluster has no guest `vmid`.
+/// [`find_ct`], with `None` when the cluster has no guest `vmid`; errors if the
+/// token cannot audit that path.
 pub async fn find_ct_opt(client: &generated::Client, vmid: u64) -> Result<Option<CtRef>> {
     use gtypes::GetResourcesClusterResourcesResponseItemType as Kind;
     let items = client
@@ -414,13 +415,11 @@ pub async fn find_ct_opt(client: &generated::Client, vmid: u64) -> Result<Option
     }))
 }
 
-/// `perms` is the `/access/permissions?path=/vms/{vmid}` body.
+/// `perms` is the `/access/permissions?path=/vms/{vmid}` body. A listed
+/// privilege is held; its value is the propagate flag, not a grant.
 fn require_audit(vmid: u64, perms: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
     let path = format!("/vms/{vmid}");
-    let audit = perms
-        .get(&path)
-        .and_then(|p| p.get("VM.Audit"))
-        .is_some_and(|v| v.as_u64().is_some_and(|n| n != 0) || v.as_bool() == Some(true));
+    let audit = perms.get(&path).and_then(|p| p.get("VM.Audit")).is_some();
     if !audit {
         bail!(
             "guest {vmid} not listed and the token lacks VM.Audit on {path}; cannot tell whether \
@@ -631,7 +630,7 @@ mod tests {
             .to_string();
         assert!(err.contains("lacks VM.Audit"), "{err}");
         assert!(check("{}").is_err());
-        assert!(check(r#"{"/vms/110":{"VM.Audit":0}}"#).is_err());
+        assert!(check(r#"{"/vms/110":{"VM.Audit":0}}"#).is_ok());
         assert!(check(r#"{"/vms/110":{"VM.Audit":1}}"#).is_ok());
     }
 
