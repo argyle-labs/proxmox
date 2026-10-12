@@ -72,6 +72,8 @@ const TEMP_STALE_AGE: Duration = Duration::from_secs(600);
 const CREDS_ORPHAN_AGE: Duration = Duration::from_secs(600);
 /// The only PVE user allowed to set a bind `mpN`.
 const ROOT_USER: &str = "root@pam";
+/// Upper bound on a tmpfs resize, whatever the CT's memory.
+const SHM_MAX_MB: u64 = 64 * 1024;
 /// Privileged-seam op names (`<plugin> --privileged-op`).
 pub const OP_SET_ENTRY: &str = "guest_mount.set_entry";
 pub const OP_STRIP_ENTRY: &str = "guest_mount.strip_entry";
@@ -295,13 +297,27 @@ async fn apply_bind<I: GuestMountIo>(
     }
     let after = io.conf(vmid).await?;
     let pending = after.slot(&key).is_some_and(MpSlot::is_pending);
-    Ok(match (changed, pending) {
+    let pending_deletes: Vec<&str> = delete
+        .iter()
+        .filter(|k| after.slot(k).is_some())
+        .map(String::as_str)
+        .collect();
+    let msg = match (changed, pending) {
         (false, false) => format!("Bind mount {target} already present as {key} on CT {vmid}."),
         (true, false) => format!("Set {key} bind mount {target} on CT {vmid}."),
         (_, true) => format!(
             "Pending restart: {key} bind mount {target} on CT {vmid} is held in [pve:pending] \
              until the CT restarts."
         ),
+    };
+    Ok(if pending_deletes.is_empty() {
+        msg
+    } else {
+        format!(
+            "{msg} Pending restart: delete of duplicate {} for {target} is held in \
+             [pve:pending] until the CT restarts.",
+            pending_deletes.join(",")
+        )
     })
 }
 
@@ -413,7 +429,10 @@ fn classify(spec: &GuestMountSpec) -> Result<Plan<'_>, String> {
             let ro = opts().any(|o| o.key == "ro" && o.value.is_none_or(truthy));
             Ok(Plan::Bind { src, ro })
         }
-        t if NETWORK_FSTYPES.contains(&t) => Ok(Plan::Raw { fs_spec: src }),
+        t if NETWORK_FSTYPES.contains(&t) => {
+            check_network_mount(t, src, &spec.options)?;
+            Ok(Plan::Raw { fs_spec: src })
+        }
         other => Err(format!(
             "unsupported guest mount fstype '{other}' (expected bind, cifs or nfs)"
         )),
@@ -454,6 +473,146 @@ fn check_target(target: &str) -> Result<(), String> {
 fn check_mp_field(what: &str, s: &str) -> Result<(), String> {
     if s.contains([',', '=']) {
         return Err(format!("{what} '{s}' contains ',' or '='"));
+    }
+    Ok(())
+}
+
+/// Mount options that would turn a network entry into a host bind or change
+/// mount propagation; refused by name so the error says why.
+const DENIED_OPTION_KEYS: &[&str] = &[
+    "bind",
+    "rbind",
+    "remount",
+    "move",
+    "shared",
+    "rshared",
+    "slave",
+    "rslave",
+    "private",
+    "rprivate",
+    "unbindable",
+    "runbindable",
+];
+
+/// Option keys any network entry may carry.
+const COMMON_OPTION_KEYS: &[&str] = &[
+    "ro",
+    "rw",
+    "vers",
+    "sec",
+    "soft",
+    "hard",
+    "_netdev",
+    "nofail",
+    "create",
+    "noexec",
+    "nosuid",
+    "nodev",
+    "noatime",
+    "nodiratime",
+    "relatime",
+];
+
+const CIFS_OPTION_KEYS: &[&str] = &[
+    "uid",
+    "gid",
+    "forceuid",
+    "forcegid",
+    "file_mode",
+    "dir_mode",
+    "noperm",
+    "nobrl",
+    "domain",
+    "iocharset",
+    "noserverino",
+    "cache",
+    "actimeo",
+    "mfsymlinks",
+    "seal",
+    "echo_interval",
+];
+
+const NFS_OPTION_KEYS: &[&str] = &[
+    "nfsvers",
+    "timeo",
+    "retrans",
+    "rsize",
+    "wsize",
+    "proto",
+    "port",
+    "nolock",
+    "lookupcache",
+    "actimeo",
+];
+
+/// A raw network entry: the source is a remote share in its fstype's grammar
+/// (never a local path) and every option is on the fstype's allowlist, so the
+/// entry cannot bind a host path into the guest.
+fn check_network_mount(fstype: &str, fs_spec: &str, options: &str) -> Result<(), String> {
+    check_token("source", fs_spec)?;
+    let fstype_keys = if is_cifs(fstype) {
+        check_cifs_spec(fs_spec)?;
+        CIFS_OPTION_KEYS
+    } else if NETWORK_FSTYPES.contains(&fstype) {
+        check_nfs_spec(fs_spec)?;
+        NFS_OPTION_KEYS
+    } else {
+        return Err(format!("raw guest mount fstype '{fstype}' refused"));
+    };
+    if options.is_empty() {
+        return Ok(());
+    }
+    check_token("options", options)?;
+    for opt in parse_option_string(options) {
+        if DENIED_OPTION_KEYS.contains(&opt.key) {
+            return Err(format!("{fstype} mount option '{}' is refused", opt.key));
+        }
+        if opt.key == "create" && opt.value != Some("dir") {
+            return Err(format!(
+                "{fstype} mount option 'create={}' is refused; only create=dir",
+                opt.value.unwrap_or_default()
+            ));
+        }
+        let allowed = COMMON_OPTION_KEYS.contains(&opt.key)
+            || fstype_keys.contains(&opt.key)
+            || (is_cifs(fstype) && CREDENTIAL_KEYS.contains(&opt.key));
+        if !allowed {
+            return Err(format!(
+                "{fstype} mount option '{}' is not on the allowlist",
+                opt.key
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `//host/share[/path]`.
+fn check_cifs_spec(fs_spec: &str) -> Result<(), String> {
+    let bad = || format!("cifs source '{fs_spec}' is not //host/share[/path]");
+    let rest = fs_spec.strip_prefix("//").ok_or_else(bad)?;
+    let mut parts = rest.split('/');
+    let host = parts.next().unwrap_or_default();
+    if host.is_empty() || parts.clone().next().is_none() {
+        return Err(bad());
+    }
+    if parts.any(|c| c.is_empty() || c == "." || c == "..") {
+        return Err(bad());
+    }
+    Ok(())
+}
+
+/// `host:/path`.
+fn check_nfs_spec(fs_spec: &str) -> Result<(), String> {
+    let bad = || format!("nfs source '{fs_spec}' is not host:/path");
+    let (host, path) = fs_spec
+        .find(":/")
+        .map(|i| (&fs_spec[..i], &fs_spec[i + 1..]))
+        .ok_or_else(bad)?;
+    if host.is_empty() || host.contains('/') {
+        return Err(bad());
+    }
+    if path != "/" {
+        check_abs_path("nfs export path", path).map_err(|_| bad())?;
     }
     Ok(())
 }
@@ -606,6 +765,67 @@ fn value_str(v: &Value) -> Option<String> {
     }
 }
 
+/// An enabled endpoint that sees the CT.
+struct EndpointHit<C> {
+    endpoint: String,
+    node: String,
+    url_local: bool,
+    cfg: C,
+}
+
+/// The one endpoint to use for a CT on `local`.
+fn pick_endpoint<C>(
+    vmid: u64,
+    local: &str,
+    hits: Vec<EndpointHit<C>>,
+    errors: &[String],
+) -> Result<EndpointHit<C>, String> {
+    let (mut here, elsewhere): (Vec<_>, Vec<_>) = hits.into_iter().partition(|h| h.node == local);
+    if here.len() > 1 && here.iter().any(|h| h.url_local) {
+        here.retain(|h| h.url_local);
+    }
+    match here.len() {
+        1 => Ok(here.remove(0)),
+        0 => match elsewhere.first() {
+            Some(h) => Err(format!(
+                "CT {vmid} runs on node '{}' but this proxmox plugin runs on '{local}'; apply \
+                 its mounts from the orca instance on '{}'",
+                h.node, h.node
+            )),
+            None => Err(format!(
+                "guest {vmid}: no enabled proxmox endpoint hosts this LXC ({})",
+                errors.join("; ")
+            )),
+        },
+        _ => Err(format!(
+            "guest {vmid}: endpoints {} all host this LXC on '{local}'; disable all but one",
+            here.iter()
+                .map(|h| format!("'{}'", h.endpoint))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// Whether `base_url`'s host resolves to an address bound on this machine.
+fn url_is_this_host(base_url: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let Some(authority) = base_url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split('/').next())
+    else {
+        return false;
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if !p.contains(']') => (h, p.parse().unwrap_or(443)),
+        _ => (authority, 443),
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    (host, port).to_socket_addrs().is_ok_and(|mut addrs| {
+        addrs.any(|a| a.ip().is_loopback() || std::net::UdpSocket::bind((a.ip(), 0)).is_ok())
+    })
+}
+
 /// The API for one CT, on the enabled endpoint whose cluster hosts it.
 struct PveIo {
     endpoint: String,
@@ -614,9 +834,12 @@ struct PveIo {
 }
 
 impl PveIo {
-    /// Find the endpoint that hosts LXC `vmid`. The CT must be on this node: a
-    /// raw entry and its creds file are written locally.
+    /// Find the endpoint that hosts LXC `vmid` on this node: a raw entry and its
+    /// creds file are written locally. Endpoints that see the CT on another node
+    /// are skipped; when several see it here, the one whose URL is this host wins.
     async fn locate(vmid: u64) -> Result<Self, String> {
+        let local = crate::diagnostics::local_node();
+        let mut hits = Vec::new();
         let mut errors = Vec::new();
         for name in crate::tools::enabled_endpoint_names() {
             let found = async {
@@ -626,28 +849,21 @@ impl PveIo {
             }
             .await;
             match found {
-                Ok((cfg, ct)) => {
-                    let local = crate::diagnostics::local_node();
-                    if ct.node != local {
-                        return Err(format!(
-                            "CT {vmid} runs on node '{}' but this proxmox plugin runs on \
-                             '{local}'; apply its mounts from the orca instance on '{}'",
-                            ct.node, ct.node
-                        ));
-                    }
-                    return Ok(Self {
-                        endpoint: name,
-                        cfg,
-                        node: ct.node,
-                    });
-                }
+                Ok((cfg, ct)) => hits.push(EndpointHit {
+                    url_local: url_is_this_host(&cfg.base_url),
+                    endpoint: name,
+                    node: ct.node,
+                    cfg,
+                }),
                 Err(e) => errors.push(format!("{name}: {e:#}")),
             }
         }
-        Err(format!(
-            "guest {vmid}: no enabled proxmox endpoint hosts this LXC ({})",
-            errors.join("; ")
-        ))
+        let hit = pick_endpoint(vmid, &local, hits, &errors)?;
+        Ok(Self {
+            endpoint: hit.endpoint,
+            cfg: hit.cfg,
+            node: hit.node,
+        })
     }
 
     fn ct_url(&self, vmid: u64) -> String {
@@ -660,12 +876,12 @@ impl PveIo {
 
     /// A client carrying a fresh `root@pam` ticket and its CSRF token.
     async fn root_client(&self) -> Result<reqwest::Client, String> {
+        refuse_insecure_root(&self.endpoint, self.cfg.insecure)?;
         let name = root_password_secret(&self.endpoint);
         let stored = plugin_toolkit::secrets::get(&name)
             .map_err(|e| format!("read secret '{name}': {e:#}"))?;
         let password = require_root_password(&self.endpoint, stored)?;
         let anon = plugin_toolkit::api_client::ApiClientBuilder::new()
-            .insecure(self.cfg.insecure)
             .build()
             .map_err(|e| format!("http client: {e:#}"))?;
         let body = gtypes::PostCreateTicketAccessTicketBody {
@@ -683,16 +899,12 @@ impl PveIo {
             .await
             .map_err(|e| format!("{ROOT_USER} login on endpoint '{}': {e}", self.endpoint))?
             .into_inner();
-        let (Some(ticket), Some(csrf)) = (ticket.ticket, ticket.csrf_prevention_token) else {
-            return Err(format!(
-                "{ROOT_USER} login on endpoint '{}' returned no ticket (two-factor enabled?)",
-                self.endpoint
-            ));
-        };
+        let (ticket, csrf) =
+            root_session(&self.endpoint, ticket.ticket, ticket.csrf_prevention_token)?;
         plugin_toolkit::api_client::ApiClientBuilder::new()
             .header("cookie", format!("PVEAuthCookie={ticket}"))
             .and_then(|b| b.header("csrfpreventiontoken", csrf))
-            .and_then(|b| b.insecure(self.cfg.insecure).build())
+            .and_then(|b| b.build())
             .map_err(|e| format!("http client: {e:#}"))
     }
 }
@@ -743,6 +955,42 @@ impl GuestMountIo for PveIo {
 
     async fn strip_entry(&self, op: &StripEntryOp) -> Result<RawEdit, String> {
         privileged(OP_STRIP_ENTRY, op).await
+    }
+}
+
+/// The `root@pam` password must not cross an unverified TLS link, and the HTTP
+/// client has no certificate pinning, so an `insecure` endpoint is refused.
+fn refuse_insecure_root(endpoint: &str, insecure: bool) -> Result<(), String> {
+    if insecure {
+        return Err(format!(
+            "endpoint '{endpoint}' skips TLS verification (insecure), so orca will not send \
+             the {ROOT_USER} password over it. Give the PVE node a certificate the host trusts \
+             and turn insecure off for this endpoint."
+        ));
+    }
+    Ok(())
+}
+
+/// The session from a ticket login. With two-factor on, PVE answers a password
+/// with a half-ticket (`PVE:!tfa!...`, plus `NeedTFA`) that needs a second step;
+/// the generated response type drops `NeedTFA`, so the ticket prefix decides.
+fn root_session(
+    endpoint: &str,
+    ticket: Option<String>,
+    csrf: Option<String>,
+) -> Result<(String, String), String> {
+    let tfa = || {
+        format!(
+            "{ROOT_USER} has two-factor enabled on endpoint '{endpoint}'; orca cannot complete \
+             a two-factor login, so bind mount points cannot be set through this endpoint"
+        )
+    };
+    match (ticket, csrf) {
+        (Some(t), _) if t.starts_with("PVE:!tfa!") => Err(tfa()),
+        (Some(t), Some(c)) => Ok((t, c)),
+        _ => Err(format!(
+            "{ROOT_USER} login on endpoint '{endpoint}' returned no ticket"
+        )),
     }
 }
 
@@ -883,13 +1131,7 @@ impl SetEntryOp {
 
     fn validate(&self) -> Result<(), String> {
         check_target(&self.target)?;
-        check_token("source", &self.fs_spec)?;
-        if !NETWORK_FSTYPES.contains(&self.fstype.as_str()) {
-            return Err(format!("raw guest mount fstype '{}' refused", self.fstype));
-        }
-        if !self.options.is_empty() {
-            check_token("options", &self.options)?;
-        }
+        check_network_mount(&self.fstype, &self.fs_spec, &self.options)?;
         if let Some(c) = &self.creds {
             check_token("username", &c.username)?;
             if let Some(d) = &c.domain {
@@ -935,6 +1177,12 @@ impl ShmResizeOp {
         if self.size_mb == 0 {
             return Err("tmpfs size must be > 0 MiB".to_string());
         }
+        if self.size_mb > SHM_MAX_MB {
+            return Err(format!(
+                "tmpfs size {} MiB exceeds the {SHM_MAX_MB} MiB cap",
+                self.size_mb
+            ));
+        }
         Ok(())
     }
 }
@@ -968,6 +1216,16 @@ pub fn privileged_ops() -> PrivilegedOps {
 /// entry under PVE's config lock.
 fn root_set_entry(root: &Path, op: &SetEntryOp) -> Result<RawEdit, String> {
     op.validate()?;
+    let clash = |key: String| {
+        format!(
+            "CT {}: {key} already mounts {}; remove it before placing a {} mount there",
+            op.vmid, op.target, op.fstype
+        )
+    };
+    let path = lxc_conf_path_in(root, op.vmid)?;
+    if let Some(key) = mp_on_target(split_live_section(&read_conf(&path)?).0, &op.target) {
+        return Err(clash(key));
+    }
     sweep_stale_temps_in(root, pid_alive);
     let cred_path = op
         .creds
@@ -976,15 +1234,34 @@ fn root_set_entry(root: &Path, op: &SetEntryOp) -> Result<RawEdit, String> {
         .transpose()?;
     let rel = relative_mountpoint(&op.target);
     let line = op.entry_line(cred_path.as_deref());
+    let mp_clash = std::cell::RefCell::new(None);
     let edit = edit_raw_conf_in(root, op.vmid, |conf| {
+        // Re-checked under the lock: an mpN may have landed since the read above.
+        if let Some(key) = mp_on_target(conf, &op.target) {
+            *mp_clash.borrow_mut() = Some(key);
+            return None;
+        }
         let (rewritten, changed) = upsert_entry(conf, &rel, &line);
         changed.then_some(rewritten)
-    })?;
+    });
+    if let Some(key) = mp_clash.into_inner() {
+        return Err(clash(key));
+    }
+    let edit = edit?;
     if cred_path.is_none() {
         remove_creds_if_unreferenced(root, &guest_creds_path(op.vmid, &op.target));
     }
     sweep_orphan_creds_in(root);
     Ok(edit)
+}
+
+/// The `mpN` key in a live config section whose `mp=` is `target`.
+fn mp_on_target(live: &str, target: &str) -> Option<String> {
+    live.lines().find_map(|l| {
+        let (key, value) = l.split_once(':')?;
+        let key = key.trim();
+        (is_mp_key(key) && parse_mp(value.trim()).mp == Some(target)).then(|| key.to_string())
+    })
 }
 
 /// Root side of [`OP_STRIP_ENTRY`]: drop the entry, then its creds file once no
@@ -1006,11 +1283,27 @@ fn root_strip_entry(root: &Path, op: &StripEntryOp) -> Result<RawEdit, String> {
 fn root_shm_resize(root: &Path, op: &ShmResizeOp) -> Result<RawEdit, String> {
     op.validate()?;
     sweep_stale_temps_in(root, pid_alive);
+    let path = lxc_conf_path_in(root, op.vmid)?;
+    if let Some(mem) = ct_memory_mb(split_live_section(&read_conf(&path)?).0)
+        && op.size_mb > mem
+    {
+        return Err(format!(
+            "tmpfs size {} MiB exceeds CT {} memory ({mem} MiB)",
+            op.size_mb, op.vmid
+        ));
+    }
     edit_raw_conf_in(root, op.vmid, |conf| {
         let (rewritten, changed) =
             crate::shm_trap::rewrite_tmpfs_size(conf, &op.target, op.size_mb);
         changed.then_some(rewritten)
     })
+}
+
+/// The CT's `memory:` (MiB) from its live config section.
+fn ct_memory_mb(live: &str) -> Option<u64> {
+    live.lines()
+        .find_map(|l| l.strip_prefix("memory:"))
+        .and_then(|v| v.trim().parse().ok())
 }
 
 // ── Node-local paths ────────────────────────────────────────────────────────
@@ -1053,14 +1346,20 @@ fn guest_creds_path(vmid: u64, target: &str) -> String {
     format!("{SECRET_FILE_DIR}/guest-{vmid}-{}.secret", slug(target))
 }
 
-/// Filesystem-safe slug of a mountpoint: non-alphanumerics collapse to `-`.
+/// Filesystem-safe, reversible slug of a mountpoint: ASCII alphanumerics stay,
+/// every other byte becomes `_xx` hex, so distinct targets never share a slug.
 fn slug(target: &str) -> String {
     target
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string()
+        .trim_start_matches('/')
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                char::from(b).to_string()
+            } else {
+                format!("_{b:02x}")
+            }
+        })
+        .collect()
 }
 
 // ── Credential handling ─────────────────────────────────────────────────────
@@ -1980,6 +2279,194 @@ mod tests {
         );
     }
 
+    #[test]
+    fn network_mounts_cannot_bind_a_host_path() {
+        let bad = [
+            spec("nfs", "/", "/mnt/a", "rbind,rw"),
+            spec("nfs", "/srv", "/mnt/a", ""),
+            spec("nfs", "nas:/srv", "/mnt/a", "bind"),
+            spec("nfs", "nas:/srv", "/mnt/a", "rshared"),
+            spec("nfs", "nas:/srv", "/mnt/a", "remount,rw"),
+            spec("nfs", "nas:/srv/../etc", "/mnt/a", ""),
+            spec("nfs", ":/srv", "/mnt/a", ""),
+            spec("nfs", "nas:srv", "/mnt/a", ""),
+            spec("nfs4", "nas:/srv", "/mnt/a", "create=file"),
+            spec("nfs4", "nas:/srv", "/mnt/a", "x-systemd.automount"),
+            spec("cifs", "/srv/a", "/mnt/a", ""),
+            spec("cifs", "//w", "/mnt/a", ""),
+            spec("cifs", "///a", "/mnt/a", ""),
+            spec("cifs", "//w/a/../b", "/mnt/a", ""),
+            spec("cifs", "//w/a", "/mnt/a", "move"),
+            spec("cifs", "//w/a", "/mnt/a", "private"),
+            spec("cifs", "//w/a", "/mnt/a", "timeo=5"),
+        ];
+        for s in &bad {
+            assert!(
+                classify(s).is_err(),
+                "accepted {} {:?} {:?}",
+                s.fstype,
+                s.sources,
+                s.options
+            );
+        }
+        for s in [
+            spec(
+                "nfs",
+                "nas:/",
+                "/mnt/a",
+                "ro,soft,timeo=50,retrans=3,_netdev,nofail",
+            ),
+            spec(
+                "nfs4",
+                "[fe80::1]:/srv/a",
+                "/mnt/a",
+                "vers=4.2,hard,create=dir",
+            ),
+            spec(
+                "cifs",
+                "//w/a/sub",
+                "/mnt/a",
+                "vers=3.1.1,uid=1000,gid=1000,file_mode=0644,dir_mode=0755,noperm,nobrl,\
+                 username=alice,credentials=/x",
+            ),
+        ] {
+            assert!(
+                classify(&s).is_ok(),
+                "refused {:?} {:?}",
+                s.sources,
+                s.options
+            );
+        }
+    }
+
+    #[test]
+    fn root_side_refuses_a_host_bind_payload() {
+        let op = SetEntryOp {
+            vmid: 110,
+            target: "/mnt/a".to_string(),
+            fs_spec: "/".to_string(),
+            fstype: "nfs".to_string(),
+            options: "rbind,rw".to_string(),
+            creds: None,
+        };
+        assert!(op.validate().is_err());
+        let root = pve_root("hostbind", 110, "arch: amd64\n");
+        assert!(root_set_entry(&root, &op).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("etc/pve/lxc/110.conf")).unwrap(),
+            "arch: amd64\n"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn root_set_entry_refuses_a_target_an_mp_already_mounts() {
+        let conf = "arch: amd64\nmp2: /srv/a,mp=/mnt/a,ro=1\n";
+        let root = pve_root("mpclash", 110, conf);
+        let mut op = set_op("cifs", "pw");
+        op.creds = None;
+        let err = root_set_entry(&root, &op).unwrap_err();
+        assert!(err.contains("mp2"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("etc/pve/lxc/110.conf")).unwrap(),
+            conf
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn hit(endpoint: &str, node: &str, url_local: bool) -> EndpointHit<()> {
+        EndpointHit {
+            endpoint: endpoint.to_string(),
+            node: node.to_string(),
+            url_local,
+            cfg: (),
+        }
+    }
+
+    #[test]
+    fn locate_skips_remote_hits_and_prefers_a_local_url() {
+        let pick = |hits| pick_endpoint(110, "pve1", hits, &[]).map(|h| h.endpoint);
+        assert_eq!(
+            pick(vec![
+                hit("remote", "pve2", false),
+                hit("here", "pve1", false)
+            ])
+            .unwrap(),
+            "here"
+        );
+        assert_eq!(
+            pick(vec![hit("a", "pve1", false), hit("b", "pve1", true)]).unwrap(),
+            "b"
+        );
+        let err = pick(vec![hit("a", "pve1", false), hit("b", "pve1", false)]).unwrap_err();
+        assert!(err.contains("'a', 'b'"), "{err}");
+        let err = pick(vec![hit("a", "pve1", true), hit("b", "pve1", true)]).unwrap_err();
+        assert!(err.contains("disable all but one"), "{err}");
+        let err = pick(vec![hit("remote", "pve2", false)]).unwrap_err();
+        assert!(err.contains("runs on node 'pve2'"), "{err}");
+        let err = pick_endpoint::<()>(110, "pve1", vec![], &["x: down".to_string()])
+            .map(|h| h.endpoint)
+            .unwrap_err();
+        assert!(err.contains("x: down"), "{err}");
+    }
+
+    #[test]
+    fn root_login_refuses_insecure_tls_and_two_factor() {
+        assert!(refuse_insecure_root("pve", false).is_ok());
+        let err = refuse_insecure_root("pve", true).unwrap_err();
+        assert!(err.contains("insecure"), "{err}");
+        let err = root_session("pve", Some("PVE:!tfa!%7B%7D::sig".into()), None).unwrap_err();
+        assert!(err.contains("two-factor enabled"), "{err}");
+        let err = root_session("pve", Some("PVE:!tfa!x".into()), Some("csrf".into())).unwrap_err();
+        assert!(err.contains("two-factor enabled"), "{err}");
+        assert_eq!(
+            root_session("pve", Some("PVE:root@pam:1".into()), Some("c".into())).unwrap(),
+            ("PVE:root@pam:1".to_string(), "c".to_string())
+        );
+        assert!(root_session("pve", None, None).is_err());
+    }
+
+    #[test]
+    fn bind_reports_a_pending_duplicate_delete() {
+        let before = ct_conf(
+            &[
+                ("mp3", Some("/srv/a,mp=/mnt/b"), None, false),
+                ("mp5", Some("/srv/dup,mp=/mnt/b"), None, false),
+            ],
+            &[],
+        );
+        let after = ct_conf(
+            &[
+                ("mp3", Some("/srv/a,mp=/mnt/b"), None, false),
+                ("mp5", Some("/srv/dup,mp=/mnt/b"), None, true),
+            ],
+            &[],
+        );
+        let fake = Fake::new(vec![before, after]);
+        let msg = bind(&fake, "/srv/a", "/mnt/b", false).unwrap();
+        assert!(msg.contains("delete of duplicate mp5"), "{msg}");
+    }
+
+    #[test]
+    fn shm_resize_is_capped() {
+        let op = |size_mb| ShmResizeOp {
+            vmid: 120,
+            target: "dev/shm".to_string(),
+            size_mb,
+        };
+        assert!(op(SHM_MAX_MB).validate().is_ok());
+        assert!(op(SHM_MAX_MB + 1).validate().is_err());
+        let root = pve_root(
+            "shmcap",
+            120,
+            "memory: 2048\nlxc.mount.entry: tmpfs dev/shm tmpfs size=1g,mode=1777 0 0\n",
+        );
+        let err = root_shm_resize(&root, &op(4096)).unwrap_err();
+        assert!(err.contains("2048"), "{err}");
+        assert_eq!(root_shm_resize(&root, &op(1536)).unwrap(), RawEdit::Written);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     fn set_op(fstype: &str, password: &str) -> SetEntryOp {
         SetEntryOp {
             vmid: 110,
@@ -2057,11 +2544,13 @@ mod tests {
         std::fs::write(&fresh, "x").unwrap();
         let mut op = set_op("nfs4", "");
         op.creds = None;
+        op.fs_spec = "w:/a".to_string();
+        op.options = "vers=4.2".to_string();
 
         assert_eq!(root_set_entry(&root, &op).unwrap(), RawEdit::Written);
         assert_eq!(
             std::fs::read_to_string(root.join("etc/pve/lxc/110.conf")).unwrap(),
-            "arch: amd64\nlxc.mount.entry: //w/a mnt/a nfs4 vers=3.1.1,create=dir 0 0\n"
+            "arch: amd64\nlxc.mount.entry: w:/a mnt/a nfs4 vers=4.2,create=dir 0 0\n"
         );
         assert!(!mine.exists());
         assert!(!orphan.exists());
@@ -2198,6 +2687,14 @@ mod tests {
         assert_ne!(
             guest_creds_path(110, "/mnt/b"),
             guest_creds_path(200, "/mnt/b")
+        );
+        assert_ne!(
+            guest_creds_path(110, "/mnt/a-b"),
+            guest_creds_path(110, "/mnt/a/b")
+        );
+        assert_ne!(
+            guest_creds_path(110, "/mnt/a_b"),
+            guest_creds_path(110, "/mnt/a/b")
         );
     }
 
