@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use plugin_toolkit::abi::{BackendDef, DbOp, DbRow, DbValue};
+use plugin_toolkit::abi::{BackendDef, ColumnDef, DbOp, DbRow, DbValue, TableDef};
 use plugin_toolkit::privileged::PrivilegedOps;
 use plugin_toolkit::reqwest;
 use plugin_toolkit::runtime::{ToDbValue, db_op, field_from_row};
@@ -80,6 +80,10 @@ const HOST_STAGE_DIR: &str = "/mnt/orca-guest";
 const MAX_SLUG_LEN: usize = 64;
 /// orca core's mount-placement table (`storage.mount.*`).
 const MOUNTS_TABLE: &str = "mounts";
+/// Plugin table (`plug__proxmox__raw_drop`) of raw entries dropped from a
+/// running CT, keyed `{node}/{vmid}/{target}`.
+const RAW_DROP_TABLE: &str = "raw_drop";
+const PLUGIN_NAMESPACE: &str = "proxmox";
 
 /// Wire args for `guest_mount_apply` — the whole spec crosses the boundary.
 #[derive(Deserialize)]
@@ -350,18 +354,32 @@ async fn apply_bind<I: GuestMountIo>(
 ) -> Result<String, String> {
     let mut conf = io.conf(vmid).await?;
     let mut notes = Vec::new();
-    if conf.has_raw_entry(target) {
+    // lxc keeps a dropped raw mount live until the CT restarts; an mpN set
+    // before then would stack over it.
+    let restart_required = format!(
+        "Restart required: CT {vmid} is running, so {target} is bound on the next apply \
+         after it restarts."
+    );
+    let dropped_at = if conf.has_raw_entry(target) {
         let (after, edit, note) = drop_raw_entry(io, vmid, target).await?;
         conf = after;
         notes.push(note);
-        // lxc keeps a dropped raw mount live until the CT restarts; an mpN set
-        // now would stack over it.
-        if edit == RawEdit::Written && io.running(vmid).await? {
-            notes.push(format!(
-                "Restart required: CT {vmid} is running, so {target} is bound on the next \
-                 apply after it restarts."
-            ));
+        if edit == RawEdit::Written && io.uptime_secs(vmid).await?.is_some() {
+            io.record_raw_drop(vmid, target, plugin_toolkit::now_millis_since_epoch())
+                .await?;
+            notes.push(restart_required);
             return Ok(notes.join(" "));
+        }
+        None
+    } else {
+        io.raw_drop_at(vmid, target).await?
+    };
+    if let Some(at) = dropped_at {
+        let since_drop_ms = plugin_toolkit::now_millis_since_epoch().saturating_sub(at);
+        if io.uptime_secs(vmid).await?.is_some_and(|up| {
+            i64::try_from(up.saturating_mul(1000)).unwrap_or(i64::MAX) > since_drop_ms
+        }) {
+            return Ok(restart_required);
         }
     }
     let on_target = conf.mps_on(target);
@@ -424,6 +442,9 @@ async fn apply_bind<I: GuestMountIo>(
             pending_deletes.join(",")
         )
     };
+    if dropped_at.is_some() {
+        io.clear_raw_drop(vmid, target).await?;
+    }
     notes.push(msg);
     Ok(notes.join(" "))
 }
@@ -646,8 +667,12 @@ pub(crate) trait GuestMountIo {
     async fn local_host(&self) -> Result<String, String>;
     /// Remove the CT's raw `lxc.mount.entry` for `target` ([`OP_DROP_RAW_ENTRY`]).
     async fn drop_raw_entry(&self, vmid: u64, target: &str) -> Result<RawEdit, String>;
-    /// Whether the CT is running.
-    async fn running(&self, vmid: u64) -> Result<bool, String>;
+    /// The CT's uptime in seconds while running; `None` when it is not.
+    async fn uptime_secs(&self, vmid: u64) -> Result<Option<u64>, String>;
+    /// When a raw entry for `target` was dropped from the running CT (ms epoch).
+    async fn raw_drop_at(&self, vmid: u64, target: &str) -> Result<Option<i64>, String>;
+    async fn record_raw_drop(&self, vmid: u64, target: &str, at_ms: i64) -> Result<(), String>;
+    async fn clear_raw_drop(&self, vmid: u64, target: &str) -> Result<(), String>;
 }
 
 /// The columns of an orca `mounts` row guest mounts read or author.
@@ -1008,10 +1033,99 @@ impl GuestMountIo for PveIo {
         privileged(OP_DROP_RAW_ENTRY, &op).await
     }
 
-    async fn running(&self, vmid: u64) -> Result<bool, String> {
+    async fn uptime_secs(&self, vmid: u64) -> Result<Option<u64>, String> {
         let http = self.cfg.build_reqwest_client().map_err(|e| e.to_string())?;
         let status = get_data(&http, &format!("{}/status/current", self.ct_url(vmid))).await?;
-        Ok(status.get("status").and_then(Value::as_str) == Some("running"))
+        if status.get("status").and_then(Value::as_str) != Some("running") {
+            return Ok(None);
+        }
+        Ok(Some(
+            status.get("uptime").and_then(Value::as_u64).unwrap_or(0),
+        ))
+    }
+
+    async fn raw_drop_at(&self, vmid: u64, target: &str) -> Result<Option<i64>, String> {
+        raw_drop_db::get(&raw_drop_key(self.node(), vmid, target))
+            .map_err(|e| format!("read raw-entry drop for CT {vmid} {target}: {e:#}"))
+    }
+
+    async fn record_raw_drop(&self, vmid: u64, target: &str, at_ms: i64) -> Result<(), String> {
+        raw_drop_db::upsert(&raw_drop_key(self.node(), vmid, target), at_ms)
+            .map_err(|e| format!("record raw-entry drop for CT {vmid} {target}: {e:#}"))
+    }
+
+    async fn clear_raw_drop(&self, vmid: u64, target: &str) -> Result<(), String> {
+        raw_drop_db::remove(&raw_drop_key(self.node(), vmid, target))
+            .map_err(|e| format!("clear raw-entry drop for CT {vmid} {target}: {e:#}"))
+    }
+}
+
+fn raw_drop_key(node: &str, vmid: u64, target: &str) -> String {
+    format!("{node}/{vmid}/{target}")
+}
+
+/// The declared shape of [`RAW_DROP_TABLE`].
+pub fn raw_drop_table_def() -> TableDef {
+    TableDef {
+        table: RAW_DROP_TABLE.to_string(),
+        columns: vec![
+            ColumnDef {
+                name: "id".to_string(),
+                sql_type: "TEXT".to_string(),
+                not_null: true,
+                primary_key: true,
+                default: None,
+            },
+            ColumnDef {
+                name: "dropped_at".to_string(),
+                sql_type: "INTEGER".to_string(),
+                not_null: true,
+                primary_key: false,
+                default: Some("0".to_string()),
+            },
+        ],
+        indexes: vec![],
+    }
+}
+
+mod raw_drop_db {
+    use super::*;
+    use plugin_toolkit::anyhow::Result;
+
+    pub(super) fn get(id: &str) -> Result<Option<i64>> {
+        let reply = db_op(&DbOp::Get {
+            namespace: PLUGIN_NAMESPACE.to_string(),
+            table: RAW_DROP_TABLE.to_string(),
+            key_col: "id".to_string(),
+            key: id.to_string(),
+        })?;
+        reply
+            .rows
+            .first()
+            .map(|r| field_from_row(r, "dropped_at"))
+            .transpose()
+    }
+
+    pub(super) fn upsert(id: &str, at_ms: i64) -> Result<()> {
+        let mut row = DbRow::new();
+        row.insert("id".to_string(), DbValue::Text(id.to_string()));
+        row.insert("dropped_at".to_string(), DbValue::Int(at_ms));
+        db_op(&DbOp::Upsert {
+            namespace: PLUGIN_NAMESPACE.to_string(),
+            table: RAW_DROP_TABLE.to_string(),
+            row,
+        })?;
+        Ok(())
+    }
+
+    pub(super) fn remove(id: &str) -> Result<()> {
+        db_op(&DbOp::Delete {
+            namespace: PLUGIN_NAMESPACE.to_string(),
+            table: RAW_DROP_TABLE.to_string(),
+            key_col: "id".to_string(),
+            key: id.to_string(),
+        })?;
+        Ok(())
     }
 }
 
@@ -1732,7 +1846,8 @@ mod tests {
         placements: Mutex<Vec<Placement>>,
         set_err: Option<String>,
         conf_err: Option<String>,
-        running: bool,
+        uptime: Option<u64>,
+        raw_drops: Mutex<Vec<(String, i64)>>,
         drop_result: RawEdit,
         calls: Mutex<Vec<String>>,
     }
@@ -1744,7 +1859,8 @@ mod tests {
                 placements: Mutex::new(Vec::new()),
                 set_err: None,
                 conf_err: None,
-                running: false,
+                uptime: None,
+                raw_drops: Mutex::new(Vec::new()),
                 drop_result: RawEdit::Written,
                 calls: Mutex::new(Vec::new()),
             }
@@ -1835,8 +1951,30 @@ mod tests {
             })
         }
 
-        async fn running(&self, _vmid: u64) -> Result<bool, String> {
-            Ok(self.running)
+        async fn uptime_secs(&self, _vmid: u64) -> Result<Option<u64>, String> {
+            Ok(self.uptime)
+        }
+
+        async fn raw_drop_at(&self, _vmid: u64, target: &str) -> Result<Option<i64>, String> {
+            let drops = self.raw_drops.lock().unwrap();
+            Ok(drops.iter().find(|(t, _)| t == target).map(|(_, at)| *at))
+        }
+
+        async fn record_raw_drop(
+            &self,
+            _vmid: u64,
+            target: &str,
+            at_ms: i64,
+        ) -> Result<(), String> {
+            let mut drops = self.raw_drops.lock().unwrap();
+            drops.retain(|(t, _)| t != target);
+            drops.push((target.to_string(), at_ms));
+            Ok(())
+        }
+
+        async fn clear_raw_drop(&self, _vmid: u64, target: &str) -> Result<(), String> {
+            self.raw_drops.lock().unwrap().retain(|(t, _)| t != target);
+            Ok(())
         }
     }
 
@@ -2334,18 +2472,49 @@ mod tests {
     fn bind_waits_for_a_restart_after_dropping_a_running_cts_raw_entry() {
         let raw = ["//w/a mnt/a cifs 0 0"];
         let mut fake = Fake::new(vec![ct_conf(&[], &raw), ct_conf(&[], &[])]);
-        fake.running = true;
+        fake.uptime = Some(3600);
         let msg = bind(&fake, "/srv/a", "/mnt/a", false).unwrap();
         assert_eq!(fake.calls(), ["drop_raw /mnt/a"]);
         assert!(msg.contains("Restart required"), "{msg}");
+        assert_eq!(fake.raw_drops.lock().unwrap().len(), 1);
 
-        fake.calls.lock().unwrap().clear();
+        // Still up since before the drop: the raw mount is live, so no mpN yet.
+        let msg = bind(&fake, "/srv/a", "/mnt/a", false).unwrap();
+        assert_eq!(fake.calls(), ["drop_raw /mnt/a"]);
+        assert!(msg.starts_with("Restart required"), "{msg}");
+
+        fake.uptime = Some(0);
         let msg = bind(&fake, "/srv/a", "/mnt/a", false).unwrap();
         assert_eq!(
             fake.calls(),
-            [r#"put [("digest", "d1"), ("mp0", "/srv/a,mp=/mnt/a")]"#]
+            [
+                "drop_raw /mnt/a",
+                r#"put [("digest", "d1"), ("mp0", "/srv/a,mp=/mnt/a")]"#
+            ]
         );
         assert!(msg.starts_with("Set mp0"), "{msg}");
+        assert!(fake.raw_drops.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bind_after_a_recorded_drop_proceeds_once_the_ct_is_stopped() {
+        let fake = Fake::new(vec![ct_conf(&[], &[])]);
+        fake.raw_drops.lock().unwrap().push((
+            "/mnt/a".to_string(),
+            plugin_toolkit::now_millis_since_epoch(),
+        ));
+        let msg = bind(&fake, "/srv/a", "/mnt/a", false).unwrap();
+        assert!(msg.starts_with("Set mp0"), "{msg}");
+        assert!(fake.raw_drops.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stopped_ct_binds_right_after_the_drop_without_a_record() {
+        let raw = ["//w/a mnt/a cifs 0 0"];
+        let fake = Fake::new(vec![ct_conf(&[], &raw), ct_conf(&[], &[])]);
+        let msg = bind(&fake, "/srv/a", "/mnt/a", false).unwrap();
+        assert!(msg.contains("Set mp0"), "{msg}");
+        assert!(fake.raw_drops.lock().unwrap().is_empty());
     }
 
     #[test]
