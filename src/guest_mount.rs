@@ -10,16 +10,15 @@
 //! start — independent of the host's own mount state
 //! ([[proxmox per-guest mounts]]).
 //!
-//! Two write paths:
-//!
-//! * a host-path bind (`fstype` `bind`/`none`, absolute source) is an `mpN`
-//!   mount point, set and removed through `PUT /nodes/{node}/lxc/{vmid}/config`
-//!   with the config `digest`, so a concurrent change fails instead of being
-//!   overwritten;
-//! * a cifs/nfs mount is a raw `lxc.mount.entry`, which the PVE config API does
-//!   not expose. Only that path edits `/etc/pve/lxc/<vmid>.conf`, and only
-//!   through [`edit_raw_conf`]: the CT must be stopped, the config digest must be
-//!   unchanged across the edit, and the write is atomic.
+//! The PVE config API cannot set raw `lxc.*` lines, and its `mpN` bind mounts
+//! are refused for API tokens (`check_ct_modify_config_perm` allows non-volume
+//! mount points only for `root@pam` itself), so every mount — host-path binds
+//! included — is a raw `lxc.mount.entry`. All edits of
+//! `/etc/pve/lxc/<vmid>.conf` go through [`edit_raw_conf`], which holds PVE's
+//! own per-CT config flock (the one `pct set` and the API take), re-reads the
+//! file under it, and replaces it atomically. Only the live section (before the
+//! first `[snapshot]` header) is edited. A changed line on a running CT takes
+//! effect on its next restart; that is reported as pending, never forced.
 //!
 //! Core routes a guest-targeted storage placement here as a
 //! [`GuestMountSpec`](plugin_toolkit::storage::GuestMountSpec): `guest` is the
@@ -27,31 +26,30 @@
 //! `options` its rendered `-o` string, and `credential` an opaque
 //! [`SecretRef`](plugin_toolkit::storage::SecretRef) string. For cifs the
 //! password is resolved through the secrets domain and written to a root-owned
-//! `0600` creds file under [`SECRET_FILE_DIR`], referenced by `credentials=` in
-//! the entry — the password never sits inline in the config.
+//! `0600` creds file in a `0700` [`SECRET_FILE_DIR`], referenced by
+//! `credentials=` in the entry — the password never sits inline in the config.
 //!
 //! VM guests (their own kernel mounts via cloud-init/fstab) are a later phase;
 //! this domain handles LXC and returns a clear error for a VM vmid.
 
 use std::io::Write;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use plugin_toolkit::abi::BackendDef;
-use plugin_toolkit::reqwest;
 use plugin_toolkit::serde_json::{self, Value};
 use plugin_toolkit::storage::{GuestMountSpec, SECRET_FILE_DIR, parse_option_string};
 use serde::Deserialize;
 
-use crate::responses::{ConfigField, GuestConfigData};
-use crate::{GuestKind, generated};
-
 /// Invoke-name prefix for this domain's ops (`proxmox.__guest_mount.*`).
 pub const GM_PREFIX: &str = "proxmox.__guest_mount";
 const PROVIDER: &str = "proxmox";
-/// PVE allows `mp0`..`mp255`.
-const MAX_MP: u32 = 256;
 const CREDS_FILE_MODE: u32 = 0o600;
+const CREDS_DIR_MODE: u32 = 0o700;
+/// PVE's `lock_config` waits 10s for the config flock.
+const CONF_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Option keys that carry a credential and must never be rendered inline into
 /// the config — resolved into the root-owned creds file instead.
@@ -94,25 +92,20 @@ pub fn dispatch(
     name: &str,
     args: serde_json::Value,
 ) -> Option<Result<serde_json::Value, serde_json::Value>> {
-    let op = name.strip_prefix(GM_PREFIX)?.strip_prefix('.')?.to_string();
-    Some(plugin_toolkit::reactor::block_on(async move {
-        match op.as_str() {
-            "guest_mount_apply" => {
-                let a: GuestApplyArgs = serde_json::from_value(args)
-                    .map_err(|e| err_val(format!("guest_mount_apply args: {e}")))?;
-                apply(&a.spec).await.map(Value::String).map_err(err_val)
-            }
-            "guest_mount_remove" => {
-                let a: GuestRemoveArgs = serde_json::from_value(args)
-                    .map_err(|e| err_val(format!("guest_mount_remove args: {e}")))?;
+    let op = name.strip_prefix(GM_PREFIX)?.strip_prefix('.')?;
+    Some(match op {
+        "guest_mount_apply" => serde_json::from_value::<GuestApplyArgs>(args)
+            .map_err(|e| err_val(format!("guest_mount_apply args: {e}")))
+            .and_then(|a| apply(&a.spec).map(Value::String).map_err(err_val)),
+        "guest_mount_remove" => serde_json::from_value::<GuestRemoveArgs>(args)
+            .map_err(|e| err_val(format!("guest_mount_remove args: {e}")))
+            .and_then(|a| {
                 remove(&a.guest, &a.target)
-                    .await
                     .map(Value::String)
                     .map_err(err_val)
-            }
-            other => Err(err_val(format!("unknown guest_mount op '{other}'"))),
-        }
-    }))
+            }),
+        other => Err(err_val(format!("unknown guest_mount op '{other}'"))),
+    })
 }
 
 /// A message-only backend error is a plain JSON string.
@@ -122,19 +115,15 @@ fn err_val(msg: impl Into<String>) -> serde_json::Value {
 
 /// Reconcile the guest's mount for `spec` to present. Idempotent: rewrites the
 /// `lxc.mount.entry` for this mountpoint (and, for cifs, its creds file) only
-/// when they diverge. The mount goes live on the guest's next start; a running
-/// guest picks it up on reboot (the converge loop re-applies each tick, so no
-/// state is lost).
-async fn apply(spec: &GuestMountSpec) -> Result<String, String> {
+/// when they diverge. A stopped CT mounts it on its next start; a running CT
+/// reports a pending restart, since lxc reads `lxc.*` lines only at start.
+fn apply(spec: &GuestMountSpec) -> Result<String, String> {
     let vmid = parse_vmid(&spec.guest)?;
     let conf_path = lxc_conf_path(vmid)?;
     let fs_spec = spec
         .sources
         .first()
         .ok_or_else(|| format!("guest {vmid}: share has no enabled source route"))?;
-    if is_bind(&spec.fstype, fs_spec) {
-        return apply_bind(vmid, &conf_path, fs_spec, spec).await;
-    }
     let mountpoint_rel = relative_mountpoint(&spec.target);
 
     // cifs with a credential → resolve the password and materialize a root-owned
@@ -155,96 +144,51 @@ async fn apply(spec: &GuestMountSpec) -> Result<String, String> {
     let options = render_entry_options(&spec.options, cred_path.as_deref());
     let entry = render_lxc_mount_entry(fs_spec, &mountpoint_rel, &spec.fstype, &options);
 
-    let changed = edit_raw_conf(vmid, |conf| {
+    let outcome = edit_raw_conf(vmid, |conf| {
         let (rewritten, changed) = upsert_entry(conf, &mountpoint_rel, &entry);
         changed.then_some(rewritten)
-    })
-    .await?;
-    if changed {
-        Ok(format!(
-            "Set guest mount {} in {conf_path}; applies on next start of CT {vmid} (`pct reboot {vmid}`).",
-            spec.target
-        ))
-    } else {
-        Ok(format!(
+    })?;
+    Ok(match outcome {
+        RawEdit::Unchanged => format!(
             "Guest mount {} already present in {conf_path} (CT {vmid}).",
             spec.target
-        ))
-    }
-}
-
-/// Reconcile a host-path bind as an `mpN` mount point through the PVE API.
-async fn apply_bind(
-    vmid: u64,
-    conf_path: &str,
-    src: &str,
-    spec: &GuestMountSpec,
-) -> Result<String, String> {
-    let ro = parse_option_string(&spec.options)
-        .any(|o| o.key == "ro" && o.value.is_none_or(|v| v == "1"));
-    let value = render_mp_value(src, &spec.target, ro);
-    let conf = std::fs::read_to_string(conf_path).map_err(|e| format!("read {conf_path}: {e}"))?;
-    if find_mp(&conf_mp_entries(&conf), &spec.target).is_some_and(|(_, v)| v == value) {
-        return Ok(format!(
-            "Bind mount {} already present on CT {vmid}.",
+        ),
+        RawEdit::Written => format!(
+            "Set guest mount {} in {conf_path}; mounts on next start of CT {vmid}.",
             spec.target
-        ));
-    }
-    let ct = PveCt::locate(vmid).await?;
-    let cfg = ct.config().await?;
-    let digest = config_digest(&cfg)?;
-    let entries = api_mp_entries(&cfg);
-    let key = match find_mp(&entries, &spec.target) {
-        Some((k, _)) => k.to_string(),
-        None => first_free_mp(&entries)
-            .ok_or_else(|| format!("CT {vmid}: all {MAX_MP} mount point slots are in use"))?,
-    };
-    ct.put_config(&mp_set_pairs(&key, &value, &digest)).await?;
-    Ok(format!(
-        "Set {key} bind mount {} on CT {vmid} via the PVE API.",
-        spec.target
-    ))
+        ),
+        RawEdit::PendingRestart => format!(
+            "Pending restart: set guest mount {} in {conf_path}; CT {vmid} is running and \
+             mounts it after a restart (`pct reboot {vmid}`).",
+            spec.target
+        ),
+    })
 }
 
 /// Remove the mount at `target` inside `guest` — the counterpart to a deleted or
 /// disabled placement. Idempotent: absent entry ⇒ `Ok`. Also removes the creds
 /// file (best-effort; a missing file is not an error).
-async fn remove(guest: &str, target: &str) -> Result<String, String> {
+fn remove(guest: &str, target: &str) -> Result<String, String> {
     let vmid = parse_vmid(guest)?;
     let conf_path = lxc_conf_path(vmid)?;
     let mountpoint_rel = relative_mountpoint(target);
 
-    let conf = std::fs::read_to_string(&conf_path).map_err(|e| format!("read {conf_path}: {e}"))?;
-    if find_mp(&conf_mp_entries(&conf), target).is_some() {
-        let ct = PveCt::locate(vmid).await?;
-        let cfg = ct.config().await?;
-        let digest = config_digest(&cfg)?;
-        let entries = api_mp_entries(&cfg);
-        if let Some((key, _)) = find_mp(&entries, target) {
-            ct.put_config(&mp_delete_pairs(key, &digest)).await?;
-            return Ok(format!(
-                "Removed {key} bind mount {target} from CT {vmid} via the PVE API."
-            ));
-        }
-    }
-
-    let removed = edit_raw_conf(vmid, |conf| {
+    let outcome = edit_raw_conf(vmid, |conf| {
         let (rewritten, removed) = strip_entry(conf, &mountpoint_rel);
         removed.then_some(rewritten)
-    })
-    .await?;
-    // Best-effort creds cleanup; a leftover/absent file is harmless.
+    })?;
     std::fs::remove_file(guest_creds_path(vmid, target)).ok();
 
-    if removed {
-        Ok(format!(
-            "Removed guest mount {target} from {conf_path}; frees on next start of CT {vmid}."
-        ))
-    } else {
-        Ok(format!(
-            "Guest mount {target} not present in {conf_path} (CT {vmid})."
-        ))
-    }
+    Ok(match outcome {
+        RawEdit::Unchanged => {
+            format!("Guest mount {target} not present in {conf_path} (CT {vmid}).")
+        }
+        RawEdit::Written => format!("Removed guest mount {target} from {conf_path} (CT {vmid})."),
+        RawEdit::PendingRestart => format!(
+            "Pending restart: removed guest mount {target} from {conf_path}; CT {vmid} is \
+             running and keeps it until a restart (`pct reboot {vmid}`)."
+        ),
+    })
 }
 
 // ── Node-local paths ────────────────────────────────────────────────────────
@@ -313,8 +257,11 @@ fn write_creds_file(
     let contents = render_creds_file(&username, &password, domain.as_deref());
 
     let path = guest_creds_path(vmid, target);
-    if let Some(parent) = std::path::Path::new(&path).parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    if let Some(parent) = Path::new(&path).parent() {
+        ensure_private_dir(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    if creds_file_current(Path::new(&path), contents.as_bytes()) {
+        return Ok(path);
     }
     atomic_write(
         Path::new(&path),
@@ -324,6 +271,28 @@ fn write_creds_file(
     )
     .map_err(|e| format!("write creds file {path}: {e}"))?;
     Ok(path)
+}
+
+/// Create `dir` (and parents) and force it to `0700`.
+fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(CREDS_DIR_MODE)
+        .create(dir)?;
+    if std::fs::metadata(dir)?.mode() & 0o7777 != CREDS_DIR_MODE {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(CREDS_DIR_MODE))?;
+    }
+    Ok(())
+}
+
+/// True when the creds file already holds `contents` with the expected mode, so
+/// an unchanged secret is not rewritten every converge tick.
+fn creds_file_current(path: &Path, contents: &[u8]) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    meta.mode() & 0o7777 == CREDS_FILE_MODE
+        && std::fs::read(path).is_ok_and(|existing| existing == contents)
 }
 
 /// Extract `username=` and `domain=` from a rendered option string (the inline
@@ -364,7 +333,9 @@ fn create_temp_beside(
         .file_name()
         .ok_or_else(|| std::io::Error::other("path has no file name"))?
         .to_string_lossy();
-    let tmp = path.with_file_name(format!(".{name}.tmp.{}", std::process::id()));
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(".{name}.tmp.{}.{seq}", std::process::id()));
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -414,210 +385,119 @@ fn atomic_replace(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     )
 }
 
-// ── PVE API ─────────────────────────────────────────────────────────────────
+// ── Raw conf edits ──────────────────────────────────────────────────────────
 
-/// A CT on this node, reached through an enabled endpoint's API.
-struct PveCt {
-    http: reqwest::Client,
-    client: generated::Client,
-    base_url: String,
-    node: String,
-    vmid: u64,
+/// Result of [`edit_raw_conf`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RawEdit {
+    Unchanged,
+    /// Written to a stopped CT; applies on its next start.
+    Written,
+    /// Written to a running CT; lxc reads `lxc.*` lines only at start.
+    PendingRestart,
 }
 
-impl PveCt {
-    /// The first enabled endpoint whose cluster places `vmid` on this node.
-    async fn locate(vmid: u64) -> Result<Self, String> {
-        let local = crate::diagnostics::local_node();
-        let mut errs = Vec::new();
-        for name in crate::tools::enabled_endpoint_names() {
-            let cfg = match crate::tools::resolve_config(&name).await {
-                Ok(c) => c,
-                Err(e) => {
-                    errs.push(format!("{name}: {e:#}"));
-                    continue;
-                }
-            };
-            let (http, client) = match (cfg.build_reqwest_client(), cfg.build_generated_client()) {
-                (Ok(h), Ok(c)) => (h, c),
-                (Err(e), _) | (_, Err(e)) => {
-                    errs.push(format!("{name}: {e}"));
-                    continue;
-                }
-            };
-            match crate::lxc_guest::find_ct(&client, vmid).await {
-                Ok(ct) if ct.node == local => {
-                    return Ok(Self {
-                        http,
-                        client,
-                        base_url: cfg.base_url,
-                        node: ct.node,
-                        vmid,
-                    });
-                }
-                Ok(ct) => errs.push(format!("{name}: CT {vmid} is on node '{}'", ct.node)),
-                Err(e) => errs.push(format!("{name}: {e:#}")),
+impl RawEdit {
+    fn after_write(running: bool) -> Self {
+        if running {
+            Self::PendingRestart
+        } else {
+            Self::Written
+        }
+    }
+}
+
+/// PVE's per-CT config lock (`PVE::LXC::Config::config_file_lock`).
+fn conf_lock_path(vmid: u64) -> PathBuf {
+    PathBuf::from(format!("/run/lock/lxc/pve-config-{vmid}.lock"))
+}
+
+/// A running CT has its cgroup under `/sys/fs/cgroup/lxc/<vmid>`; a local fact,
+/// so no API token or subprocess is needed.
+fn ct_running(vmid: u64) -> bool {
+    Path::new(&format!("/sys/fs/cgroup/lxc/{vmid}")).exists()
+}
+
+/// Take `path`'s exclusive flock, polling until `timeout`.
+fn lock_exclusive(path: &Path, timeout: Duration) -> Result<std::fs::File, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(format!(
+                    "timed out after {}s waiting for {}",
+                    timeout.as_secs(),
+                    path.display()
+                ));
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!("lock {}: {e}", path.display()));
             }
         }
-        Err(format!(
-            "CT {vmid}: no enabled proxmox endpoint places it on node '{local}' ({})",
-            errs.join("; ")
-        ))
-    }
-
-    async fn config(&self) -> Result<GuestConfigData, String> {
-        crate::fetch_guest_config(
-            &self.http,
-            &self.base_url,
-            &self.node,
-            GuestKind::Lxc,
-            self.vmid,
-        )
-        .await
-        .map(|r| r.data)
-        .map_err(|e| format!("CT {} config: {e}", self.vmid))
-    }
-
-    async fn status(&self) -> Result<String, String> {
-        self.client
-            .get_vm_status_nodes_node_lxc_vmid_status_current(&self.node, self.vmid as i64)
-            .await
-            .map(|r| r.into_inner().status.to_string())
-            .map_err(|e| format!("CT {} status: {e}", self.vmid))
-    }
-
-    async fn put_config(&self, pairs: &[(String, String)]) -> Result<(), String> {
-        let url = format!(
-            "{}/nodes/{}/lxc/{}/config",
-            self.base_url.trim_end_matches('/'),
-            crate::backup::enc(&self.node),
-            self.vmid
-        );
-        crate::backup::put_form(&self.http, &url, pairs)
-            .await
-            .map_err(|e| format!("{e:#}"))
     }
 }
 
-fn config_digest(cfg: &GuestConfigData) -> Result<String, String> {
-    cfg.get_str("digest")
-        .map(str::to_string)
-        .ok_or_else(|| "PVE config response carries no digest".to_string())
+/// Split a CT conf into its live section and the rest, which starts at the first
+/// `[snapshot]` header and is returned untouched.
+fn split_live_section(conf: &str) -> (&str, &str) {
+    let mut offset = 0;
+    for line in conf.split_inclusive('\n') {
+        if line.trim_start().starts_with('[') {
+            return conf.split_at(offset);
+        }
+        offset += line.len();
+    }
+    (conf, "")
 }
 
-/// Raw `lxc.*` lines have no PVE API, so they are edited in the conf file under
-/// guards: the CT must be stopped (a running CT's conf is live state PVE may
-/// rewrite), the digest must not change between read and write, and the write
-/// is atomic. `edit` returns the new conf, or `None` for no change. Returns
-/// whether the file was written; a no-op never touches the API.
-pub(crate) async fn edit_raw_conf<F>(vmid: u64, edit: F) -> Result<bool, String>
+/// Apply `edit` to the live section of `conf`; `None` when it makes no change.
+fn edit_live_section<F>(conf: &str, edit: F) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let (live, snapshots) = split_live_section(conf);
+    let mut out = edit(live)?;
+    if !snapshots.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(snapshots);
+    Some(out)
+}
+
+/// Raw `lxc.*` lines have no PVE API (and API tokens cannot set bind `mpN`s, which
+/// are `root@pam`-only), so the conf is edited locally as root. The edit runs
+/// under PVE's own config flock, re-reads the file under it, touches only the
+/// live section, and replaces the file atomically. `edit` returns the new live
+/// section, or `None` for no change.
+pub(crate) fn edit_raw_conf<F>(vmid: u64, edit: F) -> Result<RawEdit, String>
 where
     F: Fn(&str) -> Option<String>,
 {
     let path = format!("/etc/pve/lxc/{vmid}.conf");
     let read = || std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"));
-    if edit(&read()?).is_none() {
-        return Ok(false);
+    if edit_live_section(&read()?, &edit).is_none() {
+        return Ok(RawEdit::Unchanged);
     }
-    let ct = PveCt::locate(vmid).await?;
-    require_stopped(vmid, &ct.status().await?)?;
-    let before = config_digest(&ct.config().await?)?;
-    let Some(rewritten) = edit(&read()?) else {
-        return Ok(false);
+    let _lock = lock_exclusive(&conf_lock_path(vmid), CONF_LOCK_TIMEOUT)
+        .map_err(|e| format!("CT {vmid} config lock: {e}"))?;
+    let Some(rewritten) = edit_live_section(&read()?, &edit) else {
+        return Ok(RawEdit::Unchanged);
     };
-    let after = config_digest(&ct.config().await?)?;
-    require_same_digest(vmid, &before, &after)?;
     atomic_replace(Path::new(&path), rewritten.as_bytes())
         .map_err(|e| format!("write {path}: {e}"))?;
-    Ok(true)
-}
-
-fn require_stopped(vmid: u64, status: &str) -> Result<(), String> {
-    if status == "stopped" {
-        Ok(())
-    } else {
-        Err(format!(
-            "CT {vmid} is {status}; raw lxc.* config lines have no PVE API, so they are only \
-             edited while the CT is stopped (`pct stop {vmid}`)"
-        ))
-    }
-}
-
-fn require_same_digest(vmid: u64, before: &str, after: &str) -> Result<(), String> {
-    if before == after {
-        Ok(())
-    } else {
-        Err(format!(
-            "CT {vmid} config changed during the edit (digest {before} -> {after}); aborted"
-        ))
-    }
-}
-
-// ── Mount points (mpN) ──────────────────────────────────────────────────────
-
-/// True for a host-path bind, which PVE models as an `mpN` mount point.
-fn is_bind(fstype: &str, src: &str) -> bool {
-    matches!(fstype, "bind" | "none") && src.starts_with('/')
-}
-
-fn is_mp_key(key: &str) -> bool {
-    key.strip_prefix("mp")
-        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-}
-
-/// `mpN` entries from the conf's live section (before any `[snapshot]`).
-fn conf_mp_entries(conf: &str) -> Vec<(String, String)> {
-    conf.lines()
-        .take_while(|l| !l.trim_start().starts_with('['))
-        .filter_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            let k = k.trim();
-            is_mp_key(k).then(|| (k.to_string(), v.trim().to_string()))
-        })
-        .collect()
-}
-
-fn api_mp_entries(cfg: &GuestConfigData) -> Vec<(String, String)> {
-    cfg.fields
-        .iter()
-        .filter_map(|(k, v)| match v {
-            ConfigField::Str(s) if is_mp_key(k) => Some((k.clone(), s.clone())),
-            _ => None,
-        })
-        .collect()
-}
-
-/// The `mpN` whose `mp=` is `target`.
-fn find_mp<'a>(entries: &'a [(String, String)], target: &str) -> Option<(&'a str, &'a str)> {
-    entries
-        .iter()
-        .find(|(_, v)| v.split(',').any(|p| p.strip_prefix("mp=") == Some(target)))
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-}
-
-fn first_free_mp(entries: &[(String, String)]) -> Option<String> {
-    (0..MAX_MP)
-        .map(|i| format!("mp{i}"))
-        .find(|k| !entries.iter().any(|(e, _)| e == k))
-}
-
-fn render_mp_value(src: &str, target: &str, ro: bool) -> String {
-    let ro = if ro { ",ro=1" } else { "" };
-    format!("{src},mp={target}{ro}")
-}
-
-fn mp_set_pairs(key: &str, value: &str, digest: &str) -> Vec<(String, String)> {
-    vec![
-        (key.to_string(), value.to_string()),
-        ("digest".to_string(), digest.to_string()),
-    ]
-}
-
-fn mp_delete_pairs(key: &str, digest: &str) -> Vec<(String, String)> {
-    vec![
-        ("delete".to_string(), key.to_string()),
-        ("digest".to_string(), digest.to_string()),
-    ]
+    Ok(RawEdit::after_write(ct_running(vmid)))
 }
 
 // ── Pure entry rendering ────────────────────────────────────────────────────
@@ -872,13 +752,6 @@ mod tests {
         d
     }
 
-    fn entries(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
     #[test]
     fn creds_temp_file_is_0600_at_creation() {
         let dir = scratch("creds-mode");
@@ -917,69 +790,56 @@ mod tests {
     }
 
     #[test]
-    fn raw_edit_refused_unless_stopped() {
-        assert!(require_stopped(110, "stopped").is_ok());
-        let err = require_stopped(110, "running").unwrap_err();
-        assert!(err.contains("running"));
+    fn live_section_stops_at_first_snapshot_header() {
+        let conf = "arch: amd64\nmemory: 512\n\n[snap1]\nlxc.mount.entry: a mnt/x cifs o 0 0\n";
+        let (live, rest) = split_live_section(conf);
+        assert_eq!(live, "arch: amd64\nmemory: 512\n\n");
+        assert_eq!(rest, "[snap1]\nlxc.mount.entry: a mnt/x cifs o 0 0\n");
+        assert_eq!(split_live_section("arch: amd64\n"), ("arch: amd64\n", ""));
     }
 
     #[test]
-    fn raw_edit_aborts_on_digest_change() {
-        assert!(require_same_digest(110, "abc", "abc").is_ok());
-        assert!(require_same_digest(110, "abc", "def").is_err());
+    fn edit_never_touches_snapshot_sections() {
+        let snap = "[snap1]\nlxc.mount.entry: //old mnt/backups cifs o 0 0\n";
+        let conf = format!("arch: amd64\n{snap}");
+        let line = "lxc.mount.entry: //new mnt/backups cifs create=dir 0 0";
+        let out = edit_live_section(&conf, |c| {
+            let (r, changed) = upsert_entry(c, "mnt/backups", line);
+            changed.then_some(r)
+        })
+        .unwrap();
+        assert_eq!(out, format!("arch: amd64\n{line}\n{snap}"));
+        let out = edit_live_section(&out, |c| {
+            let (r, removed) = strip_entry(c, "mnt/backups");
+            removed.then_some(r)
+        })
+        .unwrap();
+        assert_eq!(out, conf);
     }
 
     #[test]
-    fn first_free_mp_fills_gaps() {
-        assert_eq!(first_free_mp(&[]), Some("mp0".to_string()));
-        let e = entries(&[("mp0", "/a,mp=/a"), ("mp2", "/c,mp=/c")]);
-        assert_eq!(first_free_mp(&e), Some("mp1".to_string()));
-        let full: Vec<_> = (0..MAX_MP)
-            .map(|i| (format!("mp{i}"), String::new()))
-            .collect();
-        assert_eq!(first_free_mp(&full), None);
+    fn running_ct_write_is_pending_restart_not_error() {
+        assert_eq!(RawEdit::after_write(true), RawEdit::PendingRestart);
+        assert_eq!(RawEdit::after_write(false), RawEdit::Written);
     }
 
     #[test]
-    fn find_mp_matches_target_exactly() {
-        let e = entries(&[
-            ("mp0", "/srv/a,mp=/mnt/a"),
-            ("mp3", "/srv/b,mp=/mnt/b,ro=1"),
-        ]);
-        assert_eq!(find_mp(&e, "/mnt/b").map(|(k, _)| k), Some("mp3"));
-        assert!(find_mp(&e, "/mnt").is_none());
-    }
-
-    #[test]
-    fn conf_mp_entries_reads_live_section_only() {
-        let conf = "arch: amd64\nmp0: /srv/a,mp=/mnt/a\nmemory: 512\n[snap1]\nmp1: /x,mp=/y\n";
+    fn conf_lock_path_matches_pct() {
         assert_eq!(
-            conf_mp_entries(conf),
-            entries(&[("mp0", "/srv/a,mp=/mnt/a")])
+            conf_lock_path(110),
+            PathBuf::from("/run/lock/lxc/pve-config-110.lock")
         );
     }
 
     #[test]
-    fn mp_requests_carry_value_and_digest() {
-        let value = render_mp_value("/srv/media", "/mnt/media", true);
-        assert_eq!(value, "/srv/media,mp=/mnt/media,ro=1");
-        assert_eq!(
-            mp_set_pairs("mp1", &value, "d1"),
-            entries(&[("mp1", "/srv/media,mp=/mnt/media,ro=1"), ("digest", "d1")])
-        );
-        assert_eq!(
-            mp_delete_pairs("mp1", "d1"),
-            entries(&[("delete", "mp1"), ("digest", "d1")])
-        );
-        assert_eq!(render_mp_value("/a", "/b", false), "/a,mp=/b");
-    }
-
-    #[test]
-    fn bind_detection_needs_bind_type_and_host_path() {
-        assert!(is_bind("bind", "/srv/a"));
-        assert!(is_bind("none", "/srv/a"));
-        assert!(!is_bind("cifs", "//host/share"));
-        assert!(!is_bind("nfs", "host:/export"));
+    fn lock_exclusive_times_out_while_held() {
+        let dir = scratch("lock");
+        let path = dir.join("pve-config-1.lock");
+        let held = lock_exclusive(&path, Duration::ZERO).unwrap();
+        assert!(lock_exclusive(&path, Duration::ZERO).is_err());
+        drop(held);
+        assert!(lock_exclusive(&path, Duration::ZERO).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

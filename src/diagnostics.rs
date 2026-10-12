@@ -448,8 +448,7 @@ fn finding_shm_trap(node: &str, vmid: u64, name: &str, trap: &crate::shm_trap::S
             id: format!("shm-resize::{vmid}::{}::{suggested}", trap.target),
             description: format!(
                 "Rewrite the tmpfs /{} entry in /etc/pve/lxc/{vmid}.conf to size={suggested}m \
-                 (leaves headroom under the {} MiB cap). The CT must be stopped first; takes \
-                 effect on its next start.",
+                 (leaves headroom under the {} MiB cap). Takes effect on the CT's next start.",
                 trap.target, trap.memory_mb
             ),
             // Confirmation required — it edits the CT config and needs a restart.
@@ -462,16 +461,15 @@ fn finding_shm_trap(node: &str, vmid: u64, name: &str, trap: &crate::shm_trap::S
 
 /// Apply an `shm-resize::<vmid>::<target>::<new_mb>` repair by rewriting the
 /// tmpfs `size=` in the CT's conf. The tmpfs is a raw `lxc.mount.entry` with no
-/// PVE API, so it goes through the stopped/digest/atomic guards of
+/// PVE API, so it goes through the locked, live-section-only atomic edit of
 /// [`crate::guest_mount::edit_raw_conf`].
 async fn repair_shm_resize(vmid: u64, target: &str, new_mb: u64) -> Result<String, String> {
     let path = format!("/etc/pve/lxc/{vmid}.conf");
-    let changed = crate::guest_mount::edit_raw_conf(vmid, |conf| {
+    let outcome = crate::guest_mount::edit_raw_conf(vmid, |conf| {
         let (rewritten, changed) = crate::shm_trap::rewrite_tmpfs_size(conf, target, new_mb);
         changed.then_some(rewritten)
-    })
-    .await?;
-    if !changed {
+    })?;
+    if outcome == crate::guest_mount::RawEdit::Unchanged {
         return Err(format!(
             "no tmpfs /{target} entry with a size= found in {path} (already fixed?)"
         ));
