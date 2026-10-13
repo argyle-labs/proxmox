@@ -33,7 +33,12 @@ use proxmox::tools as _;
 
 fn main() -> plugin_toolkit::anyhow::Result<()> {
     if plugin_toolkit::privileged::requested() {
-        proxmox::guest_file::register(proxmox::guest_mount::privileged_ops()).serve_stdin();
+        proxmox::guest_file::register(proxmox::guest_mount::privileged_ops())
+            .op(
+                proxmox::node_state::OP_CAPTURE,
+                proxmox::node_state::root_capture_op,
+            )
+            .serve_stdin();
     }
     let mut plugin = Plugin::named("proxmox")
         .version(env!("CARGO_PKG_VERSION"))

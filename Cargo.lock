@@ -2192,6 +2192,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex",
+ "rusqlite",
  "schemars 1.2.2",
  "serde",
  "serde_json",
