@@ -8,6 +8,9 @@
 //! * `host/<abs path>` — host config files listed in [`HOST_PATHS`];
 //! * `OWNERSHIP` — `mode uid gid path` of every captured entry, since the
 //!   payload copies are owned by the orca user so the engine can ship them;
+//! * `SECRETS_EXCLUDED` — `mode uid gid size sha256 path` of every secret left
+//!   out of the payload (see [`is_secret`] and [`scrub_db_secrets`]), so a
+//!   restore can detect drift without the orca user ever holding the material;
 //! * `api/*.json` — what the PVE API exposes for the node (network, dns, hosts,
 //!   apt repositories, cluster node list);
 //! * `SHA256SUMS` — `sha256sum -c` format over every other file.
@@ -34,6 +37,7 @@ const SUMS: &str = "SHA256SUMS";
 const OWNERSHIP: &str = "OWNERSHIP";
 const DB_FILE: &str = "config.db";
 const HOST_DIR: &str = "host";
+const SECRETS_EXCLUDED: &str = "SECRETS_EXCLUDED";
 
 pub const HOST_PATHS: &[&str] = &[
     "/etc/pve",
@@ -43,6 +47,8 @@ pub const HOST_PATHS: &[&str] = &[
     "/etc/sudoers.d",
     "/etc/cron.d",
     "/etc/fstab",
+    "/etc/hosts",
+    "/etc/hostname",
     "/etc/apt/sources.list",
     "/etc/apt/sources.list.d",
     "/usr/local/bin",
@@ -92,7 +98,8 @@ pub async fn backup(dir: &str, instance: &str) -> Result<Value> {
     Ok(json!({
         "checksum": format!("sha256:{digest}"),
         "note": format!(
-            "{node}: {detail}; api: {}; {files} file(s) in SHA256SUMS",
+            "{node}: {detail}; api: {}; {files} file(s) in SHA256SUMS; \
+             secrets excluded (listed in {SECRETS_EXCLUDED}), pending the encrypted-secrets follow-up",
             if api.is_empty() { "none".to_string() } else { api.join(", ") }
         ),
     }))
@@ -164,28 +171,33 @@ pub fn capture_in(root: &Path, dest: &Path) -> Result<String> {
     let owner = check_dest(dest)?;
 
     let db = dest.join(DB_FILE);
-    sqlite_online_copy(&under(root, CONFIG_DB), &db)?;
+    let mut excluded = sqlite_online_copy(&under(root, CONFIG_DB), &db)?;
 
     let host = dest.join(HOST_DIR);
     let mut files = 0;
     let mut missing = Vec::new();
     for p in HOST_PATHS {
-        let src = under(root, p);
-        if std::fs::symlink_metadata(&src).is_err() {
+        if std::fs::symlink_metadata(under(root, p)).is_err() {
             missing.push(*p);
             continue;
         }
-        files += crate::bind_mounts::copy_tree(&src, &under(&host, p))
+        files += copy_without_secrets(root, Path::new(p), &host, &mut excluded)
             .with_context(|| format!("copy {p}"))?;
     }
 
     let mut ownership = String::new();
     record_and_chown(&host, &host, root, owner, &mut ownership)?;
     std::fs::write(dest.join(OWNERSHIP), ownership).context("write OWNERSHIP")?;
+    std::fs::write(dest.join(SECRETS_EXCLUDED), excluded.concat())
+        .context("write SECRETS_EXCLUDED")?;
     chown(&db, owner)?;
     chown(&dest.join(OWNERSHIP), owner)?;
+    chown(&dest.join(SECRETS_EXCLUDED), owner)?;
 
-    let mut detail = format!("config.db + {files} host file(s)");
+    let mut detail = format!(
+        "config.db + {files} host file(s), {} secret(s) excluded",
+        excluded.len()
+    );
     if !missing.is_empty() {
         detail.push_str(&format!(" (absent: {})", missing.join(", ")));
     }
@@ -212,7 +224,7 @@ fn check_dest(dest: &Path) -> Result<(u32, u32)> {
         "payload dir {} is owned by root",
         dest.display()
     );
-    for name in [DB_FILE, HOST_DIR, OWNERSHIP] {
+    for name in [DB_FILE, HOST_DIR, OWNERSHIP, SECRETS_EXCLUDED] {
         ensure!(
             std::fs::symlink_metadata(dest.join(name)).is_err(),
             "payload dir {} already holds {name}",
@@ -223,8 +235,9 @@ fn check_dest(dest: &Path) -> Result<(u32, u32)> {
 }
 
 /// Short steps with a pause keep each read lock brief so pmxcfs writes are
-/// never held up; a write mid-copy makes SQLite restart the copy.
-fn sqlite_online_copy(src: &Path, dst: &Path) -> Result<()> {
+/// never held up; a write mid-copy makes SQLite restart the copy. Returns the
+/// `SECRETS_EXCLUDED` lines for rows scrubbed from the copy.
+fn sqlite_online_copy(src: &Path, dst: &Path) -> Result<Vec<String>> {
     use rusqlite::{Connection, OpenFlags, backup::Backup};
     let src_conn = Connection::open_with_flags(
         src,
@@ -237,6 +250,7 @@ fn sqlite_online_copy(src: &Path, dst: &Path) -> Result<()> {
         .context("start sqlite online backup")?
         .run_to_completion(64, Duration::from_millis(20), None)
         .context("sqlite online backup")?;
+    let excluded = scrub_db_secrets(&dst_conn)?;
     let check: String = dst_conn
         .query_row("PRAGMA integrity_check", [], |r| r.get(0))
         .context("integrity_check on the copy")?;
@@ -250,7 +264,138 @@ fn sqlite_online_copy(src: &Path, dst: &Path) -> Result<()> {
         .query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))
         .context("set journal_mode on the copy")?;
     ensure!(mode == "delete", "config.db copy kept journal_mode {mode}");
-    Ok(())
+    Ok(excluded)
+}
+
+/// pmxcfs stores every `/etc/pve` file as a `tree` row (parent = 0 at the top,
+/// inode 0 is the version row), so `priv/` and node TLS keys live in config.db
+/// too. Delete them from the copy and VACUUM so the freed pages are gone.
+fn scrub_db_secrets(conn: &rusqlite::Connection) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare(
+            "WITH RECURSIVE p(inode, path) AS (
+                 SELECT inode, '/' || name FROM tree WHERE parent = 0 AND inode != 0
+                 UNION ALL
+                 SELECT t.inode, p.path || '/' || t.name FROM tree t JOIN p ON t.parent = p.inode
+             )
+             SELECT p.inode, p.path, CAST(t.data AS BLOB) FROM p JOIN tree t ON t.inode = p.inode
+             ORDER BY p.path",
+        )
+        .context("walk config.db tree")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<Vec<u8>>>(2)?,
+            ))
+        })
+        .context("walk config.db tree")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("walk config.db tree")?;
+    drop(stmt);
+    let mut excluded = Vec::new();
+    for (inode, path, data) in rows {
+        let name = path.rsplit('/').next().unwrap_or_default();
+        let secret = path.starts_with("/priv/")
+            || is_secret_name(name)
+            || data.as_deref().is_some_and(looks_like_private_key);
+        if !secret {
+            continue;
+        }
+        let data = data.unwrap_or_default();
+        excluded.push(format!(
+            "- - - {} {} {DB_FILE}:{path}\n",
+            data.len(),
+            plugin_toolkit::hash::sha256_hex(&data)
+        ));
+        conn.execute("DELETE FROM tree WHERE inode = ?1", [inode])
+            .with_context(|| format!("scrub {path} from config.db copy"))?;
+    }
+    conn.execute_batch("VACUUM")
+        .context("VACUUM config.db copy")?;
+    Ok(excluded)
+}
+
+/// Copy `abs` from under `root` into `host`, leaving out every secret file and
+/// recording it in `excluded` instead.
+fn copy_without_secrets(
+    root: &Path,
+    abs: &Path,
+    host: &Path,
+    excluded: &mut Vec<String>,
+) -> Result<u64> {
+    let src = under(root, abs);
+    let meta =
+        std::fs::symlink_metadata(&src).with_context(|| format!("stat {}", src.display()))?;
+    if meta.is_dir() {
+        std::fs::create_dir_all(under(host, abs))
+            .with_context(|| format!("create {}", abs.display()))?;
+        let mut names: Vec<_> = std::fs::read_dir(&src)
+            .with_context(|| format!("list {}", src.display()))?
+            .map(|e| e.map(|e| e.file_name()))
+            .collect::<std::io::Result<_>>()?;
+        names.sort();
+        let mut n = 0;
+        for name in names {
+            n += copy_without_secrets(root, &abs.join(name), host, excluded)?;
+        }
+        return Ok(n);
+    }
+    if meta.is_file() && is_secret(abs, &src)? {
+        excluded.push(format!(
+            "{:o} {} {} {} {} {}\n",
+            meta.mode() & 0o7777,
+            meta.uid(),
+            meta.gid(),
+            meta.len(),
+            plugin_toolkit::hash::sha256_file(&src)?,
+            abs.display()
+        ));
+        return Ok(0);
+    }
+    crate::bind_mounts::copy_tree(&src, &under(host, abs))
+}
+
+/// `abs` is the host path; `src` is where it is read from.
+fn is_secret(abs: &Path, src: &Path) -> Result<bool> {
+    let name = abs
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    if abs.starts_with("/etc/pve/priv") || is_secret_name(&name) {
+        return Ok(true);
+    }
+    if abs.starts_with("/root/.ssh")
+        && !(name.ends_with(".pub")
+            || matches!(
+                &*name,
+                "authorized_keys" | "authorized_keys2" | "known_hosts" | "config"
+            ))
+    {
+        return Ok(true);
+    }
+    use std::io::Read;
+    let mut head = Vec::new();
+    std::fs::File::open(src)
+        .with_context(|| format!("open {}", src.display()))?
+        .take(16 * 1024)
+        .read_to_end(&mut head)
+        .with_context(|| format!("read {}", src.display()))?;
+    Ok(looks_like_private_key(&head))
+}
+
+/// SSH host keys, TLS keys (`pve-ssl.key`, `pveproxy-ssl.key`), corosync's
+/// `authkey`, ceph keyrings.
+fn is_secret_name(name: &str) -> bool {
+    (name.starts_with("ssh_host_") && name.ends_with("_key"))
+        || name.ends_with(".key")
+        || name.ends_with(".keyring")
+        || name == "authkey"
+}
+
+fn looks_like_private_key(head: &[u8]) -> bool {
+    head.windows(16).any(|w| w == b"PRIVATE KEY-----")
 }
 
 fn under(root: &Path, abs: impl AsRef<Path>) -> PathBuf {
@@ -379,8 +524,20 @@ mod tests {
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let c = rusqlite::Connection::open(&db).unwrap();
         c.execute_batch(
-            "PRAGMA journal_mode=WAL; CREATE TABLE tree (inode INTEGER, data BLOB);
-             INSERT INTO tree VALUES (1, 'corosync.conf');",
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE tree (inode INTEGER PRIMARY KEY NOT NULL, parent INTEGER NOT NULL,
+                 version INTEGER NOT NULL, writer INTEGER NOT NULL, mtime INTEGER NOT NULL,
+                 type INTEGER NOT NULL, name TEXT NOT NULL, data BLOB);
+             INSERT INTO tree VALUES
+                 (0, 0, 9, 0, 0, 8, '__version__', NULL),
+                 (1, 0, 1, 0, 0, 8, 'corosync.conf', 'totem {}'),
+                 (2, 0, 1, 0, 0, 4, 'priv', NULL),
+                 (3, 2, 1, 0, 0, 8, 'authkey.key', 'cluster secret'),
+                 (4, 2, 1, 0, 0, 8, 'token.cfg', 'tok'),
+                 (5, 0, 1, 0, 0, 4, 'nodes', NULL),
+                 (6, 5, 1, 0, 0, 4, 'n1', NULL),
+                 (7, 6, 1, 0, 0, 8, 'pve-ssl.key', 'tls secret'),
+                 (8, 6, 1, 0, 0, 8, 'pve-ssl.pem', 'cert');",
         )
         .unwrap();
         // Held open: the copy must read a database another connection owns.
@@ -390,6 +547,19 @@ mod tests {
         std::fs::write(ssh.join("sshd_config"), "Port 22\n").unwrap();
         std::fs::write(under(&root, "/etc/fstab"), "proc /proc proc 0 0\n").unwrap();
         std::os::unix::fs::symlink("sshd_config", ssh.join("link")).unwrap();
+        std::fs::write(ssh.join("ssh_host_ed25519_key"), "host secret").unwrap();
+        std::fs::write(ssh.join("ssh_host_ed25519_key.pub"), "ssh-ed25519 AAAA\n").unwrap();
+        let pv = under(&root, "/etc/pve/priv");
+        std::fs::create_dir_all(&pv).unwrap();
+        std::fs::write(pv.join("shadow.cfg"), "cluster secret").unwrap();
+        let rs = under(&root, "/root/.ssh");
+        std::fs::create_dir_all(&rs).unwrap();
+        std::fs::write(rs.join("id_rsa"), "root secret").unwrap();
+        std::fs::write(rs.join("authorized_keys"), "ssh-ed25519 AAAA\n").unwrap();
+        let bin = under(&root, "/usr/local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("deploy"), "-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+        std::fs::write(under(&root, "/etc/hosts"), "127.0.0.1 localhost\n").unwrap();
         root
     }
 
@@ -401,14 +571,76 @@ mod tests {
         std::fs::create_dir_all(&dest).unwrap();
 
         let detail = capture_in(&root, &dest).unwrap();
-        assert!(detail.contains("config.db + 3 host file(s)"), "{detail}");
-        assert!(detail.contains("absent: /etc/pve"), "{detail}");
+        assert!(
+            detail.contains("config.db + 6 host file(s), 7 secret(s) excluded"),
+            "{detail}"
+        );
+        assert!(!detail.contains("/etc/pve"), "{detail}");
 
         let c = rusqlite::Connection::open(dest.join(DB_FILE)).unwrap();
-        let n: i64 = c
-            .query_row("SELECT count(*) FROM tree", [], |r| r.get(0))
+        let names: Vec<String> = c
+            .prepare("SELECT name FROM tree ORDER BY inode")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(
+            names,
+            [
+                "__version__",
+                "corosync.conf",
+                "priv",
+                "nodes",
+                "n1",
+                "pve-ssl.pem"
+            ]
+        );
+        let check: String = c
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(check, "ok");
+        let raw = std::fs::read(dest.join(DB_FILE)).unwrap();
+        assert!(!raw.windows(14).any(|w| w == b"cluster secret"));
+        assert!(!raw.windows(10).any(|w| w == b"tls secret"));
+
+        for gone in [
+            "host/etc/ssh/ssh_host_ed25519_key",
+            "host/etc/pve/priv/shadow.cfg",
+            "host/root/.ssh/id_rsa",
+            "host/usr/local/bin/deploy",
+        ] {
+            assert!(
+                std::fs::symlink_metadata(dest.join(gone)).is_err(),
+                "{gone}"
+            );
+        }
+        for kept in [
+            "host/etc/ssh/ssh_host_ed25519_key.pub",
+            "host/root/.ssh/authorized_keys",
+            "host/etc/hosts",
+        ] {
+            assert!(dest.join(kept).is_file(), "{kept}");
+        }
+        let ex = std::fs::read_to_string(dest.join(SECRETS_EXCLUDED)).unwrap();
+        let host_secret = plugin_toolkit::hash::sha256_hex(b"host secret");
+        assert!(
+            ex.contains(&format!(
+                " 11 {host_secret} /etc/ssh/ssh_host_ed25519_key\n"
+            )),
+            "{ex}"
+        );
+        for path in [
+            " /etc/pve/priv/shadow.cfg\n",
+            " /root/.ssh/id_rsa\n",
+            " /usr/local/bin/deploy\n",
+            " config.db:/priv/authkey.key\n",
+            " config.db:/priv/token.cfg\n",
+            " config.db:/nodes/n1/pve-ssl.key\n",
+        ] {
+            assert!(ex.contains(path), "{path} missing from {ex}");
+        }
+        assert!(!ex.contains("secret\n"), "{ex}");
         assert_eq!(
             std::fs::read_to_string(dest.join("host/etc/ssh/sshd_config")).unwrap(),
             "Port 22\n"
@@ -419,7 +651,7 @@ mod tests {
 
         write_sums(&dest).unwrap();
         let (files, digest) = verify_sums(&dest).unwrap();
-        assert_eq!(files, 4);
+        assert_eq!(files, 8);
         assert_eq!(digest.len(), 64);
         std::fs::remove_dir_all(&base).unwrap();
     }
