@@ -1,21 +1,89 @@
+# ci.yml for a Rust-only plugin: copy to .github/workflows/ci.yml. Each job is
+# one shared job action from argyle-labs/.github; add no steps here. A crate
+# over the default runners' memory cap sets `runs-on: ci-large` (and optionally
+# `build-jobs` / `debuginfo`) on every Rust job.
 name: CI
 
 on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      force:
+        description: 'Ignore the pass cache'
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  ci:
-    uses: argyle-labs/.github/.github/workflows/plugin-ci.yml@main
-    secrets: inherit
-    # The generated client and tool surface compile as one giant rustc that
-    # OOMs the runner unless the build is serialized and debuginfo dropped.
-    with:
-      build-jobs: '1'
-      debuginfo: '0'
-      runs-on: ci-large
+  build:
+    runs-on: ci-large
+    container:
+      image: ${{ vars.CI_REGISTRY || 'gitea.scottkey.me' }}/argyle-labs/ci-rust:1.95.0
+      credentials:
+        username: ${{ secrets.CI_REGISTRY_USER }}
+        password: ${{ secrets.CI_REGISTRY_TOKEN }}
+    steps:
+      - name: Build
+        uses: argyle-labs/.github/.github/actions/job-rust-build@main
+        with:
+          build-jobs: '1'
+          debuginfo: '0'
+          sccache-endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          sccache-access-key: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
+          sccache-secret-key: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
+
+  test:
+    needs: build
+    runs-on: ci-large
+    container:
+      image: ${{ vars.CI_REGISTRY || 'gitea.scottkey.me' }}/argyle-labs/ci-rust:1.95.0
+      credentials:
+        username: ${{ secrets.CI_REGISTRY_USER }}
+        password: ${{ secrets.CI_REGISTRY_TOKEN }}
+    steps:
+      - name: Test
+        uses: argyle-labs/.github/.github/actions/job-rust-test@main
+        with:
+          build-jobs: '1'
+          debuginfo: '0'
+          sccache-endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          sccache-access-key: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
+          sccache-secret-key: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
+
+  lint:
+    runs-on: ci-large
+    container:
+      image: ${{ vars.CI_REGISTRY || 'gitea.scottkey.me' }}/argyle-labs/ci-rust:1.95.0
+      credentials:
+        username: ${{ secrets.CI_REGISTRY_USER }}
+        password: ${{ secrets.CI_REGISTRY_TOKEN }}
+    steps:
+      - name: Lint
+        uses: argyle-labs/.github/.github/actions/job-rust-lint@main
+        with:
+          build-jobs: '1'
+          debuginfo: '0'
+          sccache-endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          sccache-access-key: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
+          sccache-secret-key: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
+
+  lint-doctest:
+    runs-on: ci-large
+    container:
+      image: ${{ vars.CI_REGISTRY || 'gitea.scottkey.me' }}/argyle-labs/ci-rust:1.95.0
+      credentials:
+        username: ${{ secrets.CI_REGISTRY_USER }}
+        password: ${{ secrets.CI_REGISTRY_TOKEN }}
+    steps:
+      - name: Doctests
+        uses: argyle-labs/.github/.github/actions/job-rust-doctest@main
+        with:
+          build-jobs: '1'
+          debuginfo: '0'
+          sccache-endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          sccache-access-key: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
+          sccache-secret-key: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
