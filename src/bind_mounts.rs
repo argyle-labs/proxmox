@@ -372,7 +372,7 @@ fn io_err(op: &str, path: &Path, e: std::io::Error) -> anyhow::Error {
     }
 }
 
-fn copy_tree(src: &Path, dest: &Path) -> Result<u64> {
+pub(crate) fn copy_tree(src: &Path, dest: &Path) -> Result<u64> {
     let meta = std::fs::symlink_metadata(src).map_err(|e| io_err("stat", src, e))?;
     if meta.file_type().is_symlink() {
         let target = std::fs::read_link(src).map_err(|e| io_err("readlink", src, e))?;

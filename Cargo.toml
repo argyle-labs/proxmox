@@ -84,6 +84,9 @@ url         = "2"
 libc        = "0.2"
 # Streaming sha256 while copying; utils::hash only hashes whole buffers or paths.
 sha2        = "0.10"
+# Already linked through the toolkit; `backup` adds SQLite's online backup API
+# for a consistent copy of the live pmxcfs `config.db`.
+rusqlite    = { version = "0.39", features = ["backup"] }
 
 [dev-dependencies]
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }

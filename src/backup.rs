@@ -8,7 +8,7 @@
 //! runs on the same host as the engine, so we write bytes directly rather than
 //! streaming them over the socket).
 //!
-//! Four KINDs are registered, each with a distinct bridge invoke-prefix:
+//! Five KINDs are registered, each with a distinct bridge invoke-prefix:
 //!
 //! - `pve-config` (`proxmox.__backup_pveconfig`) — one logical instance
 //!   (`default`). Captures cluster/host config the API exposes: storage config
@@ -26,10 +26,12 @@
 //! - `lxc-bind` (`proxmox.__backup_lxcbind`) — containers on THIS node whose
 //!   app state lives in a bind mount, which vzdump never includes. Copies the
 //!   host side of those paths; see [`crate::bind_mounts`].
+//! - `pve-node-state` (`proxmox.__backup_pvenodestate`) — THIS node's pmxcfs
+//!   `config.db` and host config files; see [`crate::node_state`].
 //!
 //! The host calls, per kind, `{prefix}.{op}` for op in
 //! instances|layout|backup|restore over the subprocess socket with BARE JSON
-//! requests/responses (no envelope). [`dispatch`] matches all three prefixes and
+//! requests/responses (no envelope). [`dispatch`] matches every prefix and
 //! their four ops, decodes the arg shapes, and drives the async work to
 //! completion on the subprocess reactor.
 
@@ -47,8 +49,9 @@ pub const PVECONFIG_PREFIX: &str = "proxmox.__backup_pveconfig";
 pub const VM_PREFIX: &str = "proxmox.__backup_vm";
 pub const LXC_PREFIX: &str = "proxmox.__backup_lxc";
 pub const LXC_BIND_PREFIX: &str = "proxmox.__backup_lxcbind";
+pub const NODE_STATE_PREFIX: &str = "proxmox.__backup_pvenodestate";
 
-/// The three `backup_kind` backend descriptors this plugin advertises, one per
+/// The `backup_kind` backend descriptors this plugin advertises, one per
 /// KIND with its own invoke-prefix. `backup_kind_backend_def` enforces
 /// `name == kind`, so the host records and (on unload) deregisters each by the
 /// KIND name that the provider registry keys on.
@@ -58,11 +61,12 @@ pub fn backend_defs() -> Vec<BackendDef> {
         backup_kind_backend_def("vm", VM_PREFIX),
         backup_kind_backend_def("lxc", LXC_PREFIX),
         backup_kind_backend_def("lxc-bind", LXC_BIND_PREFIX),
+        backup_kind_backend_def("pve-node-state", NODE_STATE_PREFIX),
     ]
 }
 
 /// Handle a `proxmox.__backup_*` bridge call. Returns `None` for anything that
-/// isn't one of the three backup prefixes so the composed `Plugin` dispatch
+/// isn't one of the backup prefixes so the composed `Plugin` dispatch
 /// falls through to the next handler (and ultimately the `#[orca_tool]` surface).
 pub fn dispatch(
     name: &str,
@@ -90,6 +94,7 @@ enum Kind {
     Vm,
     Lxc,
     LxcBind,
+    NodeState,
 }
 
 /// Split a bridge tool name into `(kind, op)` if it targets one of our backup
@@ -100,6 +105,7 @@ fn match_prefix(name: &str) -> Option<(Kind, &str)> {
         (VM_PREFIX, Kind::Vm),
         (LXC_PREFIX, Kind::Lxc),
         (LXC_BIND_PREFIX, Kind::LxcBind),
+        (NODE_STATE_PREFIX, Kind::NodeState),
     ] {
         if let Some(op) = name.strip_prefix(prefix).and_then(|s| s.strip_prefix('.')) {
             return Some((kind, op));
@@ -172,6 +178,25 @@ async fn run(kind: Kind, op: &str, args_json: &str) -> Result<String> {
                 Path::new(&dir),
             )?;
             Ok(Value::Null.to_string())
+        }
+
+        // ── pve-node-state ──────────────────────────────────────────────────
+        (Kind::NodeState, "instances") => {
+            Ok(serde_json::to_string(&crate::node_state::instances())?)
+        }
+        (Kind::NodeState, "layout") => {
+            let instance = decode_instance(args_json)?;
+            Ok(json!(["hosts", "proxmox-node-state", instance]).to_string())
+        }
+        (Kind::NodeState, "backup") => {
+            let (dir, instance) = decode_backup(args_json)?;
+            Ok(crate::node_state::backup(&dir, &instance)
+                .await?
+                .to_string())
+        }
+        (Kind::NodeState, "restore") => {
+            let (dir, _instance) = decode_backup(args_json)?;
+            Ok(crate::node_state::restore(&dir)?.to_string())
         }
 
         (_, other) => Err(anyhow!("proxmox backup: unknown op '{other}'")),
@@ -469,7 +494,7 @@ fn parse_instance(instance: &str) -> Result<(String, u64)> {
 /// Resolve the enabled endpoint whose cluster hosts `node`, returning its ready
 /// [`Config`] and name. Probes each endpoint's `/nodes` listing and matches by
 /// node name (unique within a cluster/fleet).
-async fn resolve_endpoint_for_node(node: &str) -> Result<(Config, String)> {
+pub(crate) async fn resolve_endpoint_for_node(node: &str) -> Result<(Config, String)> {
     for name in crate::tools::enabled_endpoint_names() {
         let cfg = match crate::tools::resolve_config(&name).await {
             Ok(c) => c,
