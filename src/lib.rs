@@ -34,6 +34,7 @@ pub mod mount_scan;
 pub mod overallocation;
 pub mod responses;
 pub mod shm_trap;
+pub mod stale_snapshots;
 pub mod thin_discard;
 pub mod thin_pool;
 pub mod tools;
