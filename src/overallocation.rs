@@ -1,51 +1,13 @@
-//! Node capacity commitment — a `diagnostics` provider surface.
+//! Node vCPU commitment — a `diagnostics` provider surface.
 //!
-//! A PVE node happily lets you allocate more memory to its guests than it
-//! physically has. Nothing warns you; it works right up until a spike, and then
-//! something gets OOM-killed with no explanation. That is how thor was found
-//! sitting at 34 GiB committed on a 31 GiB box — by a human running `pvesh`
-//! while chasing an unrelated slow CI job.
-//!
-//! **The two resources are not the same problem, and treating them alike is
-//! what makes a check like this useless:**
-//!
-//! * **vCPU over-subscription is normal.** Handing 36 vCPUs to guests on a
-//!   16-core node is the entire point of virtualization — cores time-slice.
-//!   Flagging that at >100% would fire on every healthy node forever, so it is
-//!   only an `Info` nudge, and only at a genuinely steep ratio.
-//! * **Memory over-commitment is real**, because memory does not time-slice.
-//!
-//! **And the two guest kinds do not commit memory the same way:**
-//!
-//! * A **QEMU VM** *reserves* its memory. It is gone from the node whether the
-//!   guest touches it or not.
-//! * An **LXC** memory value is a cgroup *cap*, not a reservation. Ten
-//!   containers capped at 8 GiB each on a 32 GiB node is fine if they idle at
-//!   500 MiB.
-//!
-//! So this reports two separate numbers. *Reserved* (VMs alone) crossing the
-//! node's physical memory is the dangerous one — it cannot be reclaimed by
-//! anything. *Total commitment* (VMs + LXC caps) crossing it means the node
-//! works only as long as the containers stay under their caps: real, worth
-//! knowing, not an emergency.
-//!
-//! No repair. Resizing a guest is a capacity decision with a blast radius —
-//! orca reports the number and lets a human choose. See [`finding_*`].
+//! vCPU over-subscription is normal: cores time-slice, so only a steep ratio
+//! earns an `Info` nudge. Memory commitment is judged in [`crate::memory`].
 
 use crate::GuestKind;
 use crate::generated::{self, types as gtypes};
 use crate::tools::for_each_enabled_endpoint;
 use plugin_toolkit::contract::diagnostics::{Finding, Severity};
 use std::collections::HashMap;
-
-/// Reserved (VM) memory at or above this share of physical is `Crit`: VM memory
-/// cannot be reclaimed, so there is no headroom left for anything.
-pub const RESERVED_CRIT_PCT: f64 = 90.0;
-
-/// Total commitment (VM reserved + LXC caps) above this share of physical is
-/// `Warn`. 100% is the honest line — past it the node only survives because
-/// containers are under their caps.
-pub const TOTAL_COMMIT_WARN_PCT: f64 = 100.0;
 
 /// vCPUs committed per physical core before an `Info` nudge. Deliberately
 /// steep: mild over-subscription is correct practice, not a defect.
@@ -117,10 +79,6 @@ fn pct(part: u64, whole: u64) -> f64 {
     (part as f64 / whole as f64) * 100.0
 }
 
-fn gib(bytes: u64) -> f64 {
-    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-}
-
 /// Pure: fold a node's running guests into its commitment totals.
 pub fn assess(node: &NodeCapacity, guests: &[GuestAlloc]) -> Commitment {
     let mut c = Commitment {
@@ -150,76 +108,10 @@ pub fn findings_for(c: &Commitment) -> Vec<Finding> {
     if c.phys_mem_bytes == 0 {
         return out; // node capacity unknown — say nothing rather than guess.
     }
-    if c.reserved_pct() >= RESERVED_CRIT_PCT {
-        out.push(finding_reserved(c));
-    }
-    if c.total_pct() > TOTAL_COMMIT_WARN_PCT {
-        out.push(finding_total(c));
-    }
     if c.vcpu_ratio() > VCPU_RATIO_INFO {
         out.push(finding_vcpu(c));
     }
     out
-}
-
-fn finding_reserved(c: &Commitment) -> Finding {
-    Finding {
-        id: format!("capacity-reserved::{}", c.node),
-        provider: PROVIDER.to_string(),
-        severity: Severity::Crit,
-        title: format!(
-            "PVE node '{}' has {:.0}% of its memory reserved by VMs",
-            c.node,
-            c.reserved_pct()
-        ),
-        detail: format!(
-            "Running QEMU VMs on node '{}' reserve {:.1} GiB of its {:.1} GiB physical memory \
-             ({:.0}%). VM memory is a hard reservation — unlike an LXC cap it is consumed whether \
-             the guest touches it or not, and the node cannot reclaim it under pressure. At this \
-             level there is effectively no headroom left for the host itself, for LXC guests, or \
-             for a migration onto this node. If the node has no swap, the next spike is an \
-             OOM kill with no warning. Reduce a VM's memory, move one to another node, or convert \
-             it to an LXC so its memory becomes a cap instead of a reservation.",
-            c.node,
-            gib(c.reserved_mem_bytes),
-            gib(c.phys_mem_bytes),
-            c.reserved_pct()
-        ),
-        // Resizing or relocating a guest is a capacity decision with real blast
-        // radius. Report the number; let a human choose.
-        repair: None,
-    }
-}
-
-fn finding_total(c: &Commitment) -> Finding {
-    Finding {
-        id: format!("capacity-commit::{}", c.node),
-        provider: PROVIDER.to_string(),
-        severity: Severity::Warn,
-        title: format!(
-            "PVE node '{}' is over-allocated: {:.0}% of memory committed",
-            c.node,
-            c.total_pct()
-        ),
-        detail: format!(
-            "Node '{}' has {:.1} GiB committed across {} running guests but only {:.1} GiB \
-             physically ({:.0}%). That splits into {:.1} GiB reserved by QEMU VMs and {:.1} GiB \
-             of LXC memory caps. This is not necessarily broken: LXC memory is a cgroup cap, not \
-             a reservation, so the node stays healthy as long as the containers sit under their \
-             caps. It does mean there is no headroom — if the containers ever claim what they are \
-             allowed, the node is short, and with no swap that surfaces as an OOM kill rather \
-             than as slowness. Either right-size the caps to what the guests actually use, or \
-             move a guest to a node with room.",
-            c.node,
-            gib(c.total_mem_bytes()),
-            c.guest_count,
-            gib(c.phys_mem_bytes),
-            c.total_pct(),
-            gib(c.reserved_mem_bytes),
-            gib(c.capped_mem_bytes)
-        ),
-        repair: None,
-    }
 }
 
 fn finding_vcpu(c: &Commitment) -> Finding {
@@ -354,43 +246,6 @@ mod tests {
         }
     }
 
-    /// The real shape that motivated this check (measured 2026-09-22): thor,
-    /// 20 cores / 31.1 GiB, committing 34 GiB. Over-committed in total, but
-    /// only 21 GiB of that is VM-reserved — so it warns, it does not crit.
-    #[test]
-    fn thor_warns_on_total_commit_but_not_on_reserved() {
-        let n = node("thor", 31.1, 20.0);
-        let guests = vec![
-            vm("freyr", 12.0, 8.0),
-            vm("haos-17.1", 3.0, 2.0),
-            vm("proxmox-backup-server", 6.0, 2.0),
-            ct("mimir", 8.0, 6.0),
-            ct("unifi", 3.0, 2.0),
-            ct("zwave-js-ui", 1.0, 2.0),
-            ct("mqtt", 0.5, 1.0),
-            ct("alpine-zigbee2mqtt", 0.5, 1.0),
-        ];
-        let c = assess(&n, &guests);
-
-        assert!(
-            c.total_pct() > 100.0,
-            "expected over-commit, got {:.1}%",
-            c.total_pct()
-        );
-        assert!(
-            c.reserved_pct() < RESERVED_CRIT_PCT,
-            "VM-reserved is only 21 GiB of 31 — must not crit, got {:.1}%",
-            c.reserved_pct()
-        );
-
-        let f = findings_for(&c);
-        assert_eq!(f.len(), 1, "exactly one finding expected: {f:#?}");
-        assert_eq!(f[0].severity, Severity::Warn);
-        assert_eq!(f[0].id, "capacity-commit::thor");
-        // The split is the point of the message — both halves must be stated.
-        assert!(f[0].detail.contains("reserved by QEMU VMs"));
-    }
-
     /// vCPU over-subscription alone must never fire: 24 vCPUs on 20 cores is
     /// ordinary and correct. A check that flags this is noise.
     #[test]
@@ -420,35 +275,6 @@ mod tests {
             "CPU time-slices — never Warn"
         );
         assert_eq!(f[0].id, "capacity-vcpu::small");
-    }
-
-    /// VMs alone eating the node is the dangerous case — unreclaimable.
-    #[test]
-    fn vm_reserved_at_or_above_threshold_is_crit() {
-        let n = node("tight", 32.0, 16.0);
-        let c = assess(&n, &[vm("hog", 30.0, 4.0)]);
-
-        assert!(c.reserved_pct() >= RESERVED_CRIT_PCT);
-        let f = findings_for(&c);
-        assert_eq!(f[0].severity, Severity::Crit);
-        assert_eq!(f[0].id, "capacity-reserved::tight");
-        assert!(f[0].detail.contains("hard reservation"));
-    }
-
-    /// The same memory total is a crit as VMs and silent as containers. This is
-    /// the distinction the whole module exists for.
-    #[test]
-    fn identical_memory_totals_differ_by_guest_kind() {
-        let n = node("n", 32.0, 16.0);
-        let as_vms = findings_for(&assess(&n, &[vm("a", 15.0, 2.0), vm("b", 15.0, 2.0)]));
-        let as_cts = findings_for(&assess(&n, &[ct("a", 15.0, 2.0), ct("b", 15.0, 2.0)]));
-
-        assert_eq!(as_vms.len(), 1);
-        assert_eq!(as_vms[0].severity, Severity::Crit);
-        assert!(
-            as_cts.is_empty(),
-            "30 GiB of LXC *caps* on 32 GiB is not over-committed: {as_cts:#?}"
-        );
     }
 
     #[test]
