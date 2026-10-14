@@ -168,6 +168,11 @@ fn thin_audit_reads_and_enable_discard_is_dry_run_by_default() {
     assert!(is_execute_gated("proxmox.thin.enable_discard"));
 }
 
+#[test]
+fn disk_grow_is_dry_run_by_default() {
+    assert!(is_execute_gated("proxmox.guest.disk.grow"));
+}
+
 /// Hand-written reads plan nothing, so they must run without `execute` and be
 /// callable below admin.
 #[test]
@@ -348,7 +353,7 @@ where
 
 #[test]
 fn every_admin_handler_refuses_a_non_admin_caller_itself() {
-    use proxmox::{access, backup_jobs, deploy, guest_standard, thin_discard, tools};
+    use proxmox::{access, backup_jobs, deploy, disk_grow, guest_standard, thin_discard, tools};
     let reader = plugin_toolkit::contract::CallerIdentity {
         user_id: "u".into(),
         username: "op".into(),
@@ -392,6 +397,10 @@ fn every_admin_handler_refuses_a_non_admin_caller_itself() {
         (
             run_handler::<thin_discard::ProxmoxThinEnableDiscard>,
             serde_json::json!({"endpoint": "pve", "node": "n", "ctid": 1}),
+        ),
+        (
+            run_handler::<disk_grow::ProxmoxGuestDiskGrow>,
+            serde_json::json!({"endpoint": "pve", "node": "n", "vmid": 1, "disk": "scsi0", "grow_gib": 1}),
         ),
         (
             run_handler::<tools::ProxmoxAction>,
