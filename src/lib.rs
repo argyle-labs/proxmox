@@ -23,6 +23,7 @@ pub mod cluster_roster_impl;
 pub mod containers_adapter;
 pub mod deploy;
 pub mod diagnostics;
+pub mod disk_grow;
 pub mod execute;
 pub mod guest_exec;
 pub mod guest_file;

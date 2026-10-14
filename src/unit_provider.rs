@@ -1091,15 +1091,17 @@ async fn lifecycle(
     res.map_err(|e| anyhow!("{action} {} {vmid}: {e}", kind_str(kind)))
 }
 
-/// Build the typed create body from the typed payload and POST it. The body is
-/// assembled as JSON (only set fields) then deserialized into the generated
-/// typed body, so required-field validation happens against the real PVE schema.
-async fn provision(
-    client: &generated::Client,
+/// Every created VM gets the guest agent channel: it cannot be hot-added to a
+/// running VM, and without it the guest can't be exec'd into or fstrim its disks.
+const QEMU_AGENT_DEFAULT: &str = "enabled=1";
+
+/// The create body as JSON (only set fields); [`provision`] deserializes it into
+/// the generated typed body so required-field validation runs against the PVE schema.
+fn create_body(
     p: &ProvisionPayload,
     kind: GuestKind,
     vmid: u64,
-) -> Result<Option<String>> {
+) -> Result<serde_json::Map<String, serde_json::Value>> {
     let mut body = serde_json::Map::new();
     body.insert("vmid".into(), json!(vmid));
     if let Some(cores) = p.cores {
@@ -1111,8 +1113,7 @@ async fn provision(
     if let Some(storage) = &p.storage {
         body.insert("storage".into(), json!(storage));
     }
-
-    let upid = match kind {
+    match kind {
         GuestKind::Lxc => {
             let ostemplate = p
                 .ostemplate
@@ -1125,14 +1126,6 @@ async fn provision(
             if let Some(password) = &p.password {
                 body.insert("password".into(), json!(password));
             }
-            let typed: gtypes::PostCreateVmNodesNodeLxcBody =
-                serde_json::from_value(serde_json::Value::Object(body))
-                    .map_err(|e| anyhow!("lxc create body: {e}"))?;
-            client
-                .post_create_vm_nodes_node_lxc(&p.node, &typed)
-                .await
-                .map_err(|e| anyhow!("lxc create: {e}"))?
-                .into_inner()
         }
         GuestKind::Qemu => {
             if let Some(name) = &p.name {
@@ -1141,9 +1134,33 @@ async fn provision(
             if let Some(iso) = &p.iso {
                 body.insert("cdrom".into(), json!(iso));
             }
+            body.insert("agent".into(), json!(QEMU_AGENT_DEFAULT));
+        }
+    }
+    Ok(body)
+}
+
+/// Build the typed create body from the typed payload and POST it.
+async fn provision(
+    client: &generated::Client,
+    p: &ProvisionPayload,
+    kind: GuestKind,
+    vmid: u64,
+) -> Result<Option<String>> {
+    let body = serde_json::Value::Object(create_body(p, kind, vmid)?);
+    let upid = match kind {
+        GuestKind::Lxc => {
+            let typed: gtypes::PostCreateVmNodesNodeLxcBody =
+                serde_json::from_value(body).map_err(|e| anyhow!("lxc create body: {e}"))?;
+            client
+                .post_create_vm_nodes_node_lxc(&p.node, &typed)
+                .await
+                .map_err(|e| anyhow!("lxc create: {e}"))?
+                .into_inner()
+        }
+        GuestKind::Qemu => {
             let typed: gtypes::PostCreateVmNodesNodeQemuBody =
-                serde_json::from_value(serde_json::Value::Object(body))
-                    .map_err(|e| anyhow!("qemu create body: {e}"))?;
+                serde_json::from_value(body).map_err(|e| anyhow!("qemu create body: {e}"))?;
             client
                 .post_create_vm_nodes_node_qemu(&p.node, &typed)
                 .await
@@ -1729,5 +1746,28 @@ mod tests {
         assert_eq!(p.endpoint, "lab");
         assert_eq!(p.cores, Some(2));
         assert_eq!(p.ostemplate.as_deref(), Some("local:vztmpl/debian.tar.zst"));
+    }
+
+    #[test]
+    fn qemu_create_body_enables_the_guest_agent() {
+        let p: ProvisionPayload = serde_json::from_str(
+            r#"{"endpoint":"lab","node":"pve1","kind":"vm","iso":"local:iso/debian.iso"}"#,
+        )
+        .unwrap();
+        let body = create_body(&p, GuestKind::Qemu, 120).unwrap();
+        assert_eq!(body["agent"], json!("enabled=1"));
+        let typed: gtypes::PostCreateVmNodesNodeQemuBody =
+            serde_json::from_value(serde_json::Value::Object(body)).unwrap();
+        assert_eq!(typed.agent.as_deref(), Some("enabled=1"));
+    }
+
+    #[test]
+    fn lxc_create_body_has_no_agent_field() {
+        let p: ProvisionPayload = serde_json::from_str(
+            r#"{"endpoint":"lab","node":"pve1","kind":"lxc","ostemplate":"local:vztmpl/debian.tar.zst"}"#,
+        )
+        .unwrap();
+        let body = create_body(&p, GuestKind::Lxc, 121).unwrap();
+        assert!(!body.contains_key("agent"));
     }
 }
