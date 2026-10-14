@@ -31,6 +31,7 @@ pub mod guest_mount;
 pub mod guest_standard;
 pub mod host_workloads;
 pub mod lxc_guest;
+pub mod memory;
 pub mod mount_scan;
 pub mod node_state;
 pub mod overallocation;

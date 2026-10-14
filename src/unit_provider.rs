@@ -143,6 +143,9 @@ pub struct ProvisionPayload {
     /// Install ISO volume id for a vm (mapped to `cdrom`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iso: Option<String>,
+    /// RAM held back for the host by the over-allocation guard; default 4096.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_reserve_mib: Option<u64>,
 }
 
 /// Typed response for a successful `provision` / `destroy`.
@@ -861,6 +864,17 @@ impl ProxmoxUnitProvider {
                 _ => {}
             }
         }
+
+        crate::memory::guard_create(
+            &p.endpoint,
+            &p.node,
+            p.memory
+                .map_or(crate::memory::PVE_DEFAULT_MEMORY_MIB, |m| m.max(0) as u64),
+            p.host_reserve_mib
+                .unwrap_or(crate::memory::MemoryThresholds::default().reserve_mib),
+        )
+        .await
+        .map_err(|e| anyhow!("provision refused: {e}"))?;
 
         let client = crate::tools::make_client(&p.endpoint).await?;
 
