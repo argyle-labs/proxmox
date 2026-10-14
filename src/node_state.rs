@@ -563,12 +563,20 @@ mod tests {
         root
     }
 
+    /// `check_dest` refuses a root-owned dest; CI runs tests as root.
+    fn unroot(dest: &Path) {
+        if std::fs::metadata(dest).unwrap().uid() == 0 {
+            std::os::unix::fs::chown(dest, Some(65534), Some(65534)).unwrap();
+        }
+    }
+
     #[test]
     fn capture_copies_db_and_host_paths_and_sums_verify() {
         let base = scratch("cap");
         let root = fake_root(&base);
         let dest = base.join("payload");
         std::fs::create_dir_all(&dest).unwrap();
+        unroot(&dest);
 
         let detail = capture_in(&root, &dest).unwrap();
         assert!(
@@ -662,6 +670,7 @@ mod tests {
         let root = fake_root(&base);
         let dest = base.join("payload");
         std::fs::create_dir_all(dest.join(HOST_DIR)).unwrap();
+        unroot(&dest);
         let err = capture_in(&root, &dest).unwrap_err().to_string();
         assert!(err.contains("already holds host"), "{err}");
         assert!(capture_in(&root, Path::new("relative")).is_err());
