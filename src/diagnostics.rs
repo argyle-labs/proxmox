@@ -163,6 +163,8 @@ pub async fn diagnose(args: DiagnoseArgs) -> Vec<Finding> {
     findings.extend(crate::bind_mounts::diagnose_bind_mounts());
     // Cluster-wide: thin pools whose volumes add up to more than the pool holds.
     findings.extend(crate::thin_pool::diagnose_thin_pools().await);
+    // Cluster-wide: old guest snapshots pinning thin-pool space.
+    findings.extend(crate::stale_snapshots::diagnose_stale_snapshots().await);
     findings
 }
 
