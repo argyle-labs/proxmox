@@ -387,6 +387,7 @@ impl ProxmoxDeployTarget {
             password: None,
             iso: None,
             host_reserve_mib: None,
+            ..Default::default()
         };
         match self.runtime {
             Runtime::Vm => payload.iso = Some(image.to_string()),

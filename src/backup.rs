@@ -410,7 +410,10 @@ pub(crate) fn enc(s: &str) -> String {
 /// Flatten a JSON object into `(key, value)` form pairs for a PVE config PUT,
 /// dropping `skip` keys and JSON nulls. Strings pass through verbatim; other
 /// scalars render via their JSON text.
-fn form_pairs(obj: &serde_json::Map<String, Value>, skip: &[&str]) -> Vec<(String, String)> {
+pub(crate) fn form_pairs(
+    obj: &serde_json::Map<String, Value>,
+    skip: &[&str],
+) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     for (k, v) in obj {
         if skip.contains(&k.as_str()) {
@@ -432,7 +435,9 @@ pub(crate) async fn put_form(
     url: &str,
     pairs: &[(String, String)],
 ) -> Result<()> {
-    send_form(http.put(url), "PUT", url, pairs).await
+    send_form(http.put(url), "PUT", url, pairs)
+        .await
+        .map(|_| ())
 }
 
 /// POST a form-urlencoded body of `pairs` and fail on a non-2xx status.
@@ -441,7 +446,24 @@ pub(crate) async fn post_form(
     url: &str,
     pairs: &[(String, String)],
 ) -> Result<()> {
-    send_form(http.post(url), "POST", url, pairs).await
+    send_form(http.post(url), "POST", url, pairs)
+        .await
+        .map(|_| ())
+}
+
+/// POST a form-urlencoded body of `pairs` and return the response's `data` payload.
+pub(crate) async fn post_form_data(
+    http: &reqwest::Client,
+    url: &str,
+    pairs: &[(String, String)],
+) -> Result<Value> {
+    let body = send_form(http.post(url), "POST", url, pairs).await?;
+    let mut v: Value =
+        serde_json::from_str(&body).map_err(|e| anyhow!("POST {url}: parse: {e}"))?;
+    match v.as_object_mut().and_then(|m| m.remove("data")) {
+        Some(data) => Ok(data),
+        None => Err(anyhow!("POST {url}: response missing 'data' envelope")),
+    }
 }
 
 /// Uses the delegated-http shim's `form_urlencoded` (over `QueryParam`), which
@@ -451,7 +473,7 @@ async fn send_form(
     method: &str,
     url: &str,
     pairs: &[(String, String)],
-) -> Result<()> {
+) -> Result<String> {
     use plugin_toolkit::delegated_http::header::HeaderValue;
     use plugin_toolkit::delegated_http::serialize::ToQuery;
     use plugin_toolkit::progenitor_client::QueryParam;
@@ -473,11 +495,11 @@ async fn send_form(
         .await
         .map_err(|e| anyhow!("{method} {url}: {e}"))?;
     let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
         return Err(anyhow!("{method} {url}: HTTP {}: {body}", status.as_u16()));
     }
-    Ok(())
+    Ok(body)
 }
 
 /// Parse a `"<node>/<vmid>"` instance id.

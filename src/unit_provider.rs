@@ -107,7 +107,7 @@ pub struct GuestSummary {
 
 /// Typed payload for `Create { action: "provision" }`. Shared by both kinds;
 /// `ostemplate` is required for `lxc`, `iso`/`disk_gb` shape a `vm`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(crate = "plugin_toolkit::serde")]
 #[schemars(crate = "plugin_toolkit::schemars")]
 pub struct ProvisionPayload {
@@ -139,6 +139,45 @@ pub struct ProvisionPayload {
     /// Root password / initial credential for the lxc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    /// Root volume size in GiB, allocated on `storage` (`rootfs = <storage>:<gb>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rootfs_gb: Option<u64>,
+    /// Swap in MiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap: Option<i64>,
+    /// Run the container unprivileged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unprivileged: Option<bool>,
+    /// Container features (`nesting`/`keyctl` are what Docker needs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<LxcFeatures>,
+    /// Network interfaces, rendered in order as `net0`, `net1`, ...
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub net: Vec<LxcNet>,
+    /// Space-separated DNS server IPs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nameserver: Option<String>,
+    /// DNS search domains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub searchdomain: Option<String>,
+    /// Start the container when the node boots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onboot: Option<bool>,
+    /// Boot ordering relative to other guests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<StartupOrder>,
+    /// Container timezone (e.g. `America/Denver`, or `host`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    /// Mount points, rendered in order as `mp0`, `mp1`, ...
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<LxcMount>,
+    /// Hookscript volume id (e.g. `local:snippets/hook.sh`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hookscript: Option<String>,
+    /// Authorized SSH public keys for root, newline-separated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_public_keys: Option<String>,
     // ── vm ──
     /// Install ISO volume id for a vm (mapped to `cdrom`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,6 +185,153 @@ pub struct ProvisionPayload {
     /// RAM held back for the host by the over-allocation guard; default 4096.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_reserve_mib: Option<u64>,
+}
+
+/// LXC `features` flags; unset flags are omitted.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct LxcFeatures {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nesting: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyctl: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuse: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mknod: Option<bool>,
+    /// Allowed mount fs types, `;`-separated (e.g. `nfs;cifs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount: Option<String>,
+}
+
+/// One LXC network interface (`netN`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct LxcNet {
+    /// Interface name inside the container; omitted → `eth<N>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub bridge: String,
+    /// IPv4 CIDR, `dhcp`, or `manual`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gw: Option<String>,
+    /// IPv6 CIDR, `auto`, `dhcp`, or `manual`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip6: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gw6: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hwaddr: Option<String>,
+    /// VLAN tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firewall: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u64>,
+}
+
+/// One LXC mount point (`mpN`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct LxcMount {
+    /// Host path (bind mount), existing volume id, or `<storage>:<gb>` to allocate.
+    pub volume: String,
+    /// Path inside the container.
+    pub mp: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ro: Option<bool>,
+    /// Include in vzdump backups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<bool>,
+}
+
+/// PVE `startup` order spec (`order=<n>,up=<s>,down=<s>`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct StartupOrder {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<u64>,
+    /// Seconds to wait after starting before the next guest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up: Option<u64>,
+    /// Seconds to wait for shutdown before the next guest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub down: Option<u64>,
+}
+
+fn flag(b: bool) -> u8 {
+    u8::from(b)
+}
+
+fn property_string(parts: Vec<(&str, Option<String>)>) -> String {
+    parts
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|v| format!("{k}={v}")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+impl LxcFeatures {
+    fn render(&self) -> String {
+        property_string(vec![
+            ("nesting", self.nesting.map(|b| flag(b).to_string())),
+            ("keyctl", self.keyctl.map(|b| flag(b).to_string())),
+            ("fuse", self.fuse.map(|b| flag(b).to_string())),
+            ("mknod", self.mknod.map(|b| flag(b).to_string())),
+            ("mount", self.mount.clone()),
+        ])
+    }
+}
+
+impl LxcNet {
+    fn render(&self, index: usize) -> String {
+        property_string(vec![
+            (
+                "name",
+                Some(self.name.clone().unwrap_or_else(|| format!("eth{index}"))),
+            ),
+            ("bridge", Some(self.bridge.clone())),
+            ("ip", self.ip.clone()),
+            ("gw", self.gw.clone()),
+            ("ip6", self.ip6.clone()),
+            ("gw6", self.gw6.clone()),
+            ("hwaddr", self.hwaddr.clone()),
+            ("tag", self.tag.map(|t| t.to_string())),
+            ("firewall", self.firewall.map(|b| flag(b).to_string())),
+            ("mtu", self.mtu.map(|m| m.to_string())),
+        ])
+    }
+}
+
+impl LxcMount {
+    fn render(&self) -> String {
+        let mut s = self.volume.clone();
+        let rest = property_string(vec![
+            ("mp", Some(self.mp.clone())),
+            ("ro", self.ro.map(|b| flag(b).to_string())),
+            ("backup", self.backup.map(|b| flag(b).to_string())),
+        ]);
+        s.push(',');
+        s.push_str(&rest);
+        s
+    }
+}
+
+impl StartupOrder {
+    fn render(&self) -> String {
+        property_string(vec![
+            ("order", self.order.map(|n| n.to_string())),
+            ("up", self.up.map(|n| n.to_string())),
+            ("down", self.down.map(|n| n.to_string())),
+        ])
+    }
 }
 
 /// Typed response for a successful `provision` / `destroy`.
@@ -876,7 +1062,8 @@ impl ProxmoxUnitProvider {
         .await
         .map_err(|e| anyhow!("provision refused: {e}"))?;
 
-        let client = crate::tools::make_client(&p.endpoint).await?;
+        let cfg = crate::tools::resolve_config(&p.endpoint).await?;
+        let client = cfg.build_generated_client()?;
 
         let vmid = match p.vmid {
             Some(v) => v,
@@ -887,7 +1074,7 @@ impl ProxmoxUnitProvider {
                 .into_inner() as u64,
         };
 
-        let upid = provision(&client, &p, kind, vmid).await?;
+        let upid = provision(&cfg, &p, kind, vmid).await?;
         Ok(ProvisionResponse {
             endpoint: p.endpoint.clone(),
             node: p.node.clone(),
@@ -1140,6 +1327,49 @@ fn create_body(
             if let Some(password) = &p.password {
                 body.insert("password".into(), json!(password));
             }
+            if let Some(gb) = p.rootfs_gb {
+                let storage = p
+                    .storage
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("lxc 'rootfs_gb' requires 'storage'"))?;
+                body.insert("rootfs".into(), json!(format!("{storage}:{gb}")));
+            }
+            if let Some(swap) = p.swap {
+                body.insert("swap".into(), json!(swap));
+            }
+            if let Some(unprivileged) = p.unprivileged {
+                body.insert("unprivileged".into(), json!(unprivileged));
+            }
+            if let Some(features) = &p.features {
+                body.insert("features".into(), json!(features.render()));
+            }
+            for (i, net) in p.net.iter().enumerate() {
+                body.insert(format!("net{i}"), json!(net.render(i)));
+            }
+            if let Some(nameserver) = &p.nameserver {
+                body.insert("nameserver".into(), json!(nameserver));
+            }
+            if let Some(searchdomain) = &p.searchdomain {
+                body.insert("searchdomain".into(), json!(searchdomain));
+            }
+            if let Some(onboot) = p.onboot {
+                body.insert("onboot".into(), json!(onboot));
+            }
+            if let Some(startup) = &p.startup {
+                body.insert("startup".into(), json!(startup.render()));
+            }
+            if let Some(timezone) = &p.timezone {
+                body.insert("timezone".into(), json!(timezone));
+            }
+            for (i, mount) in p.mounts.iter().enumerate() {
+                body.insert(format!("mp{i}"), json!(mount.render()));
+            }
+            if let Some(hookscript) = &p.hookscript {
+                body.insert("hookscript".into(), json!(hookscript));
+            }
+            if let Some(keys) = &p.ssh_public_keys {
+                body.insert("ssh-public-keys".into(), json!(keys));
+            }
         }
         GuestKind::Qemu => {
             if let Some(name) = &p.name {
@@ -1156,26 +1386,33 @@ fn create_body(
 
 /// Build the typed create body from the typed payload and POST it.
 async fn provision(
-    client: &generated::Client,
+    cfg: &crate::Config,
     p: &ProvisionPayload,
     kind: GuestKind,
     vmid: u64,
 ) -> Result<Option<String>> {
-    let body = serde_json::Value::Object(create_body(p, kind, vmid)?);
+    let map = create_body(p, kind, vmid)?;
+    let body = serde_json::Value::Object(map.clone());
     let upid = match kind {
         GuestKind::Lxc => {
-            let typed: gtypes::PostCreateVmNodesNodeLxcBody =
+            let _: gtypes::PostCreateVmNodesNodeLxcBody =
                 serde_json::from_value(body).map_err(|e| anyhow!("lxc create body: {e}"))?;
-            client
-                .post_create_vm_nodes_node_lxc(&p.node, &typed)
-                .await
-                .map_err(|e| anyhow!("lxc create: {e}"))?
-                .into_inner()
+            let http = cfg.build_reqwest_client()?;
+            let url = format!(
+                "{}/nodes/{}/lxc",
+                cfg.base_url.trim_end_matches('/'),
+                crate::backup::enc(&p.node)
+            );
+            let data =
+                crate::backup::post_form_data(&http, &url, &crate::backup::form_pairs(&map, &[]))
+                    .await
+                    .map_err(|e| anyhow!("lxc create: {e}"))?;
+            data.as_str().unwrap_or_default().to_string()
         }
         GuestKind::Qemu => {
             let typed: gtypes::PostCreateVmNodesNodeQemuBody =
                 serde_json::from_value(body).map_err(|e| anyhow!("qemu create body: {e}"))?;
-            client
+            cfg.build_generated_client()?
                 .post_create_vm_nodes_node_qemu(&p.node, &typed)
                 .await
                 .map_err(|e| anyhow!("qemu create: {e}"))?
@@ -1418,6 +1655,25 @@ mod tests {
         let schema = serde_json::to_string(provision.payload_schema.as_ref().unwrap()).unwrap();
         assert!(schema.contains("endpoint"));
         assert!(schema.contains("ostemplate"));
+        for field in [
+            "rootfs_gb",
+            "swap",
+            "unprivileged",
+            "features",
+            "net",
+            "nameserver",
+            "searchdomain",
+            "onboot",
+            "startup",
+            "timezone",
+            "mounts",
+            "hookscript",
+            "ssh_public_keys",
+            "bridge",
+            "keyctl",
+        ] {
+            assert!(schema.contains(field), "schema missing {field}");
+        }
     }
 
     #[test]
@@ -1672,6 +1928,95 @@ mod tests {
         };
         assert!(has(KIND_LXC));
         assert!(!has(KIND_VM));
+    }
+
+    const DOCKER_HOST_LXC: &str = r#"{
+        "endpoint":"e","node":"thor","kind":"lxc",
+        "ostemplate":"local:vztmpl/alpine-3.23-default_20250101_amd64.tar.xz",
+        "name":"vidar","cores":4,"memory":4096,"swap":1024,
+        "storage":"local-lvm","rootfs_gb":16,"unprivileged":true,
+        "features":{"nesting":true,"keyctl":true},
+        "net":[{"bridge":"vmbr0","ip":"10.0.0.50/24","gw":"10.0.0.1",
+                "hwaddr":"BC:24:11:00:00:01","ip6":"auto"}],
+        "nameserver":"10.0.0.201 10.0.0.1","searchdomain":"scottkey.me",
+        "onboot":true,"startup":{"order":4,"up":30},
+        "timezone":"America/Denver",
+        "mounts":[{"volume":"/mnt/data","mp":"/data","backup":false}],
+        "hookscript":"local:snippets/hook.sh",
+        "ssh_public_keys":"ssh-ed25519 AAAA test"
+    }"#;
+
+    #[test]
+    fn provision_payload_parses_docker_host_lxc_fields() {
+        let p: ProvisionPayload = serde_json::from_str(DOCKER_HOST_LXC).unwrap();
+        assert_eq!(p.rootfs_gb, Some(16));
+        assert_eq!(p.swap, Some(1024));
+        assert_eq!(p.unprivileged, Some(true));
+        let f = p.features.as_ref().unwrap();
+        assert_eq!(
+            (f.nesting, f.keyctl, f.fuse),
+            (Some(true), Some(true), None)
+        );
+        assert_eq!(p.net.len(), 1);
+        assert_eq!(p.net[0].bridge, "vmbr0");
+        assert_eq!(p.net[0].hwaddr.as_deref(), Some("BC:24:11:00:00:01"));
+        assert_eq!(p.nameserver.as_deref(), Some("10.0.0.201 10.0.0.1"));
+        assert_eq!(p.searchdomain.as_deref(), Some("scottkey.me"));
+        assert_eq!(p.onboot, Some(true));
+        let s = p.startup.as_ref().unwrap();
+        assert_eq!((s.order, s.up, s.down), (Some(4), Some(30), None));
+        assert_eq!(p.timezone.as_deref(), Some("America/Denver"));
+        assert_eq!(p.mounts[0].mp, "/data");
+        assert_eq!(p.hookscript.as_deref(), Some("local:snippets/hook.sh"));
+        assert_eq!(p.ssh_public_keys.as_deref(), Some("ssh-ed25519 AAAA test"));
+    }
+
+    #[test]
+    fn create_body_renders_docker_host_lxc_property_strings() {
+        let p: ProvisionPayload = serde_json::from_str(DOCKER_HOST_LXC).unwrap();
+        let body = create_body(&p, GuestKind::Lxc, 120).unwrap();
+        assert_eq!(body["hostname"], json!("vidar"));
+        assert_eq!(body["rootfs"], json!("local-lvm:16"));
+        assert_eq!(body["swap"], json!(1024));
+        assert_eq!(body["unprivileged"], json!(true));
+        assert_eq!(body["features"], json!("nesting=1,keyctl=1"));
+        assert_eq!(
+            body["net0"],
+            json!(
+                "name=eth0,bridge=vmbr0,ip=10.0.0.50/24,gw=10.0.0.1,ip6=auto,hwaddr=BC:24:11:00:00:01"
+            )
+        );
+        assert_eq!(body["nameserver"], json!("10.0.0.201 10.0.0.1"));
+        assert_eq!(body["searchdomain"], json!("scottkey.me"));
+        assert_eq!(body["onboot"], json!(true));
+        assert_eq!(body["startup"], json!("order=4,up=30"));
+        assert_eq!(body["timezone"], json!("America/Denver"));
+        assert_eq!(body["mp0"], json!("/mnt/data,mp=/data,backup=0"));
+        assert_eq!(body["hookscript"], json!("local:snippets/hook.sh"));
+        assert_eq!(body["ssh-public-keys"], json!("ssh-ed25519 AAAA test"));
+        let _: gtypes::PostCreateVmNodesNodeLxcBody =
+            serde_json::from_value(serde_json::Value::Object(body)).unwrap();
+    }
+
+    #[test]
+    fn create_body_omits_unset_lxc_fields() {
+        let p: ProvisionPayload = serde_json::from_str(
+            r#"{"endpoint":"e","node":"n","kind":"lxc","ostemplate":"local:vztmpl/x.tar.zst"}"#,
+        )
+        .unwrap();
+        let body = create_body(&p, GuestKind::Lxc, 120).unwrap();
+        let mut keys: Vec<&str> = body.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, ["ostemplate", "vmid"]);
+    }
+
+    #[test]
+    fn create_body_rootfs_gb_requires_storage() {
+        let p: ProvisionPayload = serde_json::from_str(
+            r#"{"endpoint":"e","node":"n","kind":"lxc","ostemplate":"t","rootfs_gb":8}"#,
+        )
+        .unwrap();
+        assert!(create_body(&p, GuestKind::Lxc, 120).is_err());
     }
 
     #[test]
