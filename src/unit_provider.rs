@@ -139,12 +139,12 @@ pub struct ProvisionPayload {
     /// Root password / initial credential for the lxc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
-    /// Root volume size in GiB, allocated on `storage` (`rootfs = <storage>:<gb>`).
+    /// Root volume size in GiB, allocated on `storage` (`rootfs = <storage>:<gb>`). Requires `storage`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rootfs_gb: Option<u64>,
     /// Swap in MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub swap: Option<i64>,
+    pub swap: Option<u64>,
     /// Run the container unprivileged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unprivileged: Option<bool>,
@@ -1338,7 +1338,7 @@ fn create_body(
                 body.insert("swap".into(), json!(swap));
             }
             if let Some(unprivileged) = p.unprivileged {
-                body.insert("unprivileged".into(), json!(unprivileged));
+                body.insert("unprivileged".into(), json!(flag(unprivileged)));
             }
             if let Some(features) = &p.features {
                 body.insert("features".into(), json!(features.render()));
@@ -1353,7 +1353,7 @@ fn create_body(
                 body.insert("searchdomain".into(), json!(searchdomain));
             }
             if let Some(onboot) = p.onboot {
-                body.insert("onboot".into(), json!(onboot));
+                body.insert("onboot".into(), json!(flag(onboot)));
             }
             if let Some(startup) = &p.startup {
                 body.insert("startup".into(), json!(startup.render()));
@@ -1384,6 +1384,22 @@ fn create_body(
     Ok(body)
 }
 
+fn needs_root_pam(p: &ProvisionPayload) -> bool {
+    let features = p.features.as_ref().is_some_and(|f| {
+        f.keyctl.is_some() || f.fuse.is_some() || f.mknod.is_some() || f.mount.is_some()
+    });
+    features || p.hookscript.is_some() || p.mounts.iter().any(|m| m.volume.starts_with('/'))
+}
+
+fn upid_of(data: serde_json::Value) -> Result<String> {
+    match data {
+        serde_json::Value::String(upid) => Ok(upid),
+        other => Err(anyhow!(
+            "lxc create: expected task UPID string, got {other}"
+        )),
+    }
+}
+
 /// Build the typed create body from the typed payload and POST it.
 async fn provision(
     cfg: &crate::Config,
@@ -1397,7 +1413,13 @@ async fn provision(
         GuestKind::Lxc => {
             let _: gtypes::PostCreateVmNodesNodeLxcBody =
                 serde_json::from_value(body).map_err(|e| anyhow!("lxc create body: {e}"))?;
-            let http = cfg.build_reqwest_client()?;
+            let http = if needs_root_pam(p) {
+                crate::guest_mount::root_client(&p.endpoint, cfg)
+                    .await
+                    .map_err(|e| anyhow!("lxc create: {e}"))?
+            } else {
+                cfg.build_reqwest_client()?
+            };
             let url = format!(
                 "{}/nodes/{}/lxc",
                 cfg.base_url.trim_end_matches('/'),
@@ -1407,7 +1429,7 @@ async fn provision(
                 crate::backup::post_form_data(&http, &url, &crate::backup::form_pairs(&map, &[]))
                     .await
                     .map_err(|e| anyhow!("lxc create: {e}"))?;
-            data.as_str().unwrap_or_default().to_string()
+            upid_of(data)?
         }
         GuestKind::Qemu => {
             let typed: gtypes::PostCreateVmNodesNodeQemuBody =
@@ -1975,27 +1997,72 @@ mod tests {
     fn create_body_renders_docker_host_lxc_property_strings() {
         let p: ProvisionPayload = serde_json::from_str(DOCKER_HOST_LXC).unwrap();
         let body = create_body(&p, GuestKind::Lxc, 120).unwrap();
-        assert_eq!(body["hostname"], json!("vidar"));
-        assert_eq!(body["rootfs"], json!("local-lvm:16"));
-        assert_eq!(body["swap"], json!(1024));
-        assert_eq!(body["unprivileged"], json!(true));
-        assert_eq!(body["features"], json!("nesting=1,keyctl=1"));
-        assert_eq!(
-            body["net0"],
-            json!(
-                "name=eth0,bridge=vmbr0,ip=10.0.0.50/24,gw=10.0.0.1,ip6=auto,hwaddr=BC:24:11:00:00:01"
-            )
-        );
-        assert_eq!(body["nameserver"], json!("10.0.0.201 10.0.0.1"));
-        assert_eq!(body["searchdomain"], json!("scottkey.me"));
-        assert_eq!(body["onboot"], json!(true));
-        assert_eq!(body["startup"], json!("order=4,up=30"));
-        assert_eq!(body["timezone"], json!("America/Denver"));
-        assert_eq!(body["mp0"], json!("/mnt/data,mp=/data,backup=0"));
-        assert_eq!(body["hookscript"], json!("local:snippets/hook.sh"));
-        assert_eq!(body["ssh-public-keys"], json!("ssh-ed25519 AAAA test"));
+        let pairs: std::collections::BTreeMap<String, String> =
+            crate::backup::form_pairs(&body, &[]).into_iter().collect();
+        let want = [
+            ("hostname", "vidar"),
+            ("rootfs", "local-lvm:16"),
+            ("swap", "1024"),
+            ("unprivileged", "1"),
+            ("features", "nesting=1,keyctl=1"),
+            (
+                "net0",
+                "name=eth0,bridge=vmbr0,ip=10.0.0.50/24,gw=10.0.0.1,ip6=auto,hwaddr=BC:24:11:00:00:01",
+            ),
+            ("nameserver", "10.0.0.201 10.0.0.1"),
+            ("searchdomain", "scottkey.me"),
+            ("onboot", "1"),
+            ("startup", "order=4,up=30"),
+            ("timezone", "America/Denver"),
+            ("mp0", "/mnt/data,mp=/data,backup=0"),
+            ("hookscript", "local:snippets/hook.sh"),
+            ("ssh-public-keys", "ssh-ed25519 AAAA test"),
+        ];
+        for (k, v) in want {
+            assert_eq!(pairs.get(k).map(String::as_str), Some(v), "{k}");
+        }
         let _: gtypes::PostCreateVmNodesNodeLxcBody =
             serde_json::from_value(serde_json::Value::Object(body)).unwrap();
+    }
+
+    #[test]
+    fn root_pam_only_for_privileged_lxc_fields() {
+        let base = || -> ProvisionPayload {
+            serde_json::from_str(r#"{"endpoint":"e","node":"n","kind":"lxc","ostemplate":"t"}"#)
+                .unwrap()
+        };
+        assert!(!needs_root_pam(&base()));
+        let mut p = base();
+        p.features = Some(LxcFeatures {
+            nesting: Some(true),
+            ..Default::default()
+        });
+        assert!(!needs_root_pam(&p));
+        p.features.as_mut().unwrap().keyctl = Some(true);
+        assert!(needs_root_pam(&p));
+        let mut p = base();
+        p.hookscript = Some("local:snippets/h.sh".into());
+        assert!(needs_root_pam(&p));
+        let mut p = base();
+        p.mounts = vec![LxcMount {
+            volume: "local-lvm:8".into(),
+            mp: "/data".into(),
+            ..Default::default()
+        }];
+        assert!(!needs_root_pam(&p));
+        p.mounts[0].volume = "/mnt/data".into();
+        assert!(needs_root_pam(&p));
+    }
+
+    #[test]
+    fn upid_of_rejects_non_string_data() {
+        assert_eq!(
+            upid_of(json!("UPID:thor:1:2:3:vzcreate:120:root@pam:")).unwrap(),
+            "UPID:thor:1:2:3:vzcreate:120:root@pam:"
+        );
+        assert!(upid_of(json!(null)).is_err());
+        assert!(upid_of(json!({})).is_err());
+        assert!(upid_of(json!(7)).is_err());
     }
 
     #[test]

@@ -451,7 +451,6 @@ pub(crate) async fn post_form(
         .map(|_| ())
 }
 
-/// POST a form-urlencoded body of `pairs` and return the response's `data` payload.
 pub(crate) async fn post_form_data(
     http: &reqwest::Client,
     url: &str,
