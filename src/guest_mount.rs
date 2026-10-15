@@ -1049,39 +1049,42 @@ impl PveIo {
         )
     }
 
-    /// A client carrying a fresh `root@pam` ticket and its CSRF token.
     async fn root_client(&self) -> Result<reqwest::Client, String> {
-        refuse_insecure_root(&self.endpoint, self.cfg.insecure)?;
-        let name = root_password_secret(&self.endpoint);
-        let stored = plugin_toolkit::secrets::get(&name)
-            .map_err(|e| format!("read secret '{name}': {e:#}"))?;
-        let password = require_root_password(&self.endpoint, stored)?;
-        let anon = plugin_toolkit::api_client::ApiClientBuilder::new()
-            .build()
-            .map_err(|e| format!("http client: {e:#}"))?;
-        let body = gtypes::PostCreateTicketAccessTicketBody {
-            new_format: None,
-            otp: None,
-            password,
-            path: None,
-            privs: None,
-            realm: None,
-            tfa_challenge: None,
-            username: ROOT_USER.parse().map_err(|e| format!("{ROOT_USER}: {e}"))?,
-        };
-        let ticket = generated::Client::new_with_client(&self.cfg.base_url, anon)
-            .post_create_ticket_access_ticket(&body)
-            .await
-            .map_err(|e| format!("{ROOT_USER} login on endpoint '{}': {e}", self.endpoint))?
-            .into_inner();
-        let (ticket, csrf) =
-            root_session(&self.endpoint, ticket.ticket, ticket.csrf_prevention_token)?;
-        plugin_toolkit::api_client::ApiClientBuilder::new()
-            .header("cookie", format!("PVEAuthCookie={ticket}"))
-            .and_then(|b| b.header("csrfpreventiontoken", csrf))
-            .and_then(|b| b.build())
-            .map_err(|e| format!("http client: {e:#}"))
+        root_client(&self.endpoint, &self.cfg).await
     }
+}
+
+/// A client carrying a fresh `root@pam` ticket and its CSRF token.
+pub(crate) async fn root_client(endpoint: &str, cfg: &Config) -> Result<reqwest::Client, String> {
+    refuse_insecure_root(endpoint, cfg.insecure)?;
+    let name = root_password_secret(endpoint);
+    let stored =
+        plugin_toolkit::secrets::get(&name).map_err(|e| format!("read secret '{name}': {e:#}"))?;
+    let password = require_root_password(endpoint, stored)?;
+    let anon = plugin_toolkit::api_client::ApiClientBuilder::new()
+        .build()
+        .map_err(|e| format!("http client: {e:#}"))?;
+    let body = gtypes::PostCreateTicketAccessTicketBody {
+        new_format: None,
+        otp: None,
+        password,
+        path: None,
+        privs: None,
+        realm: None,
+        tfa_challenge: None,
+        username: ROOT_USER.parse().map_err(|e| format!("{ROOT_USER}: {e}"))?,
+    };
+    let ticket = generated::Client::new_with_client(&cfg.base_url, anon)
+        .post_create_ticket_access_ticket(&body)
+        .await
+        .map_err(|e| format!("{ROOT_USER} login on endpoint '{}': {e}", endpoint))?
+        .into_inner();
+    let (ticket, csrf) = root_session(endpoint, ticket.ticket, ticket.csrf_prevention_token)?;
+    plugin_toolkit::api_client::ApiClientBuilder::new()
+        .header("cookie", format!("PVEAuthCookie={ticket}"))
+        .and_then(|b| b.header("csrfpreventiontoken", csrf))
+        .and_then(|b| b.build())
+        .map_err(|e| format!("http client: {e:#}"))
 }
 
 impl GuestMountIo for PveIo {
