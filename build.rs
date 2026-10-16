@@ -27,11 +27,8 @@ fn main() {
     )
     .expect("proxmox openapi codegen");
 
-    // Generate the orca tool surface from the just-emitted client via the
-    // shared toolkit pass (was the local `build/surface.rs` prototype). Write
-    // methods surface as `data_mutation = true` + `role = "admin"`; a specific
-    // operation can opt out to `role = "read"` via `x-orca-user-callable: true`
-    // in the spec.
+    // Writes surface as `role = "admin"`; `x-orca-*` spec markers adjust per
+    // operation (see `plugin_toolkit_build::surface`).
     plugin_toolkit_build::surface::openapi::generate(&specs_dir, &out_dir, "proxmox")
         .expect("proxmox surface codegen");
 }
