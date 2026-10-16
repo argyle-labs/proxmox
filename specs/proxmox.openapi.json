@@ -1698,7 +1698,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       }
     },
     "/access/tfa/{userid}": {
@@ -1772,7 +1773,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       },
       "post": {
         "summary": "Add a TFA entry for a user.",
@@ -1955,7 +1957,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       },
       "put": {
         "summary": "Add a TFA entry for a user.",
@@ -2663,7 +2666,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       }
     },
     "/access/users/{userid}/token": {
@@ -2722,7 +2726,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       }
     },
     "/access/users/{userid}/token/{tokenid}": {
@@ -2782,7 +2787,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       },
       "put": {
         "summary": "Update API token for a specific user.",
@@ -6492,7 +6498,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       }
     },
     "/cluster/firewall": {
@@ -11803,7 +11810,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       }
     },
     "/cluster/notifications/endpoints": {
@@ -11825,7 +11833,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       }
     },
     "/cluster/notifications/endpoints/gotify": {
@@ -11880,7 +11889,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       },
       "post": {
         "summary": "Create a new gotify endpoint",
@@ -11996,7 +12006,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       },
       "put": {
         "summary": "Update existing gotify endpoint",
@@ -12170,7 +12181,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       },
       "post": {
         "summary": "Create a new sendmail endpoint",
@@ -12317,7 +12329,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       },
       "put": {
         "summary": "Update existing sendmail endpoint",
@@ -12530,7 +12543,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       },
       "post": {
         "summary": "Create a new smtp endpoint",
@@ -12727,7 +12741,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       },
       "put": {
         "summary": "Update existing smtp endpoint",
@@ -12951,7 +12966,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       },
       "post": {
         "summary": "Create a new webhook endpoint",
@@ -13118,7 +13134,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       },
       "put": {
         "summary": "Update existing webhook endpoint",
@@ -13281,7 +13298,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       }
     },
     "/cluster/notifications/matcher-fields": {
@@ -13312,7 +13330,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       }
     },
     "/cluster/notifications/matchers": {
@@ -13403,7 +13422,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       },
       "post": {
         "summary": "Create a new matcher",
@@ -13584,7 +13604,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       },
       "put": {
         "summary": "Update existing matcher",
@@ -13778,7 +13799,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       }
     },
     "/cluster/notifications/targets/{name}/test": {
@@ -36743,7 +36765,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-no-tool": true
       }
     },
     "/nodes/{node}/qemu/{vmid}/agent/exec-status": {
@@ -36833,7 +36856,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-no-tool": true
       }
     },
     "/nodes/{node}/qemu/{vmid}/agent/file-read": {
@@ -36904,7 +36928,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       }
     },
     "/nodes/{node}/qemu/{vmid}/agent/file-write": {
@@ -49705,7 +49730,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-no-tool": true
       }
     },
     "/nodes/{node}/storage/{storage}/file-restore/list": {
@@ -52271,7 +52297,8 @@
               }
             }
           }
-        }
+        },
+        "x-orca-admin": true
       }
     },
     "/nodes/{node}/wakeonlan": {
