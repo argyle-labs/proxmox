@@ -414,3 +414,81 @@ fn every_admin_handler_refuses_a_non_admin_caller_itself() {
         assert!(err.contains("requires role 'admin'"), "{err}");
     }
 }
+
+fn dispatch_recording_caps(name: &str, args: Value) -> (anyhow::Result<Value>, Vec<String>) {
+    let caps = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = caps.clone();
+    let out = plugin_toolkit::capsink::with_cap_sink(
+        Box::new(move |cap: &str, _raw: &str| {
+            seen.borrow_mut().push(cap.to_string());
+            Err("offline".to_string())
+        }),
+        || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(plugin_toolkit::dispatch::dispatch(name, args, &test_ctx()))
+        },
+    );
+    let caps = caps.borrow().clone();
+    (out, caps)
+}
+
+#[test]
+fn generated_reads_are_no_mutation_and_writes_stay_admin_gated() {
+    let mut reads = 0;
+    let mut writes = 0;
+    for t in proxmox_tools() {
+        let name = t["name"].as_str().unwrap();
+        if !is_generated_verb(name) {
+            continue;
+        }
+        if name.starts_with("proxmox.get_") {
+            reads += 1;
+            assert!(t["role"] == "read" || t["role"] == "admin", "{name}");
+            assert!(
+                t["execute_gated"] == false || t["role"] == "admin",
+                "{name}"
+            );
+            assert_eq!(t["data_mutation"], false, "{name}");
+        } else {
+            writes += 1;
+            assert_eq!(t["role"], "admin", "{name}");
+            assert_eq!(t["execute_gated"], true, "{name}");
+            assert_eq!(t["data_mutation"], true, "{name}");
+        }
+    }
+    assert!(reads > 0 && writes > 0, "reads={reads} writes={writes}");
+}
+
+#[test]
+fn generated_get_runs_without_execute() {
+    let (out, caps) = dispatch_recording_caps(
+        "proxmox.get_vm_config_nodes_node_lxc_vmid_config",
+        serde_json::json!({"endpoint": "pve", "node": "hyp1", "vmid": 101}),
+    );
+    assert_eq!(
+        plugin_toolkit::dispatch::required_role("proxmox.get_vm_config_nodes_node_lxc_vmid_config"),
+        Some("admin")
+    );
+    assert!(
+        out.is_err(),
+        "offline sink cannot satisfy the call: {out:?}"
+    );
+    assert!(
+        !caps.is_empty(),
+        "GET body never ran: no capability reached"
+    );
+}
+
+#[test]
+fn generated_put_without_execute_reaches_no_capability() {
+    let (out, caps) = dispatch_recording_caps(
+        "proxmox.put_update_vm_nodes_node_qemu_vmid_config",
+        serde_json::json!({"endpoint": "pve", "node": "hyp1", "vmid": 101, "body": {}}),
+    );
+    let out = out.expect("a dry run is not an error");
+    assert_eq!(out["dryRun"], serde_json::json!(true), "{out}");
+    assert!(caps.is_empty(), "dry run reached {caps:?}");
+}
