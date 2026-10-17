@@ -86,6 +86,10 @@ Under the hood the plugin also contributes three **domain backends** over the pl
 
 The plugin authenticates with a PVE API token. [docs/tokens.md](docs/tokens.md) covers both paths: generate one **by hand** (network-first / remote), or have the plugin **self-provision** a least-privilege token via `proxmox.access_bootstrap`. The secret is held in orca's secrets domain and never written in plaintext.
 
+## Backups
+
+The `pve-node-state` kind has one slot per node (node-scoped API reads, plus root-only host files when orca's privileged seam is granted and the node is this host) and one `cluster:<endpoint>` slot for cluster-scoped reads. The cluster slot captures `access/users` once, which includes user PII (emails, names, comments) but no secrets: tokens are not listed. ACLs are not capturable with the runtime token and are listed in `api/SKIPPED`. On a node that is not clustered, `GET /nodes` stands in for `/cluster/config/nodes`.
+
 ## Layout
 
 - `src/lib.rs` — config, error types, PVE fetch helpers.

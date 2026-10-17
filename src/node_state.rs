@@ -212,6 +212,8 @@ pub(crate) const CLUSTER_READS: &[Read] = &[
     read("access/domains", "domains.json", Rule::Plain, false),
 ];
 
+const CORE_FALLBACKS: &[(&str, &str, &str)] = &[("cluster/config/nodes", "nodes", "nodes.json")];
+
 pub(crate) const NOT_CAPTURABLE: &[(&str, &str)] = &[(
     "access/acl",
     "not capturable by token: PVE lists ACLs only with Permissions.Modify, which the runtime role does not hold",
@@ -339,8 +341,25 @@ pub(crate) async fn capture<A: ApiRead>(
             Scope::Node(n) => r.path.replace("{node}", &crate::backup::enc(n)),
             Scope::Cluster => r.path.to_string(),
         };
+        let mut file = r.file;
         let mut data = match api.get(&path).await {
             Ok(d) => d,
+            Err(e) if CORE_FALLBACKS.iter().any(|(p, _, _)| *p == path) => {
+                let (_, alt, alt_file) =
+                    CORE_FALLBACKS.iter().find(|(p, _, _)| *p == path).unwrap();
+                let first = scrub_text(&format!("{path}: {e:#}"));
+                let d = api.get(alt).await.map_err(|e2| {
+                    anyhow!(
+                        "pve-node-state: core read failed: {first}; fallback {}",
+                        scrub_text(&format!("{alt}: {e2:#}"))
+                    )
+                })?;
+                skipped.push_str(&format!(
+                    "{first}; not clustered, so {alt} stands in as membership\n"
+                ));
+                file = alt_file;
+                d
+            }
             Err(e) => {
                 let msg = scrub_text(&format!("{path}: {e:#}"));
                 ensure!(
@@ -362,10 +381,10 @@ pub(crate) async fn capture<A: ApiRead>(
             scrub_json(&mut data);
         }
         std::fs::write(
-            dir.join(r.file),
+            dir.join(file),
             plugin_toolkit::serde_json::to_vec_pretty(&data)?,
         )
-        .with_context(|| format!("write {}", r.file))?;
+        .with_context(|| format!("write {file}"))?;
         captured += 1;
     }
     if *scope == Scope::Cluster {
@@ -901,6 +920,35 @@ mod tests {
             assert!(!dest.join(SUMS).exists());
             std::fs::remove_dir_all(&dest).unwrap();
         }
+    }
+
+    #[test]
+    fn a_standalone_node_falls_back_to_the_nodes_list() {
+        let dest = scratch("standalone");
+        let api = fake(vec!["cluster/config/nodes"], vec![]);
+        let out = rt()
+            .block_on(capture(&api, &Scope::Cluster, &dest, None))
+            .unwrap();
+        assert!(dest.join("api/nodes.json").exists());
+        assert!(!dest.join("api/cluster-nodes.json").exists());
+        let skipped = std::fs::read_to_string(dest.join("api").join(SKIPPED)).unwrap();
+        assert!(
+            skipped.contains("nodes stands in as membership"),
+            "{skipped}"
+        );
+        assert_eq!(out["partial"], false);
+        std::fs::remove_dir_all(&dest).unwrap();
+
+        let dest = scratch("standalone-dead");
+        let api = fake(vec!["cluster/config/nodes", "nodes"], vec![]);
+        let err = rt()
+            .block_on(capture(&api, &Scope::Cluster, &dest, None))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("core read failed") && err.to_string().contains("fallback"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&dest).unwrap();
     }
 
     #[test]
