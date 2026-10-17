@@ -246,10 +246,14 @@ pub async fn instances() -> Vec<String> {
     let found =
         crate::tools::for_each_enabled_endpoint("node_state.instances", |cfg, ep| async move {
             let http = cfg.build_reqwest_client()?;
-            let status =
-                crate::backup::raw_get_data(&http, &cfg.base_url, "cluster/status").await?;
+            let status = crate::backup::raw_get_data(&http, &cfg.base_url, "cluster/status")
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!(endpoint = %ep.name, error = %e, "pve-node-state: cluster/status failed; skipping its cluster slot")
+                })
+                .ok();
             let nodes = crate::backup::raw_get_data(&http, &cfg.base_url, "nodes").await?;
-            Ok(slots(&ep.name, &status, &nodes))
+            Ok(slots(&ep.name, status.as_ref(), &nodes))
         })
         .await;
     found
@@ -259,8 +263,11 @@ pub async fn instances() -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn slots(endpoint: &str, status: &Value, nodes: &Value) -> Vec<String> {
-    let mut out = vec![format!("{CLUSTER_PREFIX}{}", cluster_key(endpoint, status))];
+pub(crate) fn slots(endpoint: &str, status: Option<&Value>, nodes: &Value) -> Vec<String> {
+    let mut out: Vec<String> = status
+        .map(|s| format!("{CLUSTER_PREFIX}{}", cluster_key(endpoint, s)))
+        .into_iter()
+        .collect();
     out.extend(node_names(nodes));
     out
 }
@@ -276,23 +283,71 @@ fn cluster_name(status: &Value) -> Option<String> {
 }
 
 fn cluster_key(endpoint: &str, status: &Value) -> String {
-    cluster_name(status).unwrap_or_else(|| endpoint.to_string())
+    cluster_name(status).unwrap_or_else(|| format!("endpoint/{endpoint}"))
+}
+
+fn standalone_proof(status: &Value, nodes: &Value) -> Result<(), String> {
+    let entries = status
+        .as_array()
+        .filter(|a| !a.is_empty())
+        .ok_or("cluster/status is empty")?;
+    if cluster_name(status).is_some() {
+        return Err("cluster/status reports a cluster".to_string());
+    }
+    let status_nodes: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.get("type").and_then(Value::as_str) == Some("node"))
+        .filter_map(|e| e.get("name")?.as_str())
+        .collect();
+    let listed = node_names(nodes);
+    match (status_nodes.as_slice(), listed.as_slice()) {
+        ([a], [b]) if a == b => Ok(()),
+        _ => Err(format!(
+            "not provably standalone: cluster/status nodes {status_nodes:?}, /nodes {listed:?}"
+        )),
+    }
+}
+
+pub(crate) fn pick_cluster_slot(
+    key: &str,
+    candidates: Vec<(String, Result<Value, String>)>,
+) -> Result<String> {
+    let mut rejected = Vec::new();
+    for (name, status) in candidates {
+        match status {
+            Ok(s) if cluster_key(&name, &s) == key => return Ok(name),
+            Ok(s) => rejected.push(format!("{name}: serves '{}'", cluster_key(&name, &s))),
+            Err(e) => rejected.push(format!("{name}: {e}")),
+        }
+    }
+    if rejected.is_empty() {
+        rejected.push("no enabled endpoints".to_string());
+    }
+    bail!(
+        "pve-node-state: no enabled endpoint serves cluster slot '{key}' ({})",
+        rejected.join("; ")
+    )
 }
 
 async fn resolve_cluster_slot(key: &str) -> Result<crate::Config> {
+    let mut candidates = Vec::new();
     for name in crate::tools::enabled_endpoint_names() {
-        let Ok(cfg) = crate::tools::resolve_config(&name).await else {
-            continue;
-        };
-        let http = cfg.build_reqwest_client()?;
-        if let Ok(status) =
-            crate::backup::raw_get_data(&http, &cfg.base_url, "cluster/status").await
-            && cluster_key(&name, &status) == key
-        {
-            return Ok(cfg);
+        let status = async {
+            let cfg = crate::tools::resolve_config(&name)
+                .await
+                .map_err(|e| format!("resolve: {e:#}"))?;
+            let http = cfg
+                .build_reqwest_client()
+                .map_err(|e| format!("client: {e:#}"))?;
+            crate::backup::raw_get_data(&http, &cfg.base_url, "cluster/status")
+                .await
+                .map_err(|e| scrub_text(&format!("cluster/status: {e:#}")))
         }
+        .await;
+        candidates.push((name, status));
     }
-    bail!("pve-node-state: no enabled endpoint serves cluster slot '{key}'")
+    let name = pick_cluster_slot(key, candidates)?;
+    crate::tools::resolve_config(&name).await
 }
 
 fn node_names(nodes: &Value) -> Vec<String> {
@@ -385,23 +440,27 @@ pub(crate) async fn capture<A: ApiRead>(
             Ok(d) => d,
             Err(e) if path == MEMBERSHIP => {
                 let first = scrub_text(&format!("{path}: {e:#}"));
-                let clustered = match api.get("cluster/status").await {
-                    Ok(status) => cluster_name(&status).is_some(),
-                    Err(e2) => bail!(
+                let status = api.get("cluster/status").await.map_err(|e2| {
+                    anyhow!(
                         "pve-node-state: core read failed: {first}; cluster/status: {}",
                         scrub_text(&format!("{e2:#}"))
-                    ),
-                };
-                ensure!(!clustered, "pve-node-state: core read failed: {first}");
-                standalone = true;
+                    )
+                })?;
+                ensure!(
+                    cluster_name(&status).is_none(),
+                    "pve-node-state: core read failed: {first}"
+                );
                 let d = api.get("nodes").await.map_err(|e2| {
                     anyhow!(
                         "pve-node-state: core read failed: {first}; standalone fallback {}",
                         scrub_text(&format!("nodes: {e2:#}"))
                     )
                 })?;
+                standalone_proof(&status, &d)
+                    .map_err(|why| anyhow!("pve-node-state: core read failed: {first}; {why}"))?;
+                standalone = true;
                 skipped.push_str(&format!(
-                    "{path}: standalone node (cluster/status has no cluster entry); nodes stands in as membership\n"
+                    "{path}: standalone node (cluster/status lists only this node); nodes stands in as membership\n"
                 ));
                 file = "nodes.json";
                 d
@@ -833,6 +892,7 @@ mod tests {
         refuse: Vec<&'static str>,
         empty: Vec<&'static str>,
         clustered: bool,
+        nodes: Vec<&'static str>,
         calls: std::sync::Mutex<Vec<String>>,
     }
 
@@ -841,6 +901,7 @@ mod tests {
             refuse,
             empty,
             clustered: true,
+            nodes: vec!["n1"],
             calls: Default::default(),
         }
     }
@@ -853,6 +914,14 @@ mod tests {
             }
             if self.empty.iter().any(|r| path.starts_with(r)) {
                 return Ok(json!([]));
+            }
+            if path == "nodes" {
+                return Ok(json!(
+                    self.nodes
+                        .iter()
+                        .map(|n| json!({ "node": n }))
+                        .collect::<Vec<_>>()
+                ));
             }
             if path == "cluster/status" {
                 return Ok(if self.clustered {
@@ -1052,14 +1121,72 @@ mod tests {
         let clustered =
             json!([{"type": "cluster", "name": "asgard"}, {"type": "node", "name": "thor"}]);
         assert_eq!(
-            slots("pve", &clustered, &nodes),
+            slots("pve", Some(&clustered), &nodes),
             ["cluster:asgard", "thor", "odin"]
         );
         let standalone = json!([{"type": "node", "name": "thor"}]);
         assert_eq!(
-            slots("pve", &standalone, &json!([{"node": "thor"}])),
-            ["cluster:pve", "thor"]
+            slots("pve", Some(&standalone), &json!([{"node": "thor"}])),
+            ["cluster:endpoint/pve", "thor"]
         );
+        assert_eq!(slots("pve", None, &nodes), ["thor", "odin"]);
+    }
+
+    #[test]
+    fn standalone_needs_one_matching_node_entry() {
+        let one = json!([{"type": "node", "name": "thor"}]);
+        assert!(standalone_proof(&one, &json!([{"node": "thor"}])).is_ok());
+        assert!(standalone_proof(&json!([]), &json!([{"node": "thor"}])).is_err());
+        assert!(standalone_proof(&one, &json!([{"node": "odin"}])).is_err());
+        assert!(standalone_proof(&one, &json!([{"node": "thor"}, {"node": "odin"}])).is_err());
+        let two = json!([{"type": "node", "name": "thor"}, {"type": "node", "name": "odin"}]);
+        assert!(standalone_proof(&two, &json!([{"node": "thor"}])).is_err());
+        let cluster = json!([{"type": "cluster", "name": "c"}, {"type": "node", "name": "thor"}]);
+        assert!(standalone_proof(&cluster, &json!([{"node": "thor"}])).is_err());
+    }
+
+    #[test]
+    fn an_unproven_standalone_fails_the_slot() {
+        let dest = scratch("unproven");
+        let mut api = fake(vec!["cluster/config/nodes"], vec![]);
+        api.clustered = false;
+        api.nodes = vec!["n1", "n2"];
+        let err = rt()
+            .block_on(capture(&api, &Scope::Cluster, &dest, None))
+            .unwrap_err();
+        assert!(err.to_string().contains("not provably standalone"), "{err}");
+        std::fs::remove_dir_all(&dest).unwrap();
+    }
+
+    #[test]
+    fn cluster_slot_resolution_lists_each_rejection() {
+        let cluster = json!([{"type": "cluster", "name": "asgard"}]);
+        let standalone = json!([{"type": "node", "name": "thor"}]);
+        let pick = pick_cluster_slot(
+            "endpoint/b",
+            vec![
+                ("a".into(), Ok(cluster.clone())),
+                ("b".into(), Ok(standalone)),
+            ],
+        );
+        assert_eq!(pick.unwrap(), "b");
+        let err = pick_cluster_slot(
+            "midgard",
+            vec![
+                ("a".into(), Ok(cluster)),
+                ("bad".into(), Err("resolve: no token".into())),
+                ("c".into(), Err("client: tls".into())),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        for want in [
+            "a: serves 'asgard'",
+            "bad: resolve: no token",
+            "c: client: tls",
+        ] {
+            assert!(err.contains(want), "{want} missing from {err}");
+        }
     }
 
     #[test]
