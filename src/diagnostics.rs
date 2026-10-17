@@ -390,26 +390,46 @@ fn ct_name(conf: &str) -> Option<String> {
 async fn diagnose_lxc_shm_traps() -> Vec<Finding> {
     for_each_enabled_endpoint("diagnostics.shm_trap", |cfg, ep| async move {
         let http = cfg.build_reqwest_client()?;
-        let resources =
-            crate::backup::raw_get_data(&http, &cfg.base_url, "cluster/resources?type=vm").await?;
-        let mut findings = Vec::new();
-        for (node, vmid, name) in lxc_guests(&resources) {
-            let path = format!("nodes/{}/lxc/{vmid}/config", crate::backup::enc(&node));
-            let config = match crate::backup::raw_get_data(&http, &cfg.base_url, &path).await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(vmid, error = %e, "shm-trap: CT config read failed");
-                    continue;
-                }
-            };
-            let profile = crate::shm_trap::parse_lxc_conf(&conf_lines(&config));
-            for trap in crate::shm_trap::classify_traps(&profile) {
-                findings.push(finding_shm_trap(&ep.name, &node, vmid, &name, &trap));
-            }
-        }
-        Ok(findings)
+        shm_findings(&http, &cfg.base_url, &ep.name).await
     })
     .await
+}
+
+async fn shm_findings(
+    http: &plugin_toolkit::reqwest::Client,
+    base_url: &str,
+    endpoint: &str,
+) -> anyhow::Result<Vec<Finding>> {
+    let resources =
+        crate::backup::raw_get_data(http, base_url, "cluster/resources?type=vm").await?;
+    let mut findings = Vec::new();
+    for (node, vmid, name) in lxc_guests(&resources) {
+        let config = match ct_config(http, base_url, &node, vmid).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(vmid, error = %e, "shm-trap: CT config read failed");
+                continue;
+            }
+        };
+        for trap in ct_traps(&config) {
+            findings.push(finding_shm_trap(endpoint, &node, vmid, &name, &trap));
+        }
+    }
+    Ok(findings)
+}
+
+async fn ct_config(
+    http: &plugin_toolkit::reqwest::Client,
+    base_url: &str,
+    node: &str,
+    vmid: u64,
+) -> anyhow::Result<serde_json::Value> {
+    let path = format!("nodes/{}/lxc/{vmid}/config", crate::backup::enc(node));
+    crate::backup::raw_get_data(http, base_url, &path).await
+}
+
+fn ct_traps(config: &serde_json::Value) -> Vec<crate::shm_trap::ShmTrap> {
+    crate::shm_trap::classify_traps(&crate::shm_trap::parse_lxc_conf(&conf_lines(config)))
 }
 
 fn lxc_guests(resources: &serde_json::Value) -> Vec<(String, u64, String)> {
@@ -503,17 +523,54 @@ async fn repair_shm_memory(
 ) -> Result<String, String> {
     let cfg = resolve_config(endpoint).await.map_err(|e| e.to_string())?;
     let http = cfg.build_reqwest_client().map_err(|e| e.to_string())?;
-    let path = format!("nodes/{}/lxc/{vmid}/config", crate::backup::enc(node));
-    let config = crate::backup::raw_get_data(&http, &cfg.base_url, &path)
+    raise_ct_memory(&http, &cfg.base_url, node, vmid, memory_mb).await
+}
+
+async fn raise_ct_memory(
+    http: &plugin_toolkit::reqwest::Client,
+    base_url: &str,
+    node: &str,
+    vmid: u64,
+    memory_mb: u64,
+) -> Result<String, String> {
+    let config = ct_config(http, base_url, node, vmid)
         .await
         .map_err(|e| format!("GET CT {vmid} config: {e:#}"))?;
+    let traps = ct_traps(&config);
+    if !traps
+        .iter()
+        .any(|t| crate::shm_trap::suggested_memory_mb(t.tmpfs_mb) == memory_mb)
+    {
+        return Err(format!(
+            "CT {vmid}: {memory_mb} MiB does not match a current shm trap ({} found); re-run diagnose",
+            traps.len()
+        ));
+    }
+    let status_path = format!("nodes/{}/status", crate::backup::enc(node));
+    let status = crate::backup::raw_get_data(http, base_url, &status_path)
+        .await
+        .map_err(|e| format!("GET node {node} status: {e:#}"))?;
+    let total_mb = status
+        .pointer("/memory/total")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("node {node} status has no memory.total"))?
+        / (1024 * 1024);
+    if memory_mb > total_mb {
+        return Err(format!(
+            "CT {vmid}: {memory_mb} MiB exceeds node {node} memory ({total_mb} MiB)"
+        ));
+    }
     let Some(pairs) = memory_raise_pairs(&config, memory_mb)? else {
         return Err(format!(
             "CT {vmid} memory is already at or above {memory_mb} MiB (already fixed?)"
         ));
     };
-    let url = format!("{}/{path}", cfg.base_url.trim_end_matches('/'));
-    crate::backup::put_form(&http, &url, &pairs)
+    let url = format!(
+        "{}/nodes/{}/lxc/{vmid}/config",
+        base_url.trim_end_matches('/'),
+        crate::backup::enc(node)
+    );
+    crate::backup::put_form(http, &url, &pairs)
         .await
         .map_err(|e| format!("PUT CT {vmid} memory: {e:#}"))?;
     Ok(format!(
@@ -835,6 +892,150 @@ mod tests {
         assert_eq!(traps.len(), 1);
         assert_eq!(traps[0].tmpfs_mb, 6144);
         assert_eq!(traps[0].memory_mb, 4096);
+    }
+
+    type Reply = (u16, String);
+
+    const BASE: &str = "https://10.0.0.5:8006/api2/json";
+
+    fn run_pve<F, T>(respond: F, f: impl AsyncFnOnce() -> T) -> (T, Vec<String>)
+    where
+        F: Fn(&str, &str, &str) -> Reply + 'static,
+    {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = log.clone();
+        let out = plugin_toolkit::capsink::with_cap_sink(
+            Box::new(move |cap: &str, raw: &str| {
+                assert_eq!(cap, "http.request");
+                let req: serde_json::Value = serde_json::from_str(raw).unwrap();
+                let method = req["method"].as_str().unwrap().to_string();
+                let path = req["url"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches(BASE)
+                    .trim_start_matches('/')
+                    .to_string();
+                let body: Vec<u8> = serde_json::from_value(req["body"].clone()).unwrap_or_default();
+                let body = String::from_utf8(body).unwrap();
+                seen.lock().unwrap().push(format!("{method} {path} {body}"));
+                let (status, out) = respond(&method, &path, &body);
+                Ok(serde_json::json!({
+                    "status": status,
+                    "headers": [["content-type", "application/json"]],
+                    "body": out.into_bytes(),
+                })
+                .to_string())
+            }),
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(f())
+            },
+        );
+        let log = log.lock().unwrap().clone();
+        (out, log)
+    }
+
+    const TRAP_CONFIG: &str = r#"{"data":{"digest":"d1","memory":4096,"lxc":[["lxc.mount.entry","tmpfs dev/shm tmpfs size=6g,mode=1777 0 0"]]}}"#;
+
+    fn pve_reply(put: Reply) -> impl Fn(&str, &str, &str) -> Reply + 'static {
+        move |method, path, _body| match (method, path) {
+            ("GET", "nodes/thor/lxc/110/config") => (200, TRAP_CONFIG.to_string()),
+            ("GET", "nodes/thor/status") => (
+                200,
+                r#"{"data":{"memory":{"total":68719476736}}}"#.to_string(),
+            ),
+            ("PUT", "nodes/thor/lxc/110/config") => put.clone(),
+            _ => (404, "{}".to_string()),
+        }
+    }
+
+    fn http() -> plugin_toolkit::reqwest::Client {
+        plugin_toolkit::reqwest::Client::new()
+    }
+
+    #[test]
+    fn repair_reads_then_puts_memory_with_the_digest() {
+        let (msg, log) = run_pve(
+            pve_reply((200, r#"{"data":null}"#.to_string())),
+            async || raise_ct_memory(&http(), BASE, "thor", 110, 12288).await,
+        );
+        assert!(msg.unwrap().contains("12288 MiB"));
+        assert_eq!(log.len(), 3, "{log:?}");
+        assert!(
+            log[2].starts_with("PUT nodes/thor/lxc/110/config "),
+            "{log:?}"
+        );
+        assert!(
+            log[2].contains("memory=12288") && log[2].contains("digest=d1"),
+            "{log:?}"
+        );
+    }
+
+    #[test]
+    fn repair_surfaces_a_digest_mismatch() {
+        let reply = (
+            400,
+            r#"{"errors":{"digest":"detected modified configuration"}}"#.to_string(),
+        );
+        let (out, _) = run_pve(pve_reply(reply), async || {
+            raise_ct_memory(&http(), BASE, "thor", 110, 12288).await
+        });
+        let err = out.unwrap_err();
+        assert!(
+            err.contains("PUT CT 110 memory") && err.contains("400"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn repair_rejects_a_mismatched_or_oversized_target() {
+        let (out, log) = run_pve(pve_reply((200, "{}".to_string())), async || {
+            raise_ct_memory(&http(), BASE, "thor", 110, 999_999).await
+        });
+        let err = out.unwrap_err();
+        assert!(err.contains("does not match a current shm trap"), "{err}");
+        assert!(!log.iter().any(|l| l.starts_with("PUT")));
+
+        let small_node = |method: &str, path: &str, _: &str| match (method, path) {
+            ("GET", "nodes/thor/lxc/110/config") => (200, TRAP_CONFIG.to_string()),
+            ("GET", "nodes/thor/status") => (
+                200,
+                r#"{"data":{"memory":{"total":8589934592}}}"#.to_string(),
+            ),
+            _ => (200, r#"{"data":null}"#.to_string()),
+        };
+        let (out, log) = run_pve(small_node, async || {
+            raise_ct_memory(&http(), BASE, "thor", 110, 12288).await
+        });
+        let err = out.unwrap_err();
+        assert!(err.contains("exceeds node thor memory (8192 MiB)"), "{err}");
+        assert!(!log.iter().any(|l| l.starts_with("PUT")));
+    }
+
+    #[test]
+    fn a_failed_ct_config_read_does_not_stop_the_sweep() {
+        let routes = |_: &str, path: &str, _: &str| {
+            match path {
+            "cluster/resources?type=vm" => (
+                200,
+                r#"{"data":[{"type":"lxc","node":"thor","vmid":109},{"type":"lxc","node":"thor","vmid":110,"name":"mimir"}]}"#
+                    .to_string(),
+            ),
+            "nodes/thor/lxc/110/config" => (200, TRAP_CONFIG.to_string()),
+            _ => (500, "{}".to_string()),
+        }
+        };
+        let (findings, log) = run_pve(routes, async || shm_findings(&http(), BASE, "pve").await);
+        let findings = findings.unwrap();
+        assert!(
+            log.iter()
+                .any(|l| l.starts_with("GET nodes/thor/lxc/109/config"))
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].id, "lxc-shm-trap::thor::110::dev/shm");
     }
 
     #[test]

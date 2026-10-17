@@ -1,11 +1,14 @@
 //! `pve-node-state` backup kind: one PVE node's own state, which neither
 //! vzdump nor the API-only `pve-config` kind covers.
 //!
-//! The payload is:
+//! Instances are each PVE node plus one `cluster:<endpoint>` slot, so
+//! cluster-scoped reads are captured once. The payload is:
 //!
-//! * `api/*.json` — every node- and cluster-scoped config read listed in
-//!   [`API_CAPTURES`], fetched with the endpoint's API token;
-//! * `api/SKIPPED` — each read PVE refused, with its error;
+//! * `api/*.json` — the [`NODE_READS`] or [`CLUSTER_READS`] for the slot,
+//!   fetched with the endpoint's API token; notification and metrics reads are
+//!   scrubbed of secrets, URL userinfo, query strings and header values;
+//! * `api/SKIPPED` — each read refused (scrubbed), each filtered list that came
+//!   back empty, and each read the token cannot make ([`NOT_CAPTURABLE`]);
 //! * `host/<abs path>` — the root-only host files in [`HOST_PATHS`], which no
 //!   PVE API exposes, captured as [`OP_CAPTURE`] through orca's privileged seam
 //!   when the admin has granted it and the node is this host;
@@ -13,6 +16,10 @@
 //! * `SECRETS_EXCLUDED` — `mode uid gid size sha256 path` of every secret left
 //!   out of the payload;
 //! * `SHA256SUMS` — `sha256sum -c` format over every other file.
+//!
+//! A failed core read fails the slot. A failed other read, a failed host
+//! capture, or a node that is not this host makes the result `partial` with a
+//! `warnings` entry.
 //!
 //! Restore is capture-only: it verifies `SHA256SUMS` and refuses.
 
@@ -44,54 +51,177 @@ pub const HOST_PATHS: &[&str] = &[
 const SUMS: &str = "SHA256SUMS";
 const API_DIR: &str = "api";
 const SKIPPED: &str = "SKIPPED";
+const CLUSTER_PREFIX: &str = "cluster:";
 
-const API_CAPTURES: &[(&str, &str)] = &[
-    ("nodes/{node}/config", "node-config.json"),
-    ("nodes/{node}/network", "network.json"),
-    ("nodes/{node}/dns", "dns.json"),
-    ("nodes/{node}/hosts", "hosts.json"),
-    ("nodes/{node}/time", "time.json"),
-    ("nodes/{node}/apt/repositories", "apt-repositories.json"),
-    (
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rule {
+    Core,
+    Filtered,
+    Plain,
+}
+
+pub(crate) struct Read {
+    pub(crate) path: &'static str,
+    pub(crate) file: &'static str,
+    pub(crate) rule: Rule,
+    pub(crate) scrub: bool,
+}
+
+const fn read(path: &'static str, file: &'static str, rule: Rule, scrub: bool) -> Read {
+    Read {
+        path,
+        file,
+        rule,
+        scrub,
+    }
+}
+
+pub(crate) const NODE_READS: &[Read] = &[
+    read("nodes/{node}/config", "node-config.json", Rule::Core, false),
+    read("nodes/{node}/network", "network.json", Rule::Core, false),
+    read("nodes/{node}/dns", "dns.json", Rule::Plain, false),
+    read("nodes/{node}/hosts", "hosts.json", Rule::Plain, false),
+    read("nodes/{node}/time", "time.json", Rule::Plain, false),
+    read(
+        "nodes/{node}/apt/repositories",
+        "apt-repositories.json",
+        Rule::Plain,
+        false,
+    ),
+    read(
         "nodes/{node}/firewall/options",
         "node-firewall-options.json",
+        Rule::Plain,
+        false,
     ),
-    ("nodes/{node}/firewall/rules", "node-firewall-rules.json"),
-    ("nodes/{node}/certificates/info", "certificates.json"),
-    ("nodes/{node}/disks/list", "disks.json"),
-    ("cluster/config/nodes", "cluster-nodes.json"),
-    ("cluster/config/totem", "cluster-totem.json"),
-    ("cluster/options", "cluster-options.json"),
-    ("storage", "storage.json"),
-    ("pools", "pools.json"),
-    ("cluster/backup", "backup-jobs.json"),
-    ("cluster/replication", "replication.json"),
-    ("cluster/ha/resources", "ha-resources.json"),
-    ("cluster/ha/groups", "ha-groups.json"),
-    ("cluster/firewall/options", "cluster-firewall-options.json"),
-    ("cluster/firewall/rules", "cluster-firewall-rules.json"),
-    ("cluster/firewall/groups", "cluster-firewall-groups.json"),
-    ("cluster/firewall/aliases", "cluster-firewall-aliases.json"),
-    ("cluster/firewall/ipset", "cluster-firewall-ipset.json"),
-    ("cluster/sdn/zones", "sdn-zones.json"),
-    ("cluster/sdn/vnets", "sdn-vnets.json"),
-    ("cluster/mapping/pci", "mapping-pci.json"),
-    ("cluster/mapping/usb", "mapping-usb.json"),
-    ("cluster/metrics/server", "metrics-servers.json"),
-    (
+    read(
+        "nodes/{node}/firewall/rules",
+        "node-firewall-rules.json",
+        Rule::Plain,
+        false,
+    ),
+    read(
+        "nodes/{node}/certificates/info",
+        "certificates.json",
+        Rule::Plain,
+        false,
+    ),
+    read("nodes/{node}/disks/list", "disks.json", Rule::Plain, false),
+];
+
+pub(crate) const CLUSTER_READS: &[Read] = &[
+    read(
+        "cluster/config/nodes",
+        "cluster-nodes.json",
+        Rule::Core,
+        false,
+    ),
+    read("storage", "storage.json", Rule::Core, false),
+    read(
+        "cluster/config/totem",
+        "cluster-totem.json",
+        Rule::Plain,
+        false,
+    ),
+    read(
+        "cluster/options",
+        "cluster-options.json",
+        Rule::Plain,
+        false,
+    ),
+    read("pools", "pools.json", Rule::Filtered, false),
+    read("cluster/backup", "backup-jobs.json", Rule::Plain, false),
+    read(
+        "cluster/replication",
+        "replication.json",
+        Rule::Filtered,
+        false,
+    ),
+    read(
+        "cluster/ha/resources",
+        "ha-resources.json",
+        Rule::Plain,
+        false,
+    ),
+    read("cluster/ha/groups", "ha-groups.json", Rule::Plain, false),
+    read(
+        "cluster/firewall/options",
+        "cluster-firewall-options.json",
+        Rule::Plain,
+        false,
+    ),
+    read(
+        "cluster/firewall/rules",
+        "cluster-firewall-rules.json",
+        Rule::Plain,
+        false,
+    ),
+    read(
+        "cluster/firewall/groups",
+        "cluster-firewall-groups.json",
+        Rule::Plain,
+        false,
+    ),
+    read(
+        "cluster/firewall/aliases",
+        "cluster-firewall-aliases.json",
+        Rule::Plain,
+        false,
+    ),
+    read(
+        "cluster/firewall/ipset",
+        "cluster-firewall-ipset.json",
+        Rule::Plain,
+        false,
+    ),
+    read("cluster/sdn/zones", "sdn-zones.json", Rule::Filtered, false),
+    read("cluster/sdn/vnets", "sdn-vnets.json", Rule::Filtered, false),
+    read(
+        "cluster/mapping/pci",
+        "mapping-pci.json",
+        Rule::Filtered,
+        false,
+    ),
+    read(
+        "cluster/mapping/usb",
+        "mapping-usb.json",
+        Rule::Filtered,
+        false,
+    ),
+    read(
+        "cluster/metrics/server",
+        "metrics-servers.json",
+        Rule::Plain,
+        true,
+    ),
+    read(
         "cluster/notifications/endpoints",
         "notification-endpoints.json",
+        Rule::Filtered,
+        true,
     ),
-    (
+    read(
         "cluster/notifications/matchers",
         "notification-matchers.json",
+        Rule::Filtered,
+        true,
     ),
-    ("access/users", "users.json"),
-    ("access/groups", "groups.json"),
-    ("access/roles", "roles.json"),
-    ("access/acl", "acl.json"),
-    ("access/domains", "domains.json"),
+    read("access/users", "users.json", Rule::Filtered, false),
+    read("access/groups", "groups.json", Rule::Filtered, false),
+    read("access/roles", "roles.json", Rule::Plain, false),
+    read("access/domains", "domains.json", Rule::Plain, false),
 ];
+
+pub(crate) const NOT_CAPTURABLE: &[(&str, &str)] = &[(
+    "access/acl",
+    "not capturable by token: PVE lists ACLs only with Permissions.Modify, which the runtime role does not hold",
+)];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Scope {
+    Node(String),
+    Cluster,
+}
 
 pub(crate) trait ApiRead {
     async fn get(&self, path: &str) -> Result<Value>;
@@ -109,14 +239,16 @@ impl ApiRead for Endpoint {
 }
 
 pub async fn instances() -> Vec<String> {
-    let nodes =
-        crate::tools::for_each_enabled_endpoint("node_state.instances", |cfg, _| async move {
+    let found =
+        crate::tools::for_each_enabled_endpoint("node_state.instances", |cfg, ep| async move {
             let http = cfg.build_reqwest_client()?;
             let nodes = crate::backup::raw_get_data(&http, &cfg.base_url, "nodes").await?;
-            Ok(node_names(&nodes))
+            let mut out = vec![format!("{CLUSTER_PREFIX}{}", ep.name)];
+            out.extend(node_names(&nodes));
+            Ok(out)
         })
         .await;
-    nodes
+    found
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
@@ -132,70 +264,136 @@ fn node_names(nodes: &Value) -> Vec<String> {
         .collect()
 }
 
-pub async fn backup(dir: &str, node: &str) -> Result<Value> {
-    let (cfg, _) = crate::backup::resolve_endpoint_for_node(node).await?;
+pub async fn backup(dir: &str, instance: &str) -> Result<Value> {
+    if let Some(endpoint) = instance.strip_prefix(CLUSTER_PREFIX) {
+        let cfg = crate::tools::resolve_config(endpoint).await?;
+        let api = Endpoint {
+            http: cfg.build_reqwest_client()?,
+            base_url: cfg.base_url.clone(),
+        };
+        return capture(&api, &Scope::Cluster, Path::new(dir), None).await;
+    }
+    let (cfg, _) = crate::backup::resolve_endpoint_for_node(instance).await?;
     let api = Endpoint {
         http: cfg.build_reqwest_client()?,
         base_url: cfg.base_url.clone(),
     };
-    let host = if node == crate::diagnostics::local_node() {
-        match plugin_toolkit::privileged::apply(
-            "proxmox",
-            OP_CAPTURE,
-            Some(&CaptureOp {
-                dest: dir.to_string(),
-            }),
+    let host =
+        host_capture(
+            dir,
+            instance,
+            &crate::diagnostics::local_node(),
+            |op| async move {
+                plugin_toolkit::privileged::apply("proxmox", OP_CAPTURE, Some(&op)).await
+            },
         )
-        .await
-        {
-            Ok(detail) => detail,
-            Err(e) => format!("host files not captured ({OP_CAPTURE}: {e:#})"),
-        }
-    } else {
-        format!("host files not captured ({node} is not this host)")
-    };
-    capture(&api, node, Path::new(dir), &host).await
+        .await;
+    capture(
+        &api,
+        &Scope::Node(instance.to_string()),
+        Path::new(dir),
+        Some(host),
+    )
+    .await
+}
+
+pub(crate) async fn host_capture<F, Fut>(
+    dir: &str,
+    node: &str,
+    local: &str,
+    apply: F,
+) -> Result<String, String>
+where
+    F: FnOnce(CaptureOp) -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    if node != local {
+        return Err(format!(
+            "host files not captured: {node} is not this host ({local})"
+        ));
+    }
+    apply(CaptureOp {
+        dest: dir.to_string(),
+    })
+    .await
+    .map_err(|e| scrub_text(&format!("host files not captured: {OP_CAPTURE}: {e:#}")))
 }
 
 pub(crate) async fn capture<A: ApiRead>(
     api: &A,
-    node: &str,
+    scope: &Scope,
     dest: &Path,
-    host: &str,
+    host: Option<Result<String, String>>,
 ) -> Result<Value> {
     let dir = dest.join(API_DIR);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let mut captured = 0;
+    let (label, reads) = match scope {
+        Scope::Node(n) => (n.clone(), NODE_READS),
+        Scope::Cluster => ("cluster".to_string(), CLUSTER_READS),
+    };
+    let mut warnings = Vec::new();
     let mut skipped = String::new();
-    for (path, file) in API_CAPTURES {
-        let path = path.replace("{node}", &crate::backup::enc(node));
-        match api.get(&path).await {
-            Ok(data) => {
-                std::fs::write(
-                    dir.join(file),
-                    plugin_toolkit::serde_json::to_vec_pretty(&data)?,
-                )
-                .with_context(|| format!("write {file}"))?;
-                captured += 1;
+    let mut captured = 0;
+    for r in reads {
+        let path = match scope {
+            Scope::Node(n) => r.path.replace("{node}", &crate::backup::enc(n)),
+            Scope::Cluster => r.path.to_string(),
+        };
+        let mut data = match api.get(&path).await {
+            Ok(d) => d,
+            Err(e) => {
+                let msg = scrub_text(&format!("{path}: {e:#}"));
+                ensure!(
+                    r.rule != Rule::Core,
+                    "pve-node-state: core read failed: {msg}"
+                );
+                skipped.push_str(&format!("{msg}\n"));
+                warnings.push(msg);
+                continue;
             }
-            Err(e) => skipped.push_str(&format!("{path}: {e:#}\n")),
+        };
+        if r.rule == Rule::Filtered && data.as_array().is_some_and(Vec::is_empty) {
+            skipped.push_str(&format!(
+                "{path}: empty list; PVE filters it by token privileges, so none configured and none visible look alike\n"
+            ));
+            continue;
+        }
+        if r.scrub {
+            scrub_json(&mut data);
+        }
+        std::fs::write(
+            dir.join(r.file),
+            plugin_toolkit::serde_json::to_vec_pretty(&data)?,
+        )
+        .with_context(|| format!("write {}", r.file))?;
+        captured += 1;
+    }
+    if *scope == Scope::Cluster {
+        for (path, why) in NOT_CAPTURABLE {
+            skipped.push_str(&format!("{path}: {why}\n"));
         }
     }
-    ensure!(
-        captured > 0,
-        "pve-node-state: every API read failed for {node}:\n{skipped}"
-    );
-    let skipped_count = skipped.lines().count();
-    if skipped_count > 0 {
+    if !skipped.is_empty() {
         std::fs::write(dir.join(SKIPPED), &skipped).context("write SKIPPED")?;
     }
+    let host_note = match host {
+        Some(Ok(detail)) => detail,
+        Some(Err(w)) => {
+            warnings.push(w.clone());
+            w
+        }
+        None => "no host files in the cluster slot".to_string(),
+    };
     write_sums(dest)?;
     let (files, digest) = verify_sums(dest)?;
     Ok(json!({
         "checksum": format!("sha256:{digest}"),
+        "partial": !warnings.is_empty(),
+        "warnings": warnings,
         "note": format!(
-            "{node}: {host}; {captured} API read(s), {skipped_count} skipped (listed in \
-             {API_DIR}/{SKIPPED}); {files} file(s) in SHA256SUMS"
+            "{label}: {host_note}; {captured} API read(s); {} SKIPPED line(s); \
+             {files} file(s) in SHA256SUMS",
+            skipped.lines().count()
         ),
     }))
 }
@@ -206,6 +404,75 @@ pub fn restore(dir: &str) -> Result<Value> {
         "pve-node-state is capture-only: {files} file(s) verified against SHA256SUMS in {dir}; \
          apply the captured config through the PVE API by hand"
     )
+}
+
+pub(crate) fn scrub_text(s: &str) -> String {
+    let scrubbed = plugin_toolkit::scrub::scrub_line(s);
+    scrubbed
+        .split(' ')
+        .map(|tok| {
+            let core = tok.trim_matches(|c: char| "\"'(),;:<>[]".contains(c));
+            match url::Url::parse(core) {
+                Ok(mut u) if u.has_host() => {
+                    if scrub_url(&mut u) {
+                        tok.replace(core, u.as_str())
+                    } else {
+                        tok.to_string()
+                    }
+                }
+                _ => tok.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn scrub_url(u: &mut url::Url) -> bool {
+    let dirty = !u.username().is_empty() || u.password().is_some() || u.query().is_some();
+    if dirty {
+        u.set_username("").ok();
+        u.set_password(None).ok();
+        if u.query().is_some() {
+            u.set_query(Some("***"));
+        }
+    }
+    dirty
+}
+
+pub(crate) fn scrub_json(v: &mut Value) {
+    plugin_toolkit::scrub::redact_json_in_place(v);
+    scrub_strings(v, false);
+}
+
+fn scrub_strings(v: &mut Value, in_header: bool) {
+    match v {
+        Value::String(s) => {
+            if in_header {
+                *s = s
+                    .split(',')
+                    .map(|part| {
+                        if part.trim_start().starts_with("value=") {
+                            "value=***"
+                        } else {
+                            part
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+            }
+            if let Ok(mut u) = url::Url::parse(s)
+                && u.has_host()
+                && scrub_url(&mut u)
+            {
+                *s = u.to_string();
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(|x| scrub_strings(x, in_header)),
+        Value::Object(o) => o.iter_mut().for_each(|(k, x)| {
+            scrub_strings(x, in_header || k.to_ascii_lowercase().contains("header"))
+        }),
+        _ => {}
+    }
 }
 
 // ── root side ───────────────────────────────────────────────────────────────
@@ -490,16 +757,28 @@ mod tests {
 
     struct FakeApi {
         refuse: Vec<&'static str>,
+        empty: Vec<&'static str>,
         calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    fn fake(refuse: Vec<&'static str>, empty: Vec<&'static str>) -> FakeApi {
+        FakeApi {
+            refuse,
+            empty,
+            calls: Default::default(),
+        }
     }
 
     impl ApiRead for FakeApi {
         async fn get(&self, path: &str) -> Result<Value> {
             self.calls.lock().unwrap().push(path.to_string());
             if self.refuse.iter().any(|r| path.starts_with(r)) {
-                bail!("HTTP 403: permission check failed");
+                bail!("HTTP 403 GET https://u:pw@pve:8006/x?token=abc: permission check failed");
             }
-            Ok(json!({ "path": path }))
+            if self.empty.iter().any(|r| path.starts_with(r)) {
+                return Ok(json!([]));
+            }
+            Ok(json!([{ "path": path }]))
         }
     }
 
@@ -510,49 +789,236 @@ mod tests {
             .unwrap()
     }
 
+    fn node() -> Scope {
+        Scope::Node("n1".to_string())
+    }
+
     #[test]
-    fn capture_writes_every_api_read_and_sums_verify() {
-        let dest = scratch("cap");
-        let api = FakeApi {
-            refuse: vec![],
-            calls: Default::default(),
-        };
+    fn node_slot_reads_only_node_scoped_paths() {
+        let dest = scratch("node");
+        let api = fake(vec![], vec![]);
         let out = rt()
-            .block_on(capture(&api, "n1", &dest, "host skipped"))
+            .block_on(capture(
+                &api,
+                &node(),
+                &dest,
+                Some(Ok("5 host file(s)".into())),
+            ))
             .unwrap();
         let calls = api.calls.lock().unwrap().clone();
-        assert_eq!(calls.len(), API_CAPTURES.len());
-        assert!(calls.contains(&"nodes/n1/network".to_string()));
-        assert!(calls.contains(&"cluster/config/totem".to_string()));
-        let net: Value = plugin_toolkit::serde_json::from_slice(
-            &std::fs::read(dest.join("api/network.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(net["path"], "nodes/n1/network");
+        assert_eq!(calls.len(), NODE_READS.len());
+        assert!(
+            calls.iter().all(|c| c.starts_with("nodes/n1/")),
+            "{calls:?}"
+        );
+        assert_eq!(out["partial"], false);
+        assert_eq!(out["warnings"], json!([]));
         assert!(!dest.join("api").join(SKIPPED).exists());
-        let (files, _) = verify_sums(&dest).unwrap();
-        assert_eq!(files, API_CAPTURES.len());
-        assert!(out["checksum"].as_str().unwrap().starts_with("sha256:"));
+        assert_eq!(verify_sums(&dest).unwrap().0, NODE_READS.len());
         std::fs::remove_dir_all(&dest).unwrap();
     }
 
     #[test]
-    fn capture_records_refused_reads() {
-        let dest = scratch("skip");
-        let api = FakeApi {
-            refuse: vec!["access/", "cluster/sdn/"],
-            calls: Default::default(),
-        };
+    fn cluster_slot_reads_cluster_paths_once_and_skips_acl() {
+        let dest = scratch("cluster");
+        let api = fake(vec![], vec![]);
+        rt().block_on(capture(&api, &Scope::Cluster, &dest, None))
+            .unwrap();
+        let calls = api.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), CLUSTER_READS.len());
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.starts_with("nodes/") || c == "access/acl")
+        );
+        assert!(!dest.join("api/acl.json").exists());
+        let skipped = std::fs::read_to_string(dest.join("api").join(SKIPPED)).unwrap();
+        assert!(
+            skipped.contains("access/acl: not capturable by token"),
+            "{skipped}"
+        );
+        std::fs::remove_dir_all(&dest).unwrap();
+    }
+
+    #[test]
+    fn empty_filtered_lists_land_in_skipped_without_a_file() {
+        let dest = scratch("empty");
+        let api = fake(
+            vec![],
+            vec![
+                "cluster/notifications/endpoints",
+                "cluster/replication",
+                "cluster/ha/groups",
+            ],
+        );
         let out = rt()
-            .block_on(capture(&api, "n1", &dest, "host skipped"))
+            .block_on(capture(&api, &Scope::Cluster, &dest, None))
             .unwrap();
         let skipped = std::fs::read_to_string(dest.join("api").join(SKIPPED)).unwrap();
-        assert_eq!(skipped.lines().count(), 7);
-        assert!(skipped.contains("access/acl: HTTP 403"), "{skipped}");
-        assert!(!dest.join("api/acl.json").exists());
-        assert!(out["note"].as_str().unwrap().contains("7 skipped"));
+        assert!(
+            skipped.contains("cluster/notifications/endpoints: empty list"),
+            "{skipped}"
+        );
+        assert!(
+            skipped.contains("cluster/replication: empty list"),
+            "{skipped}"
+        );
+        assert!(!skipped.contains("cluster/ha/groups"), "{skipped}");
+        assert!(!dest.join("api/notification-endpoints.json").exists());
+        assert!(dest.join("api/ha-groups.json").exists());
+        assert_eq!(out["partial"], false);
+        std::fs::remove_dir_all(&dest).unwrap();
+    }
+
+    #[test]
+    fn refused_reads_are_scrubbed_warnings_and_partial() {
+        let dest = scratch("skip");
+        let api = fake(vec!["nodes/n1/dns", "nodes/n1/time"], vec![]);
+        let out = rt()
+            .block_on(capture(&api, &node(), &dest, Some(Ok("ok".into()))))
+            .unwrap();
+        let skipped = std::fs::read_to_string(dest.join("api").join(SKIPPED)).unwrap();
+        assert_eq!(skipped.lines().count(), 2);
+        assert!(
+            !skipped.contains("pw@") && !skipped.contains("token=abc"),
+            "{skipped}"
+        );
+        assert_eq!(out["partial"], true);
+        assert_eq!(out["warnings"].as_array().unwrap().len(), 2);
         verify_sums(&dest).unwrap();
         std::fs::remove_dir_all(&dest).unwrap();
+    }
+
+    #[test]
+    fn a_failed_core_read_fails_the_slot() {
+        for (scope, core) in [(node(), "nodes/n1/network"), (Scope::Cluster, "storage")] {
+            let dest = scratch("core");
+            let api = fake(vec![core], vec![]);
+            let err = rt()
+                .block_on(capture(&api, &scope, &dest, None))
+                .unwrap_err();
+            assert!(err.to_string().contains("core read failed"), "{err}");
+            assert!(!dest.join(SUMS).exists());
+            std::fs::remove_dir_all(&dest).unwrap();
+        }
+    }
+
+    #[test]
+    fn host_capture_failure_and_remote_node_are_partial() {
+        let failed = rt().block_on(host_capture("/d", "n1", "n1", |_| async {
+            Err(anyhow!("sudo refused, Authorization: Bearer abc123"))
+        }));
+        let err = failed.clone().unwrap_err();
+        assert!(err.contains(OP_CAPTURE) && !err.contains("abc123"), "{err}");
+        let remote = rt().block_on(host_capture("/d", "n2", "n1", |_| async {
+            panic!("must not run for a remote node")
+        }));
+        assert!(remote.clone().unwrap_err().contains("n2 is not this host"));
+        let ok = rt().block_on(host_capture(
+            "/d",
+            "n1",
+            "n1",
+            |op| async move { Ok(op.dest) },
+        ));
+        assert_eq!(ok.unwrap(), "/d");
+        for host in [failed, remote] {
+            let dest = scratch("partial");
+            let out = rt()
+                .block_on(capture(&fake(vec![], vec![]), &node(), &dest, Some(host)))
+                .unwrap();
+            assert_eq!(out["partial"], true);
+            assert!(
+                out["warnings"][0]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("host files not captured")
+            );
+            std::fs::remove_dir_all(&dest).unwrap();
+        }
+    }
+
+    #[test]
+    fn scrub_json_strips_secrets_userinfo_queries_and_headers() {
+        let mut v = json!([{
+            "name": "hook",
+            "url": "https://user:pw@hooks.example/notify?token=abc&x=1",
+            "header": ["name=Authorization,value=QmVhcmVyIHNlY3JldA=="],
+            "token": "influx-secret",
+            "server": "10.0.0.5",
+        }]);
+        scrub_json(&mut v);
+        let text = v.to_string();
+        for leak in ["pw@", "user:", "token=abc", "QmVhcmVy", "influx-secret"] {
+            assert!(!text.contains(leak), "{leak} in {text}");
+        }
+        assert_eq!(v[0]["url"], "https://hooks.example/notify?***");
+        assert_eq!(v[0]["header"][0], "name=Authorization,value=***");
+        assert_eq!(v[0]["server"], "10.0.0.5");
+    }
+
+    #[test]
+    fn scrub_text_strips_urls_inside_messages() {
+        let s = scrub_text("GET \"https://a:b@pve:8006/api2/json/x?ticket=t\": HTTP 500");
+        assert_eq!(s, "GET \"https://pve:8006/api2/json/x?***\": HTTP 500");
+    }
+
+    #[test]
+    fn reads_are_permitted_to_the_runtime_role_per_apidoc() {
+        let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/specs/apidoc.js"))
+            .unwrap();
+        let start = raw.find('[').unwrap();
+        let end = raw.find("\n]").unwrap() + 2;
+        let schema: Vec<Value> = plugin_toolkit::serde_json::from_str(&raw[start..end]).unwrap();
+        fn find<'a>(nodes: &'a [Value], path: &str) -> Option<&'a Value> {
+            for n in nodes {
+                if n["path"] == path {
+                    return Some(n);
+                }
+                if let Some(hit) = n["children"].as_array().and_then(|c| find(c, path)) {
+                    return Some(hit);
+                }
+            }
+            None
+        }
+        fn privs(v: &Value, out: &mut Vec<String>) {
+            match v {
+                Value::String(s)
+                    if s.contains('.') && s.starts_with(|c: char| c.is_ascii_uppercase()) =>
+                {
+                    out.push(s.clone())
+                }
+                Value::Array(a) => a.iter().for_each(|x| privs(x, out)),
+                _ => {}
+            }
+        }
+        let granted: Vec<&str> = crate::access::ORCA_OPS_PRIVS.split_whitespace().collect();
+        for r in NODE_READS.iter().chain(CLUSTER_READS) {
+            let path = format!("/{}", r.path);
+            let node = find(&schema, &path).unwrap_or_else(|| panic!("{path} not in apidoc"));
+            let get = &node["info"]["GET"];
+            assert_eq!(get["allowtoken"], 1, "{path} refuses tokens");
+            let perms = &get["permissions"];
+            let mut needed = Vec::new();
+            privs(&perms["check"], &mut needed);
+            if needed.is_empty() {
+                assert!(
+                    r.rule == Rule::Filtered
+                        || perms["user"] == "all"
+                        || perms["user"] == "world"
+                        || perms.is_null(),
+                    "{path}: no privilege check, so it filters; mark it Filtered ({perms})"
+                );
+            } else {
+                assert!(
+                    needed.iter().any(|p| granted.contains(&p.as_str())),
+                    "{path} needs one of {needed:?}, ORCA_OPS_PRIVS grants none"
+                );
+            }
+        }
+        for (path, _) in NOT_CAPTURABLE {
+            assert!(find(&schema, &format!("/{path}")).is_some());
+        }
+        assert!(!granted.contains(&"Permissions.Modify"));
     }
 
     fn fake_root(base: &Path) -> PathBuf {
@@ -625,11 +1091,10 @@ mod tests {
         let own = std::fs::read_to_string(dest.join(OWNERSHIP)).unwrap();
         assert!(own.contains(" /etc/ssh/sshd_config\n"), "{own}");
 
-        let api = FakeApi {
-            refuse: vec![],
-            calls: Default::default(),
-        };
-        let out = rt().block_on(capture(&api, "n1", &dest, &detail)).unwrap();
+        let api = fake(vec![], vec![]);
+        let out = rt()
+            .block_on(capture(&api, &node(), &dest, Some(Ok(detail))))
+            .unwrap();
         assert!(out["note"].as_str().unwrap().contains("5 host file(s)"));
         verify_sums(&dest).unwrap();
         std::fs::remove_dir_all(&base).unwrap();
@@ -653,21 +1118,6 @@ mod tests {
         let nodes = json!([{"node": "thor"}, {"node": "odin"}, {"status": "x"}]);
         assert_eq!(node_names(&nodes), ["thor", "odin"]);
         assert!(node_names(&json!({})).is_empty());
-    }
-
-    #[test]
-    fn capture_fails_when_every_read_is_refused() {
-        let dest = scratch("none");
-        let api = FakeApi {
-            refuse: vec![""],
-            calls: Default::default(),
-        };
-        let err = rt()
-            .block_on(capture(&api, "n1", &dest, "host skipped"))
-            .unwrap_err();
-        assert!(err.to_string().contains("every API read failed"), "{err}");
-        assert!(!dest.join(SUMS).exists());
-        std::fs::remove_dir_all(&dest).unwrap();
     }
 
     #[test]
