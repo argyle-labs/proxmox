@@ -3,28 +3,22 @@
 //!
 //! The payload is:
 //!
-//! * `config.db` — the pmxcfs database, copied with SQLite's online backup API
-//!   (never a plain `cp` of the live file) and checked with `integrity_check`;
-//! * `host/<abs path>` — host config files listed in [`HOST_PATHS`];
-//! * `OWNERSHIP` — `mode uid gid path` of every captured entry, since the
-//!   payload copies are owned by the orca user so the engine can ship them;
+//! * `api/*.json` — every node- and cluster-scoped config read listed in
+//!   [`API_CAPTURES`], fetched with the endpoint's API token;
+//! * `api/SKIPPED` — each read PVE refused, with its error;
+//! * `host/<abs path>` — the root-only host files in [`HOST_PATHS`], which no
+//!   PVE API exposes, captured as [`OP_CAPTURE`] through orca's privileged seam
+//!   when the admin has granted it and the node is this host;
+//! * `OWNERSHIP` — `mode uid gid path` of every captured host entry;
 //! * `SECRETS_EXCLUDED` — `mode uid gid size sha256 path` of every secret left
-//!   out of the payload (see [`is_secret`] and [`scrub_db_secrets`]), so a
-//!   restore can detect drift without the orca user ever holding the material;
-//! * `api/*.json` — what the PVE API exposes for the node (network, dns, hosts,
-//!   apt repositories, cluster node list);
+//!   out of the payload;
 //! * `SHA256SUMS` — `sha256sum -c` format over every other file.
 //!
-//! `config.db` and most of [`HOST_PATHS`] need root, so the file capture runs
-//! as [`OP_CAPTURE`] through orca's `admin plugin-apply` seam.
-//!
-//! Restore is capture-only: it verifies `SHA256SUMS` and refuses, since
-//! writing `config.db` back means stopping pmxcfs on a live cluster member.
+//! Restore is capture-only: it verifies `SHA256SUMS` and refuses.
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use plugin_toolkit::serde_json::{Value, json};
@@ -32,75 +26,176 @@ use serde::{Deserialize, Serialize};
 
 pub const OP_CAPTURE: &str = "node_state.capture";
 
-pub const CONFIG_DB: &str = "/var/lib/pve-cluster/config.db";
-const SUMS: &str = "SHA256SUMS";
 const OWNERSHIP: &str = "OWNERSHIP";
-const DB_FILE: &str = "config.db";
 const HOST_DIR: &str = "host";
 const SECRETS_EXCLUDED: &str = "SECRETS_EXCLUDED";
 
 pub const HOST_PATHS: &[&str] = &[
-    "/etc/pve",
-    "/etc/network",
-    "/etc/corosync",
     "/etc/ssh",
     "/etc/sudoers.d",
     "/etc/cron.d",
     "/etc/fstab",
-    "/etc/hosts",
-    "/etc/hostname",
-    "/etc/apt/sources.list",
-    "/etc/apt/sources.list.d",
     "/usr/local/bin",
     "/usr/local/sbin",
     "/root/.ssh",
     "/var/spool/cron/crontabs",
 ];
 
-/// Node-scoped (`{node}` substituted) and cluster-scoped API reads.
+const SUMS: &str = "SHA256SUMS";
+const API_DIR: &str = "api";
+const SKIPPED: &str = "SKIPPED";
+
 const API_CAPTURES: &[(&str, &str)] = &[
+    ("nodes/{node}/config", "node-config.json"),
     ("nodes/{node}/network", "network.json"),
     ("nodes/{node}/dns", "dns.json"),
     ("nodes/{node}/hosts", "hosts.json"),
+    ("nodes/{node}/time", "time.json"),
     ("nodes/{node}/apt/repositories", "apt-repositories.json"),
+    (
+        "nodes/{node}/firewall/options",
+        "node-firewall-options.json",
+    ),
+    ("nodes/{node}/firewall/rules", "node-firewall-rules.json"),
+    ("nodes/{node}/certificates/info", "certificates.json"),
+    ("nodes/{node}/disks/list", "disks.json"),
     ("cluster/config/nodes", "cluster-nodes.json"),
+    ("cluster/config/totem", "cluster-totem.json"),
+    ("cluster/options", "cluster-options.json"),
+    ("storage", "storage.json"),
+    ("pools", "pools.json"),
+    ("cluster/backup", "backup-jobs.json"),
+    ("cluster/replication", "replication.json"),
+    ("cluster/ha/resources", "ha-resources.json"),
+    ("cluster/ha/groups", "ha-groups.json"),
+    ("cluster/firewall/options", "cluster-firewall-options.json"),
+    ("cluster/firewall/rules", "cluster-firewall-rules.json"),
+    ("cluster/firewall/groups", "cluster-firewall-groups.json"),
+    ("cluster/firewall/aliases", "cluster-firewall-aliases.json"),
+    ("cluster/firewall/ipset", "cluster-firewall-ipset.json"),
+    ("cluster/sdn/zones", "sdn-zones.json"),
+    ("cluster/sdn/vnets", "sdn-vnets.json"),
+    ("cluster/mapping/pci", "mapping-pci.json"),
+    ("cluster/mapping/usb", "mapping-usb.json"),
+    ("cluster/metrics/server", "metrics-servers.json"),
+    (
+        "cluster/notifications/endpoints",
+        "notification-endpoints.json",
+    ),
+    (
+        "cluster/notifications/matchers",
+        "notification-matchers.json",
+    ),
+    ("access/users", "users.json"),
+    ("access/groups", "groups.json"),
+    ("access/roles", "roles.json"),
+    ("access/acl", "acl.json"),
+    ("access/domains", "domains.json"),
 ];
 
-/// This host's node name, or nothing when it is not a PVE node.
-pub fn instances() -> Vec<String> {
-    if Path::new(CONFIG_DB).exists() {
-        vec![crate::diagnostics::local_node()]
-    } else {
-        Vec::new()
+pub(crate) trait ApiRead {
+    async fn get(&self, path: &str) -> Result<Value>;
+}
+
+struct Endpoint {
+    http: plugin_toolkit::reqwest::Client,
+    base_url: String,
+}
+
+impl ApiRead for Endpoint {
+    async fn get(&self, path: &str) -> Result<Value> {
+        crate::backup::raw_get_data(&self.http, &self.base_url, path).await
     }
 }
 
-pub async fn backup(dir: &str, instance: &str) -> Result<Value> {
-    let node = crate::diagnostics::local_node();
-    ensure!(
-        instance == node,
-        "pve-node-state: instance '{instance}' is not this node ('{node}')"
-    );
-    let dest = Path::new(dir);
-    let detail = plugin_toolkit::privileged::apply(
-        "proxmox",
-        OP_CAPTURE,
-        Some(&CaptureOp {
-            dest: dir.to_string(),
-        }),
-    )
-    .await
-    .with_context(|| format!("{OP_CAPTURE} via orca's privileged seam"))?;
+pub async fn instances() -> Vec<String> {
+    let nodes =
+        crate::tools::for_each_enabled_endpoint("node_state.instances", |cfg, _| async move {
+            let http = cfg.build_reqwest_client()?;
+            let nodes = crate::backup::raw_get_data(&http, &cfg.base_url, "nodes").await?;
+            Ok(node_names(&nodes))
+        })
+        .await;
+    nodes
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
 
-    let api = api_capture(&node, &dest.join("api")).await;
+fn node_names(nodes: &Value) -> Vec<String> {
+    nodes
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|n| n.get("node")?.as_str().map(str::to_string))
+        .collect()
+}
+
+pub async fn backup(dir: &str, node: &str) -> Result<Value> {
+    let (cfg, _) = crate::backup::resolve_endpoint_for_node(node).await?;
+    let api = Endpoint {
+        http: cfg.build_reqwest_client()?,
+        base_url: cfg.base_url.clone(),
+    };
+    let host = if node == crate::diagnostics::local_node() {
+        match plugin_toolkit::privileged::apply(
+            "proxmox",
+            OP_CAPTURE,
+            Some(&CaptureOp {
+                dest: dir.to_string(),
+            }),
+        )
+        .await
+        {
+            Ok(detail) => detail,
+            Err(e) => format!("host files not captured ({OP_CAPTURE}: {e:#})"),
+        }
+    } else {
+        format!("host files not captured ({node} is not this host)")
+    };
+    capture(&api, node, Path::new(dir), &host).await
+}
+
+pub(crate) async fn capture<A: ApiRead>(
+    api: &A,
+    node: &str,
+    dest: &Path,
+    host: &str,
+) -> Result<Value> {
+    let dir = dest.join(API_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let mut captured = 0;
+    let mut skipped = String::new();
+    for (path, file) in API_CAPTURES {
+        let path = path.replace("{node}", &crate::backup::enc(node));
+        match api.get(&path).await {
+            Ok(data) => {
+                std::fs::write(
+                    dir.join(file),
+                    plugin_toolkit::serde_json::to_vec_pretty(&data)?,
+                )
+                .with_context(|| format!("write {file}"))?;
+                captured += 1;
+            }
+            Err(e) => skipped.push_str(&format!("{path}: {e:#}\n")),
+        }
+    }
+    ensure!(
+        captured > 0,
+        "pve-node-state: every API read failed for {node}:\n{skipped}"
+    );
+    let skipped_count = skipped.lines().count();
+    if skipped_count > 0 {
+        std::fs::write(dir.join(SKIPPED), &skipped).context("write SKIPPED")?;
+    }
     write_sums(dest)?;
     let (files, digest) = verify_sums(dest)?;
     Ok(json!({
         "checksum": format!("sha256:{digest}"),
         "note": format!(
-            "{node}: {detail}; api: {}; {files} file(s) in SHA256SUMS; \
-             secrets excluded (listed in {SECRETS_EXCLUDED}), pending the encrypted-secrets follow-up",
-            if api.is_empty() { "none".to_string() } else { api.join(", ") }
+            "{node}: {host}; {captured} API read(s), {skipped_count} skipped (listed in \
+             {API_DIR}/{SKIPPED}); {files} file(s) in SHA256SUMS"
         ),
     }))
 }
@@ -109,47 +204,8 @@ pub fn restore(dir: &str) -> Result<Value> {
     let (files, _) = verify_sums(Path::new(dir))?;
     bail!(
         "pve-node-state is capture-only: {files} file(s) verified against SHA256SUMS in {dir}; \
-         restoring config.db needs pmxcfs stopped, so apply it by hand"
+         apply the captured config through the PVE API by hand"
     )
-}
-
-/// Each read the API refuses is skipped; the file capture is the primary copy.
-async fn api_capture(node: &str, dir: &Path) -> Vec<&'static str> {
-    let mut captured = Vec::new();
-    let (cfg, _) = match crate::backup::resolve_endpoint_for_node(node).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(node, error = %e, "pve-node-state: no endpoint; skipping api capture");
-            return captured;
-        }
-    };
-    let http = match cfg.build_reqwest_client() {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::warn!(node, error = %e, "pve-node-state: api client; skipping api capture");
-            return captured;
-        }
-    };
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        tracing::warn!(error = %e, "pve-node-state: create api dir; skipping api capture");
-        return captured;
-    }
-    for (path, file) in API_CAPTURES {
-        let path = path.replace("{node}", &crate::backup::enc(node));
-        match crate::backup::raw_get_data(&http, &cfg.base_url, &path).await {
-            Ok(data) => match plugin_toolkit::serde_json::to_vec_pretty(&data)
-                .map_err(anyhow::Error::from)
-                .and_then(|b| Ok(std::fs::write(dir.join(file), b)?))
-            {
-                Ok(()) => captured.push(*file),
-                Err(e) => tracing::warn!(file, error = %e, "pve-node-state: write api capture"),
-            },
-            Err(e) => {
-                tracing::warn!(path, error = %e, "pve-node-state: api capture failed; skipping")
-            }
-        }
-    }
-    captured
 }
 
 // ── root side ───────────────────────────────────────────────────────────────
@@ -165,13 +221,12 @@ pub async fn root_capture_op(op: CaptureOp) -> plugin_toolkit::anyhow::Result<St
     capture_in(Path::new("/"), Path::new(&op.dest))
 }
 
-/// Capture `config.db` and [`HOST_PATHS`] under `root` into `dest`, handing the
-/// copies to `dest`'s owner. `root` is `/` in production.
+/// Capture [`HOST_PATHS`] under `root` into `dest`, handing the copies to
+/// `dest`'s owner. `root` is `/` in production.
 pub fn capture_in(root: &Path, dest: &Path) -> Result<String> {
     let owner = check_dest(dest)?;
 
-    let db = dest.join(DB_FILE);
-    let mut excluded = sqlite_online_copy(&under(root, CONFIG_DB), &db)?;
+    let mut excluded = Vec::new();
 
     let host = dest.join(HOST_DIR);
     let mut files = 0;
@@ -190,12 +245,11 @@ pub fn capture_in(root: &Path, dest: &Path) -> Result<String> {
     std::fs::write(dest.join(OWNERSHIP), ownership).context("write OWNERSHIP")?;
     std::fs::write(dest.join(SECRETS_EXCLUDED), excluded.concat())
         .context("write SECRETS_EXCLUDED")?;
-    chown(&db, owner)?;
     chown(&dest.join(OWNERSHIP), owner)?;
     chown(&dest.join(SECRETS_EXCLUDED), owner)?;
 
     let mut detail = format!(
-        "config.db + {files} host file(s), {} secret(s) excluded",
+        "{files} host file(s), {} secret(s) excluded",
         excluded.len()
     );
     if !missing.is_empty() {
@@ -224,7 +278,7 @@ fn check_dest(dest: &Path) -> Result<(u32, u32)> {
         "payload dir {} is owned by root",
         dest.display()
     );
-    for name in [DB_FILE, HOST_DIR, OWNERSHIP, SECRETS_EXCLUDED] {
+    for name in [HOST_DIR, OWNERSHIP, SECRETS_EXCLUDED, API_DIR] {
         ensure!(
             std::fs::symlink_metadata(dest.join(name)).is_err(),
             "payload dir {} already holds {name}",
@@ -232,89 +286,6 @@ fn check_dest(dest: &Path) -> Result<(u32, u32)> {
         );
     }
     Ok((meta.uid(), meta.gid()))
-}
-
-/// Short steps with a pause keep each read lock brief so pmxcfs writes are
-/// never held up; a write mid-copy makes SQLite restart the copy. Returns the
-/// `SECRETS_EXCLUDED` lines for rows scrubbed from the copy.
-fn sqlite_online_copy(src: &Path, dst: &Path) -> Result<Vec<String>> {
-    use rusqlite::{Connection, OpenFlags, backup::Backup};
-    let src_conn = Connection::open_with_flags(
-        src,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("open {}", src.display()))?;
-    let mut dst_conn =
-        Connection::open(dst).with_context(|| format!("create {}", dst.display()))?;
-    Backup::new(&src_conn, &mut dst_conn)
-        .context("start sqlite online backup")?
-        .run_to_completion(64, Duration::from_millis(20), None)
-        .context("sqlite online backup")?;
-    let excluded = scrub_db_secrets(&dst_conn)?;
-    let check: String = dst_conn
-        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-        .context("integrity_check on the copy")?;
-    ensure!(
-        check == "ok",
-        "config.db copy failed integrity_check: {check}"
-    );
-    // The copy inherits pmxcfs's WAL header; rollback mode leaves no -wal/-shm
-    // side files in the payload. pmxcfs sets its own mode when it opens the db.
-    let mode: String = dst_conn
-        .query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))
-        .context("set journal_mode on the copy")?;
-    ensure!(mode == "delete", "config.db copy kept journal_mode {mode}");
-    Ok(excluded)
-}
-
-/// pmxcfs stores every `/etc/pve` file as a `tree` row (parent = 0 at the top,
-/// inode 0 is the version row), so `priv/` and node TLS keys live in config.db
-/// too. Delete them from the copy and VACUUM so the freed pages are gone.
-fn scrub_db_secrets(conn: &rusqlite::Connection) -> Result<Vec<String>> {
-    let mut stmt = conn
-        .prepare(
-            "WITH RECURSIVE p(inode, path) AS (
-                 SELECT inode, '/' || name FROM tree WHERE parent = 0 AND inode != 0
-                 UNION ALL
-                 SELECT t.inode, p.path || '/' || t.name FROM tree t JOIN p ON t.parent = p.inode
-             )
-             SELECT p.inode, p.path, CAST(t.data AS BLOB) FROM p JOIN tree t ON t.inode = p.inode
-             ORDER BY p.path",
-        )
-        .context("walk config.db tree")?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<Vec<u8>>>(2)?,
-            ))
-        })
-        .context("walk config.db tree")?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .context("walk config.db tree")?;
-    drop(stmt);
-    let mut excluded = Vec::new();
-    for (inode, path, data) in rows {
-        let name = path.rsplit('/').next().unwrap_or_default();
-        let secret = path.starts_with("/priv/")
-            || is_secret_name(name)
-            || data.as_deref().is_some_and(looks_like_private_key);
-        if !secret {
-            continue;
-        }
-        let data = data.unwrap_or_default();
-        excluded.push(format!(
-            "- - - {} {} {DB_FILE}:{path}\n",
-            data.len(),
-            plugin_toolkit::hash::sha256_hex(&data)
-        ));
-        conn.execute("DELETE FROM tree WHERE inode = ?1", [inode])
-            .with_context(|| format!("scrub {path} from config.db copy"))?;
-    }
-    conn.execute_batch("VACUUM")
-        .context("VACUUM config.db copy")?;
-    Ok(excluded)
 }
 
 /// Copy `abs` from under `root` into `host`, leaving out every secret file and
@@ -363,7 +334,7 @@ fn is_secret(abs: &Path, src: &Path) -> Result<bool> {
         .file_name()
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
-    if abs.starts_with("/etc/pve/priv") || is_secret_name(&name) {
+    if is_secret_name(&name) {
         return Ok(true);
     }
     if abs.starts_with("/root/.ssh")
@@ -385,8 +356,7 @@ fn is_secret(abs: &Path, src: &Path) -> Result<bool> {
     Ok(looks_like_private_key(&head))
 }
 
-/// SSH host keys, TLS keys (`pve-ssl.key`, `pveproxy-ssl.key`), corosync's
-/// `authkey`, ceph keyrings.
+/// SSH host keys, TLS keys, keyrings.
 fn is_secret_name(name: &str) -> bool {
     (name.starts_with("ssh_host_") && name.ends_with("_key"))
         || name.ends_with(".key")
@@ -518,30 +488,75 @@ mod tests {
         d
     }
 
-    fn fake_root(base: &Path) -> PathBuf {
-        let root = base.join("root");
-        let db = under(&root, CONFIG_DB);
-        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
-        let c = rusqlite::Connection::open(&db).unwrap();
-        c.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             CREATE TABLE tree (inode INTEGER PRIMARY KEY NOT NULL, parent INTEGER NOT NULL,
-                 version INTEGER NOT NULL, writer INTEGER NOT NULL, mtime INTEGER NOT NULL,
-                 type INTEGER NOT NULL, name TEXT NOT NULL, data BLOB);
-             INSERT INTO tree VALUES
-                 (0, 0, 9, 0, 0, 8, '__version__', NULL),
-                 (1, 0, 1, 0, 0, 8, 'corosync.conf', 'totem {}'),
-                 (2, 0, 1, 0, 0, 4, 'priv', NULL),
-                 (3, 2, 1, 0, 0, 8, 'authkey.key', 'cluster secret'),
-                 (4, 2, 1, 0, 0, 8, 'token.cfg', 'tok'),
-                 (5, 0, 1, 0, 0, 4, 'nodes', NULL),
-                 (6, 5, 1, 0, 0, 4, 'n1', NULL),
-                 (7, 6, 1, 0, 0, 8, 'pve-ssl.key', 'tls secret'),
-                 (8, 6, 1, 0, 0, 8, 'pve-ssl.pem', 'cert');",
+    struct FakeApi {
+        refuse: Vec<&'static str>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ApiRead for FakeApi {
+        async fn get(&self, path: &str) -> Result<Value> {
+            self.calls.lock().unwrap().push(path.to_string());
+            if self.refuse.iter().any(|r| path.starts_with(r)) {
+                bail!("HTTP 403: permission check failed");
+            }
+            Ok(json!({ "path": path }))
+        }
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn capture_writes_every_api_read_and_sums_verify() {
+        let dest = scratch("cap");
+        let api = FakeApi {
+            refuse: vec![],
+            calls: Default::default(),
+        };
+        let out = rt()
+            .block_on(capture(&api, "n1", &dest, "host skipped"))
+            .unwrap();
+        let calls = api.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), API_CAPTURES.len());
+        assert!(calls.contains(&"nodes/n1/network".to_string()));
+        assert!(calls.contains(&"cluster/config/totem".to_string()));
+        let net: Value = plugin_toolkit::serde_json::from_slice(
+            &std::fs::read(dest.join("api/network.json")).unwrap(),
         )
         .unwrap();
-        // Held open: the copy must read a database another connection owns.
-        std::mem::forget(c);
+        assert_eq!(net["path"], "nodes/n1/network");
+        assert!(!dest.join("api").join(SKIPPED).exists());
+        let (files, _) = verify_sums(&dest).unwrap();
+        assert_eq!(files, API_CAPTURES.len());
+        assert!(out["checksum"].as_str().unwrap().starts_with("sha256:"));
+        std::fs::remove_dir_all(&dest).unwrap();
+    }
+
+    #[test]
+    fn capture_records_refused_reads() {
+        let dest = scratch("skip");
+        let api = FakeApi {
+            refuse: vec!["access/", "cluster/sdn/"],
+            calls: Default::default(),
+        };
+        let out = rt()
+            .block_on(capture(&api, "n1", &dest, "host skipped"))
+            .unwrap();
+        let skipped = std::fs::read_to_string(dest.join("api").join(SKIPPED)).unwrap();
+        assert_eq!(skipped.lines().count(), 7);
+        assert!(skipped.contains("access/acl: HTTP 403"), "{skipped}");
+        assert!(!dest.join("api/acl.json").exists());
+        assert!(out["note"].as_str().unwrap().contains("7 skipped"));
+        verify_sums(&dest).unwrap();
+        std::fs::remove_dir_all(&dest).unwrap();
+    }
+
+    fn fake_root(base: &Path) -> PathBuf {
+        let root = base.join("root");
         let ssh = under(&root, "/etc/ssh");
         std::fs::create_dir_all(&ssh).unwrap();
         std::fs::write(ssh.join("sshd_config"), "Port 22\n").unwrap();
@@ -549,9 +564,6 @@ mod tests {
         std::os::unix::fs::symlink("sshd_config", ssh.join("link")).unwrap();
         std::fs::write(ssh.join("ssh_host_ed25519_key"), "host secret").unwrap();
         std::fs::write(ssh.join("ssh_host_ed25519_key.pub"), "ssh-ed25519 AAAA\n").unwrap();
-        let pv = under(&root, "/etc/pve/priv");
-        std::fs::create_dir_all(&pv).unwrap();
-        std::fs::write(pv.join("shadow.cfg"), "cluster secret").unwrap();
         let rs = under(&root, "/root/.ssh");
         std::fs::create_dir_all(&rs).unwrap();
         std::fs::write(rs.join("id_rsa"), "root secret").unwrap();
@@ -559,11 +571,9 @@ mod tests {
         let bin = under(&root, "/usr/local/bin");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(bin.join("deploy"), "-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
-        std::fs::write(under(&root, "/etc/hosts"), "127.0.0.1 localhost\n").unwrap();
         root
     }
 
-    /// `check_dest` refuses a root-owned dest; CI runs tests as root.
     fn unroot(dest: &Path) {
         if std::fs::metadata(dest).unwrap().uid() == 0 {
             std::os::unix::fs::chown(dest, Some(65534), Some(65534)).unwrap();
@@ -571,8 +581,8 @@ mod tests {
     }
 
     #[test]
-    fn capture_copies_db_and_host_paths_and_sums_verify() {
-        let base = scratch("cap");
+    fn host_capture_excludes_secrets_and_records_ownership() {
+        let base = scratch("host");
         let root = fake_root(&base);
         let dest = base.join("payload");
         std::fs::create_dir_all(&dest).unwrap();
@@ -580,41 +590,12 @@ mod tests {
 
         let detail = capture_in(&root, &dest).unwrap();
         assert!(
-            detail.contains("config.db + 6 host file(s), 7 secret(s) excluded"),
+            detail.starts_with("5 host file(s), 3 secret(s) excluded"),
             "{detail}"
         );
-        assert!(!detail.contains("/etc/pve"), "{detail}");
-
-        let c = rusqlite::Connection::open(dest.join(DB_FILE)).unwrap();
-        let names: Vec<String> = c
-            .prepare("SELECT name FROM tree ORDER BY inode")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert_eq!(
-            names,
-            [
-                "__version__",
-                "corosync.conf",
-                "priv",
-                "nodes",
-                "n1",
-                "pve-ssl.pem"
-            ]
-        );
-        let check: String = c
-            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(check, "ok");
-        let raw = std::fs::read(dest.join(DB_FILE)).unwrap();
-        assert!(!raw.windows(14).any(|w| w == b"cluster secret"));
-        assert!(!raw.windows(10).any(|w| w == b"tls secret"));
-
+        assert!(detail.contains("absent: /etc/sudoers.d"), "{detail}");
         for gone in [
             "host/etc/ssh/ssh_host_ed25519_key",
-            "host/etc/pve/priv/shadow.cfg",
             "host/root/.ssh/id_rsa",
             "host/usr/local/bin/deploy",
         ] {
@@ -626,7 +607,7 @@ mod tests {
         for kept in [
             "host/etc/ssh/ssh_host_ed25519_key.pub",
             "host/root/.ssh/authorized_keys",
-            "host/etc/hosts",
+            "host/etc/fstab",
         ] {
             assert!(dest.join(kept).is_file(), "{kept}");
         }
@@ -638,43 +619,55 @@ mod tests {
             )),
             "{ex}"
         );
-        for path in [
-            " /etc/pve/priv/shadow.cfg\n",
-            " /root/.ssh/id_rsa\n",
-            " /usr/local/bin/deploy\n",
-            " config.db:/priv/authkey.key\n",
-            " config.db:/priv/token.cfg\n",
-            " config.db:/nodes/n1/pve-ssl.key\n",
-        ] {
-            assert!(ex.contains(path), "{path} missing from {ex}");
-        }
+        assert!(ex.contains(" /root/.ssh/id_rsa\n"), "{ex}");
+        assert!(ex.contains(" /usr/local/bin/deploy\n"), "{ex}");
         assert!(!ex.contains("secret\n"), "{ex}");
-        assert_eq!(
-            std::fs::read_to_string(dest.join("host/etc/ssh/sshd_config")).unwrap(),
-            "Port 22\n"
-        );
         let own = std::fs::read_to_string(dest.join(OWNERSHIP)).unwrap();
         assert!(own.contains(" /etc/ssh/sshd_config\n"), "{own}");
-        assert!(own.contains(" /etc/fstab\n"), "{own}");
 
-        write_sums(&dest).unwrap();
-        let (files, digest) = verify_sums(&dest).unwrap();
-        assert_eq!(files, 8);
-        assert_eq!(digest.len(), 64);
+        let api = FakeApi {
+            refuse: vec![],
+            calls: Default::default(),
+        };
+        let out = rt().block_on(capture(&api, "n1", &dest, &detail)).unwrap();
+        assert!(out["note"].as_str().unwrap().contains("5 host file(s)"));
+        verify_sums(&dest).unwrap();
         std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
-    fn capture_refuses_a_used_payload_dir() {
+    fn host_capture_refuses_a_used_payload_dir() {
         let base = scratch("used");
         let root = fake_root(&base);
         let dest = base.join("payload");
-        std::fs::create_dir_all(dest.join(HOST_DIR)).unwrap();
+        std::fs::create_dir_all(dest.join(API_DIR)).unwrap();
         unroot(&dest);
         let err = capture_in(&root, &dest).unwrap_err().to_string();
-        assert!(err.contains("already holds host"), "{err}");
+        assert!(err.contains("already holds api"), "{err}");
         assert!(capture_in(&root, Path::new("relative")).is_err());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn node_names_reads_the_nodes_list() {
+        let nodes = json!([{"node": "thor"}, {"node": "odin"}, {"status": "x"}]);
+        assert_eq!(node_names(&nodes), ["thor", "odin"]);
+        assert!(node_names(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn capture_fails_when_every_read_is_refused() {
+        let dest = scratch("none");
+        let api = FakeApi {
+            refuse: vec![""],
+            calls: Default::default(),
+        };
+        let err = rt()
+            .block_on(capture(&api, "n1", &dest, "host skipped"))
+            .unwrap_err();
+        assert!(err.to_string().contains("every API read failed"), "{err}");
+        assert!(!dest.join(SUMS).exists());
+        std::fs::remove_dir_all(&dest).unwrap();
     }
 
     #[test]
@@ -682,11 +675,11 @@ mod tests {
         let dir = scratch("sums");
         std::fs::create_dir_all(dir.join("api")).unwrap();
         std::fs::write(dir.join("api/a.json"), "{}").unwrap();
-        std::fs::write(dir.join(DB_FILE), "db").unwrap();
+        std::fs::write(dir.join("config.db"), "db").unwrap();
         write_sums(&dir).unwrap();
         assert_eq!(verify_sums(&dir).unwrap().0, 2);
 
-        std::fs::write(dir.join(DB_FILE), "changed").unwrap();
+        std::fs::write(dir.join("config.db"), "changed").unwrap();
         assert!(
             verify_sums(&dir)
                 .unwrap_err()
@@ -717,7 +710,7 @@ mod tests {
     #[test]
     fn restore_verifies_then_refuses() {
         let dir = scratch("restore");
-        std::fs::write(dir.join(DB_FILE), "db").unwrap();
+        std::fs::write(dir.join("config.db"), "db").unwrap();
         write_sums(&dir).unwrap();
         let err = restore(dir.to_str().unwrap()).unwrap_err().to_string();
         assert!(err.contains("capture-only: 1 file(s) verified"), "{err}");

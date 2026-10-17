@@ -21,12 +21,10 @@
 //! A change PVE cannot hotplug lands in `[pve:pending]` and is reported as
 //! pending a restart.
 //!
-//! Raw config edits cover only what has no PVE API or CLI: [`OP_SHM_RESIZE`]
-//! sets a CT's tmpfs `lxc.mount.entry` `size=`, and [`OP_DROP_RAW_ENTRY`]
-//! removes a raw `lxc.mount.entry` for a guest mount target (no API removes
-//! `lxc.*` keys). The plugin runs as the unprivileged orca user, so these edits
-//! of `/etc/pve/lxc/<vmid>.conf` run as root through orca's verified
-//! `admin plugin-apply` seam ([`privileged_ops`]). There [`edit_raw_conf_in`]
+//! [`OP_DROP_RAW_ENTRY`] removes a raw `lxc.mount.entry` for a guest mount
+//! target: the PVE API cannot write `lxc.*` keys, so this edit of
+//! `/etc/pve/lxc/<vmid>.conf` runs through orca's privileged seam
+//! ([`privileged_ops`]), which an admin grants per plugin. There [`edit_raw_conf_in`]
 //! holds PVE's own per-CT config flock, re-reads the file under it, edits only
 //! the live section, and replaces it atomically.
 //!
@@ -60,12 +58,6 @@ const CONF_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const TEMP_STALE_AGE: Duration = Duration::from_secs(600);
 /// The only PVE user allowed to set a bind `mpN`.
 const ROOT_USER: &str = "root@pam";
-/// Upper bound on a tmpfs resize, whatever the CT's memory.
-const SHM_MAX_MB: u64 = 64 * 1024;
-/// PVE's `memory` when a CT config omits it.
-const CT_DEFAULT_MEMORY_MB: u64 = 512;
-/// Privileged-seam op name (`<plugin> --privileged-op`).
-pub const OP_SHM_RESIZE: &str = "guest_mount.shm_resize";
 /// Privileged-seam op removing a raw `lxc.mount.entry` for one guest target.
 pub const OP_DROP_RAW_ENTRY: &str = "guest_mount.drop_raw_entry";
 /// orca core's settings table and the key holding this host's system id.
@@ -1517,54 +1509,13 @@ fn render_mp_value(src: &str, target: &str, ro: bool, extras: &[&str]) -> String
     out
 }
 
-// ── Privileged tmpfs resize (runs as root) ──────────────────────────────────
-
-/// Payload of [`OP_SHM_RESIZE`]: the `size=` of a CT's tmpfs `lxc.mount.entry`,
-/// which has no PVE API. `target` is the entry's relative mountpoint (`dev/shm`).
-#[derive(Serialize, Deserialize)]
-pub(crate) struct ShmResizeOp {
-    pub(crate) vmid: u64,
-    pub(crate) target: String,
-    pub(crate) size_mb: u64,
-}
-
-impl ShmResizeOp {
-    fn validate(&self) -> Result<(), String> {
-        if self.target.starts_with('/') {
-            return Err(format!("tmpfs target '{}' must be relative", self.target));
-        }
-        check_abs_path("tmpfs target", &format!("/{}", self.target))?;
-        if self.size_mb == 0 {
-            return Err("tmpfs size must be > 0 MiB".to_string());
-        }
-        if self.size_mb > SHM_MAX_MB {
-            return Err(format!(
-                "tmpfs size {} MiB exceeds the {SHM_MAX_MB} MiB cap",
-                self.size_mb
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Resize a CT's tmpfs through orca's privileged seam.
-pub(crate) async fn shm_resize(op: &ShmResizeOp) -> Result<RawEdit, String> {
-    privileged(OP_SHM_RESIZE, op).await
-}
-
 /// The closed op set this plugin serves as root in `--privileged-op` mode.
 pub fn privileged_ops() -> PrivilegedOps {
-    PrivilegedOps::new()
-        .op(OP_SHM_RESIZE, |op: ShmResizeOp| async move {
-            root_shm_resize(Path::new("/"), &op)
-                .map(|e| e.detail().to_string())
-                .map_err(plugin_toolkit::anyhow::Error::msg)
-        })
-        .op(OP_DROP_RAW_ENTRY, |op: DropRawEntryOp| async move {
-            root_drop_raw_entry(Path::new("/"), &op)
-                .map(|e| e.detail().to_string())
-                .map_err(plugin_toolkit::anyhow::Error::msg)
-        })
+    PrivilegedOps::new().op(OP_DROP_RAW_ENTRY, |op: DropRawEntryOp| async move {
+        root_drop_raw_entry(Path::new("/"), &op)
+            .map(|e| e.detail().to_string())
+            .map_err(plugin_toolkit::anyhow::Error::msg)
+    })
 }
 
 /// Payload of [`OP_DROP_RAW_ENTRY`]: `target` is the absolute guest mountpoint.
@@ -1596,45 +1547,7 @@ fn drop_mount_entry(live: &str, rel: &str) -> Option<String> {
     dropped.then_some(out)
 }
 
-/// Root side of [`OP_SHM_RESIZE`]. The memory cap is checked by the edit itself,
-/// so it holds against the config re-read under the lock.
-fn root_shm_resize(root: &Path, op: &ShmResizeOp) -> Result<RawEdit, String> {
-    op.validate()?;
-    sweep_stale_temps_in(root, pid_alive);
-    let over = std::cell::Cell::new(None);
-    let edit = edit_raw_conf_in(root, op.vmid, |conf| {
-        let mem = ct_memory_mb(conf).unwrap_or(CT_DEFAULT_MEMORY_MB);
-        over.set((op.size_mb > mem).then_some(mem));
-        if op.size_mb > mem {
-            return None;
-        }
-        let (rewritten, changed) =
-            crate::shm_trap::rewrite_tmpfs_size(conf, &op.target, op.size_mb);
-        changed.then_some(rewritten)
-    });
-    if let Some(mem) = over.get() {
-        return Err(format!(
-            "tmpfs size {} MiB exceeds CT {} memory ({mem} MiB)",
-            op.size_mb, op.vmid
-        ));
-    }
-    edit
-}
-
-/// The CT's `memory:` (MiB) from its live config section.
-fn ct_memory_mb(live: &str) -> Option<u64> {
-    live.lines()
-        .find_map(|l| l.strip_prefix("memory:"))
-        .and_then(|v| v.trim().parse().ok())
-}
-
 // ── Node-local paths ────────────────────────────────────────────────────────
-
-/// The LXC config path for `vmid`, erroring if it is not an LXC (e.g. a VM,
-/// whose config lives under `qemu-server/` and whose mounts are a later phase).
-pub(crate) fn lxc_conf_path(vmid: u64) -> Result<String, String> {
-    lxc_conf_path_in(Path::new("/"), vmid)
-}
 
 fn lxc_conf_path_in(root: &Path, vmid: u64) -> Result<String, String> {
     let lxc = root.join(format!("etc/pve/lxc/{vmid}.conf"));
@@ -3175,30 +3088,7 @@ mod tests {
     }
 
     #[test]
-    fn shm_resize_is_capped_by_ct_memory_or_its_default() {
-        let op = |size_mb| ShmResizeOp {
-            vmid: 120,
-            target: "dev/shm".to_string(),
-            size_mb,
-        };
-        assert!(op(SHM_MAX_MB).validate().is_ok());
-        assert!(op(SHM_MAX_MB + 1).validate().is_err());
-        let entry = "lxc.mount.entry: tmpfs dev/shm tmpfs size=1g,mode=1777 0 0\n";
-        let root = pve_root("shmcap", 120, &format!("memory: 2048\n{entry}"));
-        let err = root_shm_resize(&root, &op(4096)).unwrap_err();
-        assert!(err.contains("2048"), "{err}");
-        assert_eq!(root_shm_resize(&root, &op(1536)).unwrap(), RawEdit::Written);
-        std::fs::remove_dir_all(&root).ok();
-
-        let root = pve_root("shmdefault", 120, entry);
-        let err = root_shm_resize(&root, &op(1024)).unwrap_err();
-        assert!(err.contains("(512 MiB)"), "{err}");
-        assert_eq!(root_shm_resize(&root, &op(256)).unwrap(), RawEdit::Written);
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn shm_cap_is_rechecked_against_the_config_under_the_lock() {
+    fn raw_edit_is_rechecked_against_the_config_under_the_lock() {
         let root = pve_root("shmlock", 120, "memory: 4096\n");
         let lxc = root.join("etc/pve/lxc/120.conf");
         let calls = std::cell::Cell::new(0);
@@ -3207,8 +3097,7 @@ mod tests {
             if calls.get() == 1 {
                 std::fs::write(&lxc, "memory: 256\n").unwrap();
             }
-            let mem = ct_memory_mb(conf).unwrap_or(CT_DEFAULT_MEMORY_MB);
-            (1024 <= mem).then(|| format!("{conf}x\n"))
+            (!conf.contains("memory: 256")).then(|| format!("{conf}x\n"))
         })
         .unwrap();
         assert_eq!(edit, RawEdit::Unchanged);
@@ -3323,42 +3212,6 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o640);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn root_shm_resize_rewrites_the_tmpfs_size_and_validates() {
-        let root = pve_root(
-            "shm",
-            120,
-            "arch: amd64\nlxc.mount.entry: tmpfs dev/shm tmpfs size=6g,mode=1777 0 0\n",
-        );
-        let op = |target: &str, size_mb| ShmResizeOp {
-            vmid: 120,
-            target: target.to_string(),
-            size_mb,
-        };
-        assert_eq!(
-            root_shm_resize(&root, &op("dev/shm", 512)).unwrap(),
-            RawEdit::Written
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join("etc/pve/lxc/120.conf")).unwrap(),
-            "arch: amd64\nlxc.mount.entry: tmpfs dev/shm tmpfs size=512m,mode=1777 0 0\n"
-        );
-        assert_eq!(
-            root_shm_resize(&root, &op("dev/shm", 512)).unwrap(),
-            RawEdit::Unchanged
-        );
-        for (target, mb) in [
-            ("/dev/shm", 512),
-            ("dev/../etc", 512),
-            ("dev/shm x", 512),
-            ("", 512),
-            ("dev/shm", 0),
-        ] {
-            assert!(root_shm_resize(&root, &op(target, mb)).is_err(), "{target}");
-        }
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

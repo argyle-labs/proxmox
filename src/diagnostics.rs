@@ -142,10 +142,7 @@ fn config_agent_enabled(cfg: &GuestConfigData) -> bool {
 /// node-local LXC shm-trap sweep.
 pub async fn diagnose(args: DiagnoseArgs) -> Vec<Finding> {
     let mut findings = diagnose_qemu_agents(args).await;
-    // Node-local: reads /etc/pve/lxc/*.conf directly (raw lxc.mount.entry sizes
-    // aren't in the PVE API), so it only yields on a cluster node. Harmless
-    // (empty) elsewhere.
-    findings.extend(diagnose_lxc_shm_traps());
+    findings.extend(diagnose_lxc_shm_traps().await);
     // Node-local: scans /proc for non-hypervisor workloads running on the host
     // itself (the PVE API exposes no process list). Empty off a PVE node.
     findings.extend(diagnose_host_workloads());
@@ -390,42 +387,80 @@ fn ct_name(conf: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Node-local sweep: parse every `/etc/pve/lxc/<vmid>.conf` and flag any tmpfs
-/// mount sized at/above the CT's memory cgroup — the shm-trap that OOM-kills
-/// whatever fills it (e.g. a Plex/Jellyfin transcode into `/dev/shm`).
-fn diagnose_lxc_shm_traps() -> Vec<Finding> {
-    let dir = std::path::Path::new("/etc/pve/lxc");
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new(); // not a PVE node
-    };
-    let node = local_node();
-    let mut findings = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|x| x.to_str()) != Some("conf") {
-            continue;
+async fn diagnose_lxc_shm_traps() -> Vec<Finding> {
+    for_each_enabled_endpoint("diagnostics.shm_trap", |cfg, ep| async move {
+        let http = cfg.build_reqwest_client()?;
+        let resources =
+            crate::backup::raw_get_data(&http, &cfg.base_url, "cluster/resources?type=vm").await?;
+        let mut findings = Vec::new();
+        for (node, vmid, name) in lxc_guests(&resources) {
+            let path = format!("nodes/{}/lxc/{vmid}/config", crate::backup::enc(&node));
+            let config = match crate::backup::raw_get_data(&http, &cfg.base_url, &path).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(vmid, error = %e, "shm-trap: CT config read failed");
+                    continue;
+                }
+            };
+            let profile = crate::shm_trap::parse_lxc_conf(&conf_lines(&config));
+            for trap in crate::shm_trap::classify_traps(&profile) {
+                findings.push(finding_shm_trap(&ep.name, &node, vmid, &name, &trap));
+            }
         }
-        let Some(vmid) = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        let Ok(conf) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let name = ct_name(&conf).unwrap_or_else(|| format!("ct-{vmid}"));
-        let profile = crate::shm_trap::parse_lxc_conf(&conf);
-        for trap in crate::shm_trap::classify_traps(&profile) {
-            findings.push(finding_shm_trap(&node, vmid, &name, &trap));
-        }
-    }
-    findings
+        Ok(findings)
+    })
+    .await
 }
 
-fn finding_shm_trap(node: &str, vmid: u64, name: &str, trap: &crate::shm_trap::ShmTrap) -> Finding {
-    let suggested = crate::shm_trap::suggested_shm_mb(trap.memory_mb);
+fn lxc_guests(resources: &serde_json::Value) -> Vec<(String, u64, String)> {
+    resources
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r.get("type").and_then(serde_json::Value::as_str) == Some("lxc"))
+        .filter(|r| r.get("template").and_then(serde_json::Value::as_u64) != Some(1))
+        .filter_map(|r| {
+            let node = r.get("node")?.as_str()?.to_string();
+            let vmid = r.get("vmid")?.as_u64()?;
+            let name = r
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("ct-{vmid}"));
+            Some((node, vmid, name))
+        })
+        .collect()
+}
+
+fn conf_lines(config: &serde_json::Value) -> String {
+    let mut out = String::new();
+    if let Some(mem) = config.get("memory") {
+        let mem = mem.as_str().map_or_else(|| mem.to_string(), str::to_string);
+        out.push_str(&format!("memory: {mem}\n"));
+    }
+    for pair in config
+        .get("lxc")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let [k, v] = pair.as_array().map(Vec::as_slice).unwrap_or_default()
+            && let (Some(k), Some(v)) = (k.as_str(), v.as_str())
+        {
+            out.push_str(&format!("{k}: {v}\n"));
+        }
+    }
+    out
+}
+
+fn finding_shm_trap(
+    endpoint: &str,
+    node: &str,
+    vmid: u64,
+    name: &str,
+    trap: &crate::shm_trap::ShmTrap,
+) -> Finding {
+    let suggested = crate::shm_trap::suggested_memory_mb(trap.tmpfs_mb);
     Finding {
         id: format!("lxc-shm-trap::{node}::{vmid}::{}", trap.target),
         provider: PROVIDER.to_string(),
@@ -439,48 +474,76 @@ fn finding_shm_trap(node: &str, vmid: u64, name: &str, trap: &crate::shm_trap::S
             "The tmpfs mount /{tgt} in CT {vmid} on node '{node}' is sized {tmpfs} MiB, which is \
              at/above the container's {mem} MiB memory cgroup. tmpfs pages count against that \
              cgroup, so filling /{tgt} (e.g. a Plex/Jellyfin transcode writing to /dev/shm) pushes \
-             the CT past its limit and the kernel OOM-kills the process — a crash-loop. Cap the \
-             tmpfs below the memory limit (suggested {suggested} MiB, leaving headroom for the \
-             workload) or raise the CT's memory. Change applies on the next CT restart.",
+             the CT past its limit and the kernel OOM-kills the process — a crash-loop. Raise the \
+             CT's memory (suggested {suggested} MiB, leaving headroom for the workload) or cap the \
+             tmpfs below the memory limit by hand.",
             tgt = trap.target,
             tmpfs = trap.tmpfs_mb,
             mem = trap.memory_mb,
         ),
         repair: Some(RepairSpec {
-            id: format!("shm-resize::{vmid}::{}::{suggested}", trap.target),
+            id: format!("shm-memory::{endpoint}::{node}::{vmid}::{suggested}"),
             description: format!(
-                "Rewrite the tmpfs /{} entry in /etc/pve/lxc/{vmid}.conf to size={suggested}m \
-                 (leaves headroom under the {} MiB cap). Takes effect on the CT's next start.",
-                trap.target, trap.memory_mb
+                "Raise CT {vmid} memory from {} MiB to {suggested} MiB through the PVE API so \
+                 the {} MiB tmpfs /{} sits under the cap.",
+                trap.memory_mb, trap.tmpfs_mb, trap.target
             ),
-            // Confirmation required — it edits the CT config and needs a restart.
             automatic: false,
-            privileged: true,
+            privileged: false,
             delegate: None,
         }),
     }
 }
 
-/// Apply an `shm-resize::<vmid>::<target>::<new_mb>` repair by rewriting the
-/// tmpfs `size=` in the CT's conf. The tmpfs is a raw `lxc.mount.entry` with no
-/// PVE API, and `/etc/pve` is root-only, so the edit runs as root through the
-/// [`crate::guest_mount::OP_SHM_RESIZE`] privileged op.
-async fn repair_shm_resize(vmid: u64, target: &str, new_mb: u64) -> Result<String, String> {
-    let path = crate::guest_mount::lxc_conf_path(vmid)?;
-    let op = crate::guest_mount::ShmResizeOp {
-        vmid,
-        target: target.to_string(),
-        size_mb: new_mb,
-    };
-    if crate::guest_mount::shm_resize(&op).await? == crate::guest_mount::RawEdit::Unchanged {
+async fn repair_shm_memory(
+    endpoint: &str,
+    node: &str,
+    vmid: u64,
+    memory_mb: u64,
+) -> Result<String, String> {
+    let cfg = resolve_config(endpoint).await.map_err(|e| e.to_string())?;
+    let http = cfg.build_reqwest_client().map_err(|e| e.to_string())?;
+    let path = format!("nodes/{}/lxc/{vmid}/config", crate::backup::enc(node));
+    let config = crate::backup::raw_get_data(&http, &cfg.base_url, &path)
+        .await
+        .map_err(|e| format!("GET CT {vmid} config: {e:#}"))?;
+    let Some(pairs) = memory_raise_pairs(&config, memory_mb)? else {
         return Err(format!(
-            "no tmpfs /{target} entry with a size= found in {path} (already fixed?)"
+            "CT {vmid} memory is already at or above {memory_mb} MiB (already fixed?)"
         ));
-    }
+    };
+    let url = format!("{}/{path}", cfg.base_url.trim_end_matches('/'));
+    crate::backup::put_form(&http, &url, &pairs)
+        .await
+        .map_err(|e| format!("PUT CT {vmid} memory: {e:#}"))?;
     Ok(format!(
-        "Set tmpfs /{target} to size={new_mb}m in {path}. Restart CT {vmid} \
-         (`pct reboot {vmid}`) for it to take effect."
+        "Raised CT {vmid} memory to {memory_mb} MiB through the PVE API; a running CT applies \
+         it live."
     ))
+}
+
+fn memory_raise_pairs(
+    config: &serde_json::Value,
+    memory_mb: u64,
+) -> Result<Option<Vec<(String, String)>>, String> {
+    let digest = config
+        .get("digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("CT config has no digest")?;
+    let current = match config.get("memory") {
+        None => 512,
+        Some(v) => v
+            .as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            .ok_or_else(|| format!("CT memory '{v}' is not a number"))?,
+    };
+    if current >= memory_mb {
+        return Ok(None);
+    }
+    Ok(Some(vec![
+        ("memory".to_string(), memory_mb.to_string()),
+        ("digest".to_string(), digest.to_string()),
+    ]))
 }
 
 fn finding_disabled(endpoint: &str, node: &str, vmid: u64, name: &str) -> Finding {
@@ -557,26 +620,23 @@ fn outcome(repair_id: &str, ok: bool, message: String) -> RepairOutcome {
 
 /// Run a repair by its `RepairSpec.id`.
 pub async fn repair(args: RepairArgs) -> RepairOutcome {
-    // shm-resize::<vmid>::<target>::<new_mb> — node-local conf edit, distinct
-    // from the endpoint-scoped qemu-agent ids parsed below.
-    if let Some(rest) = args.repair_id.strip_prefix("shm-resize::") {
-        let parts: Vec<&str> = rest.split("::").collect();
-        let parsed = match parts.as_slice() {
-            [vmid, target, new_mb] => vmid
+    if let Some(rest) = args.repair_id.strip_prefix("shm-memory::") {
+        let parsed = match rest.split("::").collect::<Vec<_>>().as_slice() {
+            [endpoint, node, vmid, mb] => vmid
                 .parse::<u64>()
                 .ok()
-                .zip(new_mb.parse::<u64>().ok())
-                .map(|(v, m)| (v, target.to_string(), m)),
+                .zip(mb.parse::<u64>().ok())
+                .map(|(v, m)| (endpoint.to_string(), node.to_string(), v, m)),
             _ => None,
         };
-        let Some((vmid, target, new_mb)) = parsed else {
+        let Some((endpoint, node, vmid, memory_mb)) = parsed else {
             return outcome(
                 &args.repair_id,
                 false,
-                format!("malformed shm-resize repair id '{}'", args.repair_id),
+                format!("malformed shm-memory repair id '{}'", args.repair_id),
             );
         };
-        return match repair_shm_resize(vmid, &target, new_mb).await {
+        return match repair_shm_memory(&endpoint, &node, vmid, memory_mb).await {
             Ok(msg) => outcome(&args.repair_id, true, msg),
             Err(e) => outcome(&args.repair_id, false, e),
         };
@@ -712,13 +772,12 @@ mod tests {
             tmpfs_mb: 6144,
             memory_mb: 4096,
         };
-        let f = finding_shm_trap("thor", 110, "mimir", &trap);
+        let f = finding_shm_trap("pve", "thor", 110, "mimir", &trap);
         assert_eq!(f.id, "lxc-shm-trap::thor::110::dev/shm");
         assert_eq!(f.severity, Severity::Crit);
         let r = f.repair.unwrap();
-        // suggested = half of 4096 = 2048
-        assert_eq!(r.id, "shm-resize::110::dev/shm::2048");
-        assert!(!r.automatic && r.privileged);
+        assert_eq!(r.id, "shm-memory::pve::thor::110::12288");
+        assert!(!r.automatic && !r.privileged);
     }
 
     #[test]
@@ -732,14 +791,61 @@ mod tests {
     }
 
     #[test]
-    fn malformed_shm_resize_id_fails_cleanly() {
+    fn memory_raise_sets_memory_with_digest_only_when_higher() {
+        let cfg = serde_json::json!({"digest": "abc", "memory": 4096});
+        assert_eq!(
+            memory_raise_pairs(&cfg, 12288).unwrap().unwrap(),
+            [
+                ("memory".to_string(), "12288".to_string()),
+                ("digest".to_string(), "abc".to_string())
+            ]
+        );
+        assert!(memory_raise_pairs(&cfg, 4096).unwrap().is_none());
+        let defaulted = serde_json::json!({"digest": "d"});
+        assert!(memory_raise_pairs(&defaulted, 1024).unwrap().is_some());
+        let stringy = serde_json::json!({"digest": "d", "memory": "2048"});
+        assert!(memory_raise_pairs(&stringy, 2048).unwrap().is_none());
+        assert!(memory_raise_pairs(&serde_json::json!({"memory": 1}), 2048).is_err());
+    }
+
+    #[test]
+    fn shm_trap_inputs_come_from_the_api_config() {
+        let resources = serde_json::json!([
+            {"type": "lxc", "node": "thor", "vmid": 110, "name": "mimir"},
+            {"type": "lxc", "node": "thor", "vmid": 9000, "template": 1},
+            {"type": "qemu", "node": "thor", "vmid": 120},
+            {"type": "lxc", "node": "odin", "vmid": 111}
+        ]);
+        assert_eq!(
+            lxc_guests(&resources),
+            [
+                ("thor".to_string(), 110, "mimir".to_string()),
+                ("odin".to_string(), 111, "ct-111".to_string())
+            ]
+        );
+        let config = serde_json::json!({
+            "memory": 4096,
+            "lxc": [
+                ["lxc.mount.entry", "tmpfs dev/shm tmpfs size=6g,mode=1777 0 0"],
+                ["lxc.cgroup2.devices.allow", "c 226:* rwm"]
+            ]
+        });
+        let profile = crate::shm_trap::parse_lxc_conf(&conf_lines(&config));
+        let traps = crate::shm_trap::classify_traps(&profile);
+        assert_eq!(traps.len(), 1);
+        assert_eq!(traps[0].tmpfs_mb, 6144);
+        assert_eq!(traps[0].memory_mb, 4096);
+    }
+
+    #[test]
+    fn malformed_shm_memory_id_fails_cleanly() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let out = rt.block_on(repair(RepairArgs {
             provider: "proxmox".into(),
-            repair_id: "shm-resize::notanum::dev/shm".into(),
+            repair_id: "shm-memory::pve::thor::notanum::2048".into(),
             confirm: true,
         }));
         assert!(!out.ok);
