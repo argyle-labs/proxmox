@@ -26,6 +26,9 @@ use crate::tools::for_each_enabled_endpoint;
 /// Share of the pool kept free of provisioned volumes.
 pub const SAFETY_MARGIN_PCT: f64 = 5.0;
 
+/// Highest share of the pool a grow may leave allocated once fully written.
+pub const DATA_USAGE_MAX_PCT: f64 = 90.0;
+
 const PROVIDER: &str = "proxmox";
 const THIN_PLUGIN: &str = "lvmthin";
 
@@ -46,6 +49,10 @@ impl PoolCommit {
         (self.size_bytes as f64 * (1.0 - SAFETY_MARGIN_PCT / 100.0)) as u64
     }
 
+    pub fn data_limit_bytes(&self) -> u64 {
+        (self.size_bytes as f64 * DATA_USAGE_MAX_PCT / 100.0) as u64
+    }
+
     pub fn over_committed(&self) -> bool {
         self.provisioned_bytes > self.limit_bytes()
     }
@@ -62,6 +69,75 @@ pub fn provisioned_bytes(content: &Value) -> u64 {
                 .sum()
         })
         .unwrap_or(0)
+}
+
+/// Refuse a grow of `grow_bytes` that, once written, would take the pool's
+/// allocated data past [`PoolCommit::data_limit_bytes`].
+pub fn check_data_usage(pool: &PoolCommit, grow_bytes: u64) -> std::result::Result<(), String> {
+    let used_after = pool.used_bytes.saturating_add(grow_bytes);
+    let data_limit = pool.data_limit_bytes();
+    if used_after > data_limit {
+        return Err(format!(
+            "growing by {:.1} GiB could fill thin pool '{}' (node '{}') to {:.1} GiB of data, \
+             over {DATA_USAGE_MAX_PCT}% of its {:.1} GiB ({:.1} GiB allocated now)",
+            gib(grow_bytes),
+            pool.storage,
+            pool.node,
+            gib(used_after),
+            gib(pool.size_bytes),
+            gib(pool.used_bytes),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct MetadataUsage {
+    pub size_bytes: u64,
+    pub used_bytes: u64,
+}
+
+/// `(size, used)` of the metadata LV of `vg/thinpool` in a
+/// `/nodes/{node}/disks/lvmthin` listing.
+pub fn metadata_usage(lvmthin: &Value, vg: &str, thinpool: &str) -> Option<MetadataUsage> {
+    lvmthin.as_array()?.iter().find_map(|p| {
+        if p.get("vg")?.as_str()? != vg || p.get("lv")?.as_str()? != thinpool {
+            return None;
+        }
+        Some(MetadataUsage {
+            size_bytes: p.get("metadata_size")?.as_u64()?,
+            used_bytes: p.get("metadata_used")?.as_u64()?,
+        })
+    })
+}
+
+/// Refuse a grow whose data, once written, would take the pool's metadata
+/// past [`DATA_USAGE_MAX_PCT`], scaling metadata with data from a floor of 1%
+/// of the pool so a near-empty pool does not project a huge ratio.
+pub fn check_metadata_usage(
+    pool: &PoolCommit,
+    meta: MetadataUsage,
+    grow_bytes: u64,
+) -> std::result::Result<(), String> {
+    let (meta_used, grow) = (meta.used_bytes as u128, grow_bytes as u128);
+    let base = (pool.used_bytes as u128)
+        .max(pool.size_bytes as u128 / 100)
+        .max(1);
+    let projected = meta_used * (base + grow) / base;
+    let limit = (meta.size_bytes as f64 * DATA_USAGE_MAX_PCT / 100.0) as u128;
+    if projected <= limit && meta.size_bytes > 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "growing by {:.1} GiB could fill the metadata of thin pool '{}' (node '{}') to {:.2} \
+         GiB, over {DATA_USAGE_MAX_PCT}% of its {:.2} GiB ({:.2} GiB used now)",
+        gib(grow_bytes),
+        pool.storage,
+        pool.node,
+        projected as f64 / (1u64 << 30) as f64,
+        gib(meta.size_bytes),
+        gib(meta.used_bytes),
+    ))
 }
 
 /// Refuse a grow of `grow_bytes` that would take the pool's provisioned total
@@ -244,6 +320,72 @@ mod tests {
         let room = p.limit_bytes() - p.provisioned_bytes;
         assert!(check_grow(&p, room).is_ok());
         assert!(check_grow(&p, room + 1).is_err());
+    }
+
+    #[test]
+    fn grow_that_could_fill_pool_data_past_the_threshold_is_refused() {
+        let mut p = pool(100, 10);
+        p.used_bytes = 85 * GIB;
+        assert!(check_data_usage(&p, 5 * GIB).is_ok());
+        let err = check_data_usage(&p, 5 * GIB + 1).unwrap_err();
+        assert!(err.contains("of data"), "{err}");
+    }
+
+    #[test]
+    fn metadata_is_found_by_vg_and_thinpool() {
+        let list = json!([
+            {"vg": "pve", "lv": "other", "metadata_size": 1, "metadata_used": 1},
+            {"vg": "pve", "lv": "data", "metadata_size": 100, "metadata_used": 40},
+        ]);
+        assert_eq!(
+            metadata_usage(&list, "pve", "data"),
+            Some(MetadataUsage {
+                size_bytes: 100,
+                used_bytes: 40
+            })
+        );
+        assert_eq!(metadata_usage(&list, "vg2", "data"), None);
+    }
+
+    #[test]
+    fn metadata_projection_refuses_past_the_threshold() {
+        let mut p = pool(100, 10);
+        p.used_bytes = 50 * GIB;
+        let meta = MetadataUsage {
+            size_bytes: 100,
+            used_bytes: 45,
+        };
+        assert!(check_metadata_usage(&p, meta, 50 * GIB).is_ok());
+        let err = check_metadata_usage(&p, meta, 52 * GIB).unwrap_err();
+        assert!(err.contains("metadata"), "{err}");
+        let unknown = MetadataUsage {
+            size_bytes: 0,
+            used_bytes: 0,
+        };
+        assert!(check_metadata_usage(&p, unknown, GIB).is_err());
+    }
+
+    #[test]
+    fn metadata_projection_of_an_empty_pool_scales_with_the_grow() {
+        let mut p = pool(100, 0);
+        p.used_bytes = 0;
+        let meta = MetadataUsage {
+            size_bytes: 1000,
+            used_bytes: 10,
+        };
+        assert!(check_metadata_usage(&p, meta, 89 * GIB).is_ok());
+        assert!(check_metadata_usage(&p, meta, 90 * GIB).is_err());
+    }
+
+    #[test]
+    fn near_empty_pool_does_not_false_refuse() {
+        let mut p = pool(100, 0);
+        p.used_bytes = 4096;
+        let meta = MetadataUsage {
+            size_bytes: 1000,
+            used_bytes: 5,
+        };
+        assert!(check_metadata_usage(&p, meta, 50 * GIB).is_ok());
     }
 
     #[test]
