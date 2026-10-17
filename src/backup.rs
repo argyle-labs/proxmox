@@ -181,9 +181,9 @@ async fn run(kind: Kind, op: &str, args_json: &str) -> Result<String> {
         }
 
         // ── pve-node-state ──────────────────────────────────────────────────
-        (Kind::NodeState, "instances") => {
-            Ok(serde_json::to_string(&crate::node_state::instances())?)
-        }
+        (Kind::NodeState, "instances") => Ok(serde_json::to_string(
+            &crate::node_state::instances().await,
+        )?),
         (Kind::NodeState, "layout") => {
             let instance = decode_instance(args_json)?;
             Ok(json!(["hosts", "proxmox-node-state", instance]).to_string())

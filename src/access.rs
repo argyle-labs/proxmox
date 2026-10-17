@@ -35,7 +35,7 @@ pub const ORCA_OPS_PRIVS: &str = "VM.Audit VM.PowerMgmt VM.Console \
 VM.Config.Disk VM.Config.CPU VM.Config.Memory VM.Config.Network \
 VM.Config.Options VM.Config.Cloudinit VM.Allocate VM.Clone VM.Backup \
 Datastore.Audit Datastore.AllocateSpace Datastore.AllocateTemplate \
-Sys.Audit Sys.Console Pool.Audit";
+Sys.Audit Sys.Console Pool.Audit SDN.Audit Mapping.Audit";
 
 /// Default identity names. Kept as constants so the bootstrap and any later
 /// rotation/teardown agree on exactly what to look for.

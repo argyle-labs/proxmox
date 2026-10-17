@@ -132,57 +132,8 @@ pub fn classify_traps(profile: &LxcMemProfile) -> Vec<ShmTrap> {
         .collect()
 }
 
-/// Suggested safe tmpfs size for a trap: leave headroom for the process. Half
-/// the memory cap, floored at 256 MiB, never above `mem - 256`. This is the
-/// value the repair rewrites `size=` to.
-pub fn suggested_shm_mb(memory_mb: u64) -> u64 {
-    let half = memory_mb / 2;
-    let ceiling = memory_mb.saturating_sub(256);
-    half.clamp(256, ceiling.max(256))
-}
-
-/// Rewrite the `size=` of the tmpfs `lxc.mount.entry` whose mountpoint is
-/// `target`, to `new_mb` MiB (emitted as `<n>m`). Returns the new conf text and
-/// whether anything changed. Only the matching tmpfs line is touched; all other
-/// lines are preserved byte-for-byte.
-pub fn rewrite_tmpfs_size(conf: &str, target: &str, new_mb: u64) -> (String, bool) {
-    let mut changed = false;
-    let mut out = String::with_capacity(conf.len());
-    for line in conf.lines() {
-        let trimmed = line.trim();
-        let is_match = trimmed
-            .strip_prefix("lxc.mount.entry:")
-            .map(|e| {
-                let f: Vec<&str> = e.split_whitespace().collect();
-                f.len() >= 4 && f[0] == "tmpfs" && f[1] == target && f[2] == "tmpfs"
-            })
-            .unwrap_or(false);
-        if is_match && line.contains("size=") {
-            let rewritten = rewrite_size_opt(line, new_mb);
-            changed |= rewritten != line;
-            out.push_str(&rewritten);
-        } else {
-            out.push_str(line);
-        }
-        out.push('\n');
-    }
-    (out, changed)
-}
-
-/// Replace the `size=<val>` value in a single line with `<new_mb>m`, in place.
-/// `size=` can sit anywhere in the line (it's inside the space-delimited option
-/// field, e.g. `... tmpfs size=6g,mode=1777 0 0`), so match on the substring
-/// and rewrite only the value token (up to the next `,` or whitespace).
-fn rewrite_size_opt(line: &str, new_mb: u64) -> String {
-    let Some(idx) = line.find("size=") else {
-        return line.to_string();
-    };
-    let val_start = idx + "size=".len();
-    let rest = &line[val_start..];
-    let val_len = rest
-        .find(|c: char| c == ',' || c.is_whitespace())
-        .unwrap_or(rest.len());
-    format!("{}{new_mb}m{}", &line[..val_start], &rest[val_len..])
+pub fn suggested_memory_mb(tmpfs_mb: u64) -> u64 {
+    tmpfs_mb.saturating_mul(2).max(tmpfs_mb.saturating_add(256))
 }
 
 #[cfg(test)]
@@ -269,35 +220,9 @@ lxc.mount.entry: tmpfs dev/shm tmpfs nodev,nosuid,size=6g,mode=1777,create=dir 0
     }
 
     #[test]
-    fn suggested_size_leaves_headroom() {
-        assert_eq!(suggested_shm_mb(8192), 4096);
-        assert_eq!(suggested_shm_mb(4096), 2048);
-        assert_eq!(suggested_shm_mb(1024), 512);
-        // tiny CT: never below 256, never above mem-256
-        assert_eq!(suggested_shm_mb(512), 256);
-    }
-
-    #[test]
-    fn rewrite_resizes_only_the_matching_tmpfs_line() {
-        let (out, changed) = rewrite_tmpfs_size(MIMIR_CONF, "dev/shm", 2048);
-        assert!(changed);
-        assert!(out.contains("size=2048m"));
-        assert!(!out.contains("size=6g"));
-        // untouched lines preserved
-        assert!(out.contains("memory: 4096"));
-        assert!(out.contains("rootfs: local-lvm:vm-110-disk-0,size=32G"));
-        // idempotent: re-running finds nothing to change
-        let (_, changed2) = rewrite_tmpfs_size(&out, "dev/shm", 2048);
-        assert!(!changed2);
-    }
-
-    #[test]
-    fn rewrite_leaves_other_tmpfs_targets_alone() {
-        let conf = "memory: 4096\n\
-            lxc.mount.entry: tmpfs dev/shm tmpfs size=6g,mode=1777 0 0\n\
-            lxc.mount.entry: tmpfs run tmpfs size=1g 0 0\n";
-        let (out, _) = rewrite_tmpfs_size(conf, "dev/shm", 2048);
-        assert!(out.contains("tmpfs dev/shm tmpfs size=2048m,mode=1777"));
-        assert!(out.contains("tmpfs run tmpfs size=1g")); // untouched
+    fn suggested_memory_doubles_the_tmpfs_with_a_floor() {
+        assert_eq!(suggested_memory_mb(6144), 12288);
+        assert_eq!(suggested_memory_mb(2048), 4096);
+        assert_eq!(suggested_memory_mb(64), 320);
     }
 }
