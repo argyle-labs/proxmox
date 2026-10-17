@@ -557,7 +557,7 @@ async fn raise_ct_memory(
         / (1024 * 1024);
     if memory_mb > total_mb {
         return Err(format!(
-            "CT {vmid}: {memory_mb} MiB exceeds node {node} memory ({total_mb} MiB)"
+            "CT {vmid}: {memory_mb} MiB exceeds node {node} memory ({total_mb} MiB); cap = node total RAM, ignores other guests' commitments"
         ));
     }
     let Some(pairs) = memory_raise_pairs(&config, memory_mb)? else {

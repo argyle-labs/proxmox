@@ -212,7 +212,9 @@ pub(crate) const CLUSTER_READS: &[Read] = &[
     read("access/domains", "domains.json", Rule::Plain, false),
 ];
 
-const CORE_FALLBACKS: &[(&str, &str, &str)] = &[("cluster/config/nodes", "nodes", "nodes.json")];
+const MEMBERSHIP: &str = "cluster/config/nodes";
+const STANDALONE_ABSENT: &[&str] = &["cluster/config/totem"];
+const NEVER_EMPTY: &[&str] = &["access/users"];
 
 pub(crate) const NOT_CAPTURABLE: &[(&str, &str)] = &[(
     "access/acl",
@@ -244,10 +246,10 @@ pub async fn instances() -> Vec<String> {
     let found =
         crate::tools::for_each_enabled_endpoint("node_state.instances", |cfg, ep| async move {
             let http = cfg.build_reqwest_client()?;
+            let status =
+                crate::backup::raw_get_data(&http, &cfg.base_url, "cluster/status").await?;
             let nodes = crate::backup::raw_get_data(&http, &cfg.base_url, "nodes").await?;
-            let mut out = vec![format!("{CLUSTER_PREFIX}{}", ep.name)];
-            out.extend(node_names(&nodes));
-            Ok(out)
+            Ok(slots(&ep.name, &status, &nodes))
         })
         .await;
     found
@@ -255,6 +257,42 @@ pub async fn instances() -> Vec<String> {
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+pub(crate) fn slots(endpoint: &str, status: &Value, nodes: &Value) -> Vec<String> {
+    let mut out = vec![format!("{CLUSTER_PREFIX}{}", cluster_key(endpoint, status))];
+    out.extend(node_names(nodes));
+    out
+}
+
+fn cluster_name(status: &Value) -> Option<String> {
+    status
+        .as_array()?
+        .iter()
+        .find(|e| e.get("type").and_then(Value::as_str) == Some("cluster"))?
+        .get("name")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn cluster_key(endpoint: &str, status: &Value) -> String {
+    cluster_name(status).unwrap_or_else(|| endpoint.to_string())
+}
+
+async fn resolve_cluster_slot(key: &str) -> Result<crate::Config> {
+    for name in crate::tools::enabled_endpoint_names() {
+        let Ok(cfg) = crate::tools::resolve_config(&name).await else {
+            continue;
+        };
+        let http = cfg.build_reqwest_client()?;
+        if let Ok(status) =
+            crate::backup::raw_get_data(&http, &cfg.base_url, "cluster/status").await
+            && cluster_key(&name, &status) == key
+        {
+            return Ok(cfg);
+        }
+    }
+    bail!("pve-node-state: no enabled endpoint serves cluster slot '{key}'")
 }
 
 fn node_names(nodes: &Value) -> Vec<String> {
@@ -267,8 +305,8 @@ fn node_names(nodes: &Value) -> Vec<String> {
 }
 
 pub async fn backup(dir: &str, instance: &str) -> Result<Value> {
-    if let Some(endpoint) = instance.strip_prefix(CLUSTER_PREFIX) {
-        let cfg = crate::tools::resolve_config(endpoint).await?;
+    if let Some(key) = instance.strip_prefix(CLUSTER_PREFIX) {
+        let cfg = resolve_cluster_slot(key).await?;
         let api = Endpoint {
             http: cfg.build_reqwest_client()?,
             base_url: cfg.base_url.clone(),
@@ -336,6 +374,7 @@ pub(crate) async fn capture<A: ApiRead>(
     let mut warnings = Vec::new();
     let mut skipped = String::new();
     let mut captured = 0;
+    let mut standalone = false;
     for r in reads {
         let path = match scope {
             Scope::Node(n) => r.path.replace("{node}", &crate::backup::enc(n)),
@@ -344,21 +383,32 @@ pub(crate) async fn capture<A: ApiRead>(
         let mut file = r.file;
         let mut data = match api.get(&path).await {
             Ok(d) => d,
-            Err(e) if CORE_FALLBACKS.iter().any(|(p, _, _)| *p == path) => {
-                let (_, alt, alt_file) =
-                    CORE_FALLBACKS.iter().find(|(p, _, _)| *p == path).unwrap();
+            Err(e) if path == MEMBERSHIP => {
                 let first = scrub_text(&format!("{path}: {e:#}"));
-                let d = api.get(alt).await.map_err(|e2| {
+                let clustered = match api.get("cluster/status").await {
+                    Ok(status) => cluster_name(&status).is_some(),
+                    Err(e2) => bail!(
+                        "pve-node-state: core read failed: {first}; cluster/status: {}",
+                        scrub_text(&format!("{e2:#}"))
+                    ),
+                };
+                ensure!(!clustered, "pve-node-state: core read failed: {first}");
+                standalone = true;
+                let d = api.get("nodes").await.map_err(|e2| {
                     anyhow!(
-                        "pve-node-state: core read failed: {first}; fallback {}",
-                        scrub_text(&format!("{alt}: {e2:#}"))
+                        "pve-node-state: core read failed: {first}; standalone fallback {}",
+                        scrub_text(&format!("nodes: {e2:#}"))
                     )
                 })?;
                 skipped.push_str(&format!(
-                    "{first}; not clustered, so {alt} stands in as membership\n"
+                    "{path}: standalone node (cluster/status has no cluster entry); nodes stands in as membership\n"
                 ));
-                file = alt_file;
+                file = "nodes.json";
                 d
+            }
+            Err(_) if standalone && STANDALONE_ABSENT.contains(&path.as_str()) => {
+                skipped.push_str(&format!("{path}: absent on a standalone node\n"));
+                continue;
             }
             Err(e) => {
                 let msg = scrub_text(&format!("{path}: {e:#}"));
@@ -371,6 +421,14 @@ pub(crate) async fn capture<A: ApiRead>(
                 continue;
             }
         };
+        if NEVER_EMPTY.contains(&path.as_str()) && data.as_array().is_some_and(Vec::is_empty) {
+            let msg = format!(
+                "{path}: empty, which PVE never returns legitimately; the token cannot see users"
+            );
+            skipped.push_str(&format!("{msg}\n"));
+            warnings.push(msg);
+            continue;
+        }
         if r.rule == Rule::Filtered && data.as_array().is_some_and(Vec::is_empty) {
             skipped.push_str(&format!(
                 "{path}: empty list; PVE filters it by token privileges, so none configured and none visible look alike\n"
@@ -405,12 +463,17 @@ pub(crate) async fn capture<A: ApiRead>(
     };
     write_sums(dest)?;
     let (files, digest) = verify_sums(dest)?;
+    let prefix = if warnings.is_empty() {
+        String::new()
+    } else {
+        format!("PARTIAL: {} warnings; ", warnings.len())
+    };
     Ok(json!({
         "checksum": format!("sha256:{digest}"),
         "partial": !warnings.is_empty(),
         "warnings": warnings,
         "note": format!(
-            "{label}: {host_note}; {captured} API read(s); {} SKIPPED line(s); \
+            "{prefix}{label}: {host_note}; {captured} API read(s); {} SKIPPED line(s); \
              {files} file(s) in SHA256SUMS",
             skipped.lines().count()
         ),
@@ -431,31 +494,26 @@ pub(crate) fn scrub_text(s: &str) -> String {
         .split(' ')
         .map(|tok| {
             let core = tok.trim_matches(|c: char| "\"'(),;:<>[]".contains(c));
-            match url::Url::parse(core) {
-                Ok(mut u) if u.has_host() => {
-                    if scrub_url(&mut u) {
-                        tok.replace(core, u.as_str())
-                    } else {
-                        tok.to_string()
-                    }
-                }
-                _ => tok.to_string(),
+            match scrub_url(core) {
+                Some(clean) => tok.replace(core, &clean),
+                None => tok.to_string(),
             }
         })
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-fn scrub_url(u: &mut url::Url) -> bool {
-    let dirty = !u.username().is_empty() || u.password().is_some() || u.query().is_some();
-    if dirty {
-        u.set_username("").ok();
-        u.set_password(None).ok();
-        if u.query().is_some() {
-            u.set_query(Some("***"));
-        }
+fn scrub_url(s: &str) -> Option<String> {
+    let mut u = url::Url::parse(s).ok().filter(url::Url::has_host)?;
+    if u.username().is_empty() && u.password().is_none() && u.query().is_none() {
+        return None;
     }
-    dirty
+    u.set_username("").ok();
+    u.set_password(None).ok();
+    if u.query().is_some() {
+        u.set_query(Some("***"));
+    }
+    Some(u.into())
 }
 
 pub(crate) fn scrub_json(v: &mut Value) {
@@ -479,11 +537,8 @@ fn scrub_strings(v: &mut Value, in_header: bool) {
                     .collect::<Vec<_>>()
                     .join(",");
             }
-            if let Ok(mut u) = url::Url::parse(s)
-                && u.has_host()
-                && scrub_url(&mut u)
-            {
-                *s = u.to_string();
+            if let Some(clean) = scrub_url(s) {
+                *s = clean;
             }
         }
         Value::Array(a) => a.iter_mut().for_each(|x| scrub_strings(x, in_header)),
@@ -777,6 +832,7 @@ mod tests {
     struct FakeApi {
         refuse: Vec<&'static str>,
         empty: Vec<&'static str>,
+        clustered: bool,
         calls: std::sync::Mutex<Vec<String>>,
     }
 
@@ -784,6 +840,7 @@ mod tests {
         FakeApi {
             refuse,
             empty,
+            clustered: true,
             calls: Default::default(),
         }
     }
@@ -796,6 +853,13 @@ mod tests {
             }
             if self.empty.iter().any(|r| path.starts_with(r)) {
                 return Ok(json!([]));
+            }
+            if path == "cluster/status" {
+                return Ok(if self.clustered {
+                    json!([{"type": "cluster", "name": "lab"}, {"type": "node", "name": "n1"}])
+                } else {
+                    json!([{"type": "node", "name": "n1"}])
+                });
             }
             Ok(json!([{ "path": path }]))
         }
@@ -923,32 +987,87 @@ mod tests {
     }
 
     #[test]
-    fn a_standalone_node_falls_back_to_the_nodes_list() {
+    fn a_confirmed_standalone_node_falls_back_to_the_nodes_list() {
         let dest = scratch("standalone");
-        let api = fake(vec!["cluster/config/nodes"], vec![]);
+        let mut api = fake(vec!["cluster/config/nodes", "cluster/config/totem"], vec![]);
+        api.clustered = false;
         let out = rt()
             .block_on(capture(&api, &Scope::Cluster, &dest, None))
             .unwrap();
         assert!(dest.join("api/nodes.json").exists());
         assert!(!dest.join("api/cluster-nodes.json").exists());
         let skipped = std::fs::read_to_string(dest.join("api").join(SKIPPED)).unwrap();
+        assert!(skipped.contains("standalone node"), "{skipped}");
         assert!(
-            skipped.contains("nodes stands in as membership"),
+            skipped.contains("cluster/config/totem: absent on a standalone node"),
             "{skipped}"
         );
         assert_eq!(out["partial"], false);
+        assert!(!out["note"].as_str().unwrap().starts_with("PARTIAL"));
         std::fs::remove_dir_all(&dest).unwrap();
 
         let dest = scratch("standalone-dead");
-        let api = fake(vec!["cluster/config/nodes", "nodes"], vec![]);
+        let mut api = fake(vec!["cluster/config/nodes", "nodes"], vec![]);
+        api.clustered = false;
         let err = rt()
             .block_on(capture(&api, &Scope::Cluster, &dest, None))
             .unwrap_err();
+        assert!(err.to_string().contains("standalone fallback"), "{err}");
+        std::fs::remove_dir_all(&dest).unwrap();
+    }
+
+    #[test]
+    fn a_membership_error_on_a_cluster_stays_a_core_failure() {
+        let dest = scratch("clustered-403");
+        let api = fake(vec!["cluster/config/nodes"], vec![]);
+        let err = rt()
+            .block_on(capture(&api, &Scope::Cluster, &dest, None))
+            .unwrap_err();
+        assert!(err.to_string().contains("core read failed"), "{err}");
+        assert!(!api.calls.lock().unwrap().contains(&"nodes".to_string()));
+        std::fs::remove_dir_all(&dest).unwrap();
+    }
+
+    #[test]
+    fn empty_users_is_partial_and_named_in_the_note() {
+        let dest = scratch("nousers");
+        let api = fake(vec![], vec!["access/users"]);
+        let out = rt()
+            .block_on(capture(&api, &Scope::Cluster, &dest, None))
+            .unwrap();
+        assert_eq!(out["partial"], true);
         assert!(
-            err.to_string().contains("core read failed") && err.to_string().contains("fallback"),
-            "{err}"
+            out["note"]
+                .as_str()
+                .unwrap()
+                .starts_with("PARTIAL: 1 warnings; "),
+            "{out}"
         );
         std::fs::remove_dir_all(&dest).unwrap();
+    }
+
+    #[test]
+    fn instances_emit_a_cluster_slot_keyed_on_the_cluster_name() {
+        let nodes = json!([{"node": "thor"}, {"node": "odin"}]);
+        let clustered =
+            json!([{"type": "cluster", "name": "asgard"}, {"type": "node", "name": "thor"}]);
+        assert_eq!(
+            slots("pve", &clustered, &nodes),
+            ["cluster:asgard", "thor", "odin"]
+        );
+        let standalone = json!([{"type": "node", "name": "thor"}]);
+        assert_eq!(
+            slots("pve", &standalone, &json!([{"node": "thor"}])),
+            ["cluster:pve", "thor"]
+        );
+    }
+
+    #[test]
+    #[ignore = "core utils::scrub::scrub_url will scrub path and fragment secrets; swap scrub_url to it"]
+    fn slack_webhook_path_secret_is_scrubbed() {
+        let mut v = json!([{"url": "https://hooks.slack.com/services/T000/B000/XXXXSECRET"}]);
+        scrub_json(&mut v);
+        assert!(!v.to_string().contains("XXXXSECRET"), "{v}");
     }
 
     #[test]

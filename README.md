@@ -88,7 +88,7 @@ The plugin authenticates with a PVE API token. [docs/tokens.md](docs/tokens.md) 
 
 ## Backups
 
-The `pve-node-state` kind has one slot per node (node-scoped API reads, plus root-only host files when orca's privileged seam is granted and the node is this host) and one `cluster:<endpoint>` slot for cluster-scoped reads. The cluster slot captures `access/users` once, which includes user PII (emails, names, comments) but no secrets: tokens are not listed. ACLs are not capturable with the runtime token and are listed in `api/SKIPPED`. On a node that is not clustered, `GET /nodes` stands in for `/cluster/config/nodes`.
+The `pve-node-state` kind has one slot per node (node-scoped API reads, plus root-only host files when orca's privileged seam is granted and the node is this host) and one `cluster:<name>` slot for cluster-scoped reads, keyed on the cluster name from `/cluster/status` (the endpoint name on a standalone node). The cluster slot captures `access/users` once, which includes user PII (emails, names, comments) but no secrets: tokens are not listed. ACLs are not capturable with the runtime token and are listed in `api/SKIPPED`. When `/cluster/status` confirms a standalone node, `GET /nodes` stands in for `/cluster/config/nodes` and the absent totem is recorded in `api/SKIPPED`; on a cluster, a failed membership read fails the slot. Until orca core reads the `partial` field, a partial result's `note` starts with `PARTIAL: <n> warnings`.
 
 ## Layout
 
