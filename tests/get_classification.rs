@@ -3,10 +3,6 @@ use std::collections::{BTreeMap, BTreeSet};
 #[path = "../build/ungate.rs"]
 mod ungate;
 
-fn surface() -> String {
-    std::fs::read_to_string(concat!(env!("OUT_DIR"), "/proxmox_surface.rs"))
-        .expect("generated surface")
-}
 const ALLOWLIST: &str = include_str!("../specs/read_allowlist.txt");
 const GATED: &str = include_str!("../specs/gated_gets.txt");
 const SURFACED_GETS: usize = 230;
@@ -83,8 +79,7 @@ const DENIED: &[&str] = &[
 
 fn surfaced_gets() -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    let surface = surface();
-    let mut lines = surface.lines();
+    let mut lines = proxmox::SURFACE_SOURCE.lines();
     while let Some(line) = lines.next() {
         if let Some(path) = line
             .strip_prefix("/// Auto-generated from `GET ")
