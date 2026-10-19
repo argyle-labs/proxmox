@@ -59,5 +59,10 @@ fn main() {
         out.rewritten, out.gets,
         "every surfaced GET must be classified"
     );
+    std::fs::write(
+        out_dir.join("proxmox_surface_source.rs"),
+        format!("{:?}", out.source),
+    )
+    .expect("write proxmox surface source");
     std::fs::write(&surface, out.source).expect("write proxmox surface");
 }
