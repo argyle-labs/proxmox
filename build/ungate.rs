@@ -32,12 +32,21 @@ pub fn classify_gets(src: &str, allow: &BTreeSet<String>, gated: &BTreeSet<Strin
                 let attrs = line
                     .strip_suffix(")]")
                     .unwrap_or_else(|| panic!("multi-line orca_tool attribute: {line}"));
-                for key in ["role", "execute_gated", "data_mutation"] {
+                for key in ["execute_gated", "data_mutation"] {
                     assert!(
                         !attrs.contains(&format!("{key} =")),
                         "GET {path} already sets {key}: {line}"
                     );
                 }
+                let spec_admin = attrs.contains("role = \"admin\"");
+                assert!(
+                    spec_admin || !attrs.contains("role ="),
+                    "GET {path} already sets role other than admin: {line}"
+                );
+                assert!(
+                    !(spec_admin && allow.contains(path)),
+                    "GET {path} is x-orca-admin in the spec and read-allowlisted"
+                );
                 unused.remove(path);
                 let (role, execute_gated) = if allow.contains(path) {
                     ("read", false)
@@ -46,8 +55,11 @@ pub fn classify_gets(src: &str, allow: &BTreeSet<String>, gated: &BTreeSet<Strin
                 };
                 rewritten += 1;
                 source.push_str(attrs);
+                if !spec_admin {
+                    source.push_str(&format!(", role = \"{role}\""));
+                }
                 source.push_str(&format!(
-                    ", role = \"{role}\", execute_gated = {execute_gated}, data_mutation = false)]\n"
+                    ", execute_gated = {execute_gated}, data_mutation = false)]\n"
                 ));
                 continue;
             }
@@ -63,4 +75,22 @@ pub fn classify_gets(src: &str, allow: &BTreeSet<String>, gated: &BTreeSet<Strin
         gets,
         rewritten,
     }
+}
+
+pub fn check_unused(
+    unused: &BTreeSet<String>,
+    gated: &BTreeSet<String>,
+    no_tool: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for path in unused {
+        assert!(
+            gated.contains(path) && no_tool.contains(path),
+            "read_allowlist.txt / gated_gets.txt name a path with no surfaced GET: {path}"
+        );
+        warnings.push(format!(
+            "gated GET {path} has no tool (x-orca-no-tool); gate kept"
+        ));
+    }
+    warnings
 }

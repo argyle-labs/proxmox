@@ -1049,9 +1049,10 @@ impl PveIo {
 /// A client carrying a fresh `root@pam` ticket and its CSRF token.
 pub(crate) async fn root_client(endpoint: &str, cfg: &Config) -> Result<reqwest::Client, String> {
     refuse_insecure_root(endpoint, cfg.insecure)?;
-    let name = root_password_secret(endpoint);
-    let stored =
-        plugin_toolkit::secrets::get(&name).map_err(|e| format!("read secret '{name}': {e:#}"))?;
+    let name = root_password_secret(endpoint)?;
+    let stored = plugin_toolkit::secrets::get(&name)
+        .map_err(|e| format!("read secret '{name}': {e:#}"))?
+        .map(|s| s.expose_secret().clone());
     let password = require_root_password(endpoint, stored)?;
     let anon = plugin_toolkit::api_client::ApiClientBuilder::new()
         .build()
@@ -1393,8 +1394,10 @@ fn root_session(
 }
 
 /// The orca secret holding the `root@pam` password for `endpoint`.
-pub(crate) fn root_password_secret(endpoint: &str) -> String {
+pub(crate) fn root_password_secret(endpoint: &str) -> Result<String, String> {
     plugin_toolkit::secrets::scoped_name(PROVIDER, endpoint, "root_password")
+        .map(|r| r.to_string())
+        .map_err(|e| format!("{e:#}"))
 }
 
 fn require_root_password(endpoint: &str, stored: Option<String>) -> Result<String, String> {
@@ -1402,7 +1405,7 @@ fn require_root_password(endpoint: &str, stored: Option<String>) -> Result<Strin
         format!(
             "bind mount points need a {ROOT_USER} ticket: PVE refuses bind mpN to API tokens. \
              Store the {ROOT_USER} password for endpoint '{endpoint}' as the orca secret '{}'.",
-            root_password_secret(endpoint)
+            root_password_secret(endpoint).unwrap_or_else(|e| e)
         )
     })
 }

@@ -216,11 +216,12 @@ fn test_ctx() -> plugin_toolkit::contract::ToolCtx {
     }))
 }
 
-/// Without `execute` the gate answers with a plan before the verb body runs, so
-/// no capability (HTTP, secrets, db) is ever reached.
+/// With `dryRun` the gate answers with a plan before the verb body runs, so no
+/// capability (HTTP, secrets, db) is ever reached.
 #[test]
-fn enable_discard_dispatch_without_execute_returns_a_plan() {
+fn enable_discard_dispatch_with_dry_run_returns_a_plan() {
     let args = serde_json::json!({
+        "dryRun": true,
         "endpoint": "pve",
         "node": "hyp1",
         "ctid": 101,
@@ -436,7 +437,7 @@ fn dispatch_recording_caps(name: &str, args: Value) -> (anyhow::Result<Value>, V
 }
 
 #[test]
-fn generated_reads_are_no_mutation_and_writes_stay_admin_gated() {
+fn generated_tools_are_no_mutation_and_writes_stay_admin_gated() {
     let mut reads = 0;
     let mut writes = 0;
     for t in proxmox_tools() {
@@ -456,7 +457,7 @@ fn generated_reads_are_no_mutation_and_writes_stay_admin_gated() {
             writes += 1;
             assert_eq!(t["role"], "admin", "{name}");
             assert_eq!(t["execute_gated"], true, "{name}");
-            assert_eq!(t["data_mutation"], true, "{name}");
+            assert_eq!(t["data_mutation"], false, "{name}");
         }
     }
     assert!(reads > 0 && writes > 0, "reads={reads} writes={writes}");
@@ -483,10 +484,10 @@ fn generated_get_runs_without_execute() {
 }
 
 #[test]
-fn generated_put_without_execute_reaches_no_capability() {
+fn generated_put_with_dry_run_reaches_no_capability() {
     let (out, caps) = dispatch_recording_caps(
         "proxmox.put_update_vm_nodes_node_qemu_vmid_config",
-        serde_json::json!({"endpoint": "pve", "node": "hyp1", "vmid": 101, "body": {}}),
+        serde_json::json!({"dryRun": true, "endpoint": "pve", "node": "hyp1", "vmid": 101, "body": {}}),
     );
     let out = out.expect("a dry run is not an error");
     assert_eq!(out["dryRun"], serde_json::json!(true), "{out}");

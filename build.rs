@@ -50,11 +50,20 @@ fn main() {
         &allow,
         &gated,
     );
-    assert!(
-        out.unused.is_empty(),
-        "read_allowlist.txt / gated_gets.txt name paths with no surfaced GET: {:?}",
-        out.unused
-    );
+    let spec: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(specs_dir.join("proxmox.openapi.json")).expect("read spec"),
+    )
+    .expect("parse spec");
+    let no_tool = spec["paths"]
+        .as_object()
+        .expect("spec paths")
+        .iter()
+        .filter(|(_, ops)| ops["get"]["x-orca-no-tool"] == true)
+        .map(|(path, _)| path.clone())
+        .collect();
+    for warning in ungate::check_unused(&out.unused, &gated, &no_tool) {
+        println!("cargo:warning={warning}");
+    }
     assert_eq!(
         out.rewritten, out.gets,
         "every surfaced GET must be classified"
