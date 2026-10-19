@@ -186,8 +186,8 @@ where
 /// plaintext column value only if the domain has none. Once
 /// `proxmox.access_bootstrap` has run, the column is empty and the secret lives
 /// only in the secrets domain ([[runtime-least-privilege-not-root]]).
-pub(crate) fn token_secret_name(endpoint: &str) -> String {
-    plugin_toolkit::secrets::scoped_name("proxmox", endpoint, "token_secret")
+pub(crate) fn token_secret_name(endpoint: &str) -> Result<String> {
+    plugin_toolkit::secrets::scoped_name("proxmox", endpoint, "token_secret").map(|r| r.to_string())
 }
 
 /// Names of every **enabled** endpoint, for callers (e.g. the backup KINDs) that
@@ -208,12 +208,12 @@ pub(crate) fn enabled_endpoint_names() -> Vec<String> {
 }
 
 fn resolve_token_secret(name: &str, row: &ProxmoxEndpoint) -> Result<String> {
-    plugin_toolkit::secrets::resolve_scoped(
-        "proxmox",
-        name,
-        "token_secret",
-        (!row.token_secret.is_empty()).then_some(row.token_secret.as_str()),
-    )
+    let secret_name = token_secret_name(name)?;
+    match plugin_toolkit::secrets::get(&secret_name)? {
+        Some(s) => Ok(s.expose_secret().clone()),
+        None if !row.token_secret.is_empty() => Ok(row.token_secret.clone()),
+        None => Err(anyhow::anyhow!("no secret named '{secret_name}'")),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

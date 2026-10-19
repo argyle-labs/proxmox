@@ -5,7 +5,12 @@ mod ungate;
 
 const ALLOWLIST: &str = include_str!("../specs/read_allowlist.txt");
 const GATED: &str = include_str!("../specs/gated_gets.txt");
-const SURFACED_GETS: usize = 230;
+const SURFACED_GETS: usize = 228;
+
+const NO_TOOL_GETS: &[&str] = &[
+    "/nodes/{node}/qemu/{vmid}/agent/exec-status",
+    "/nodes/{node}/storage/{storage}/file-restore/download",
+];
 
 const GATED_GETS: usize = 30;
 
@@ -118,6 +123,10 @@ fn action_gets_are_pinned_admin_and_gated() {
     }
     let gets = surfaced_gets();
     for path in &gated {
+        if NO_TOOL_GETS.contains(&path.as_str()) {
+            assert!(!gets.contains_key(path), "{path} is surfaced");
+            continue;
+        }
         let attr = &gets[path];
         assert_eq!(role_of(attr), "admin", "{path}");
         assert!(attr.contains("execute_gated = true"), "{path}: {attr}");
@@ -143,6 +152,10 @@ fn sensitive_gets_are_pinned_admin() {
     let gets = surfaced_gets();
     for path in DENIED {
         assert!(!allow.contains(*path), "{path} is allowlisted");
+        if NO_TOOL_GETS.contains(path) {
+            assert!(!gets.contains_key(*path), "{path} is surfaced");
+            continue;
+        }
         let attr = gets
             .get(*path)
             .unwrap_or_else(|| panic!("{path} not surfaced"));
@@ -217,6 +230,28 @@ fn rewrite_refuses_a_get_that_already_sets_a_role() {
 }
 
 #[test]
+fn rewrite_keeps_a_spec_admin_get_and_applies_its_gate() {
+    let src = "/// Auto-generated from `GET /tfa`.\n#[orca_tool(verb = \"t\", role = \"admin\")]\n";
+    let out = ungate::classify_gets(src, &BTreeSet::new(), &allow(&["/tfa"]));
+    assert_eq!(
+        out.source,
+        "/// Auto-generated from `GET /tfa`.\n\
+         #[orca_tool(verb = \"t\", role = \"admin\", execute_gated = true, data_mutation = false)]\n"
+    );
+    assert_eq!((out.gets, out.rewritten), (1, 1));
+}
+
+#[test]
+#[should_panic(expected = "x-orca-admin in the spec and read-allowlisted")]
+fn rewrite_refuses_to_allowlist_a_spec_admin_get() {
+    ungate::classify_gets(
+        "/// Auto-generated from `GET /tfa`.\n#[orca_tool(verb = \"t\", role = \"admin\")]\n",
+        &allow(&["/tfa"]),
+        &BTreeSet::new(),
+    );
+}
+
+#[test]
 fn rewrite_gates_listed_action_gets_and_reports_unmatched_entries() {
     let src = "/// Auto-generated from `GET /scan`.\n#[orca_tool(verb = \"s\")]\n";
     let out = ungate::classify_gets(src, &BTreeSet::new(), &allow(&["/scan", "/gone"]));
@@ -225,6 +260,34 @@ fn rewrite_gates_listed_action_gets_and_reports_unmatched_entries() {
             .contains("role = \"admin\", execute_gated = true")
     );
     assert_eq!(out.unused, allow(&["/gone"]));
+}
+
+#[test]
+fn gated_get_marked_no_tool_warns_and_keeps_its_gate() {
+    let out = ungate::classify_gets("", &BTreeSet::new(), &allow(&["/dl"]));
+    let warnings = ungate::check_unused(&out.unused, &allow(&["/dl"]), &allow(&["/dl"]));
+    assert_eq!(
+        warnings,
+        ["gated GET /dl has no tool (x-orca-no-tool); gate kept"]
+    );
+}
+
+#[test]
+#[should_panic(expected = "no surfaced GET: /dl")]
+fn gated_get_missing_without_no_tool_marker_panics() {
+    let out = ungate::classify_gets("", &BTreeSet::new(), &allow(&["/dl"]));
+    ungate::check_unused(&out.unused, &allow(&["/dl"]), &BTreeSet::new());
+}
+
+#[test]
+fn gated_get_with_a_tool_is_gated_despite_no_tool_marker() {
+    let src = "/// Auto-generated from `GET /dl`.\n#[orca_tool(verb = \"d\")]\n";
+    let out = ungate::classify_gets(src, &BTreeSet::new(), &allow(&["/dl"]));
+    assert!(
+        out.source
+            .contains("role = \"admin\", execute_gated = true")
+    );
+    assert!(ungate::check_unused(&out.unused, &allow(&["/dl"]), &allow(&["/dl"])).is_empty());
 }
 
 #[test]

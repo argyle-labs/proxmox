@@ -279,7 +279,7 @@ async fn proxmox_access_bootstrap(
 
     // The one-time secret goes straight to the secrets domain — never a
     // plaintext endpoint column.
-    let secret_ref = token_secret_name(&args.endpoint);
+    let secret_ref = token_secret_name(&args.endpoint)?;
     plugin_toolkit::secrets::set(
         &secret_ref,
         &secret,
