@@ -66,6 +66,9 @@ pub mod surface {
     include!(concat!(env!("OUT_DIR"), "/proxmox_surface.rs"));
 }
 
+#[doc(hidden)]
+pub const SURFACE_SOURCE: &str = include!(concat!(env!("OUT_DIR"), "/proxmox_surface_source.rs"));
+
 /// How Proxmox VE wraps every response body: `{"data": <payload>}`.
 ///
 /// The vendored OpenAPI spec describes only the inner `<payload>`, so the

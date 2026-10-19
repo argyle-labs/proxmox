@@ -1,0 +1,35 @@
+# Admin GETs that act rather than read: they stay execute-gated, so they need
+# confirmation after a warning. The node fetches or scans for the caller,
+# opens a console or tunnel, returns guest/backup file contents, or returns
+# credentials or join material (ACME DNS plugins, notification endpoints,
+# metric servers, subscription key, cluster join info).
+/nodes/{node}/query-url-metadata
+/nodes/{node}/query-oci-repo-tags
+/nodes/{node}/scan
+/nodes/{node}/scan/cifs
+/nodes/{node}/scan/nfs
+/nodes/{node}/scan/iscsi
+/nodes/{node}/scan/lvm
+/nodes/{node}/scan/lvmthin
+/nodes/{node}/scan/zfs
+/nodes/{node}/vncwebsocket
+/nodes/{node}/qemu/{vmid}/vncwebsocket
+/nodes/{node}/lxc/{vmid}/vncwebsocket
+/nodes/{node}/qemu/{vmid}/mtunnelwebsocket
+/nodes/{node}/lxc/{vmid}/mtunnelwebsocket
+/nodes/{node}/qemu/{vmid}/agent/file-read
+/nodes/{node}/qemu/{vmid}/agent/exec-status
+/nodes/{node}/storage/{storage}/file-restore/download
+/nodes/{node}/storage/{storage}/file-restore/list
+/cluster/acme/plugins
+/cluster/acme/plugins/{id}
+/cluster/notifications/endpoints/smtp
+/cluster/notifications/endpoints/smtp/{name}
+/cluster/notifications/endpoints/gotify
+/cluster/notifications/endpoints/gotify/{name}
+/cluster/notifications/endpoints/webhook
+/cluster/notifications/endpoints/webhook/{name}
+/cluster/metrics/server
+/nodes/{node}/subscription
+/cluster/config/join
+/nodes/{node}/apt/changelog

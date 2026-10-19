@@ -4,13 +4,14 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
-# Pre-push is intentionally fmt-only (fast). The heavy gates — clippy (-D warnings)
-# and the full test suite — run on Gitea Actions on every PR
-# (.github/workflows/ci.yml via the reusable plugin-ci pipeline), which is the
-# source of truth. Running them again locally on every push was slow, redundant,
-# and — because the committed dev-patch .cargo/config.toml points at a sibling
-# ../orca checkout that need not exist — could not even resolve deps offline.
+echo "==> build"
+cargo build --all-targets -j 2
+
+echo "==> test"
+cargo test -j 2
+
+echo "==> clippy"
+cargo clippy --all-targets -j 2 -- -D warnings
+
 echo "==> rustfmt"
 cargo fmt --all -- --check
-
-echo "pre-push fmt check passed (clippy/tests run in Gitea CI)."

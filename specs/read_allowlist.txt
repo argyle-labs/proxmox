@@ -1,0 +1,21 @@
+# GET paths surfaced as role=read. Every other GET surfaces as role=admin.
+# Only inventory/status listings: nothing that reads files, configs, logs,
+# access data, consoles, or makes the node fetch or scan. Snapshot lists and
+# storage content listings carry free-text description/notes, so they are admin.
+/version
+/nodes
+/nodes/{node}/status
+/nodes/{node}/version
+/nodes/{node}/time
+/nodes/{node}/tasks/{upid}/status
+/nodes/{node}/disks/lvmthin
+/cluster/status
+/cluster/resources
+/cluster/nextid
+/cluster/ha/status/current
+/nodes/{node}/qemu
+/nodes/{node}/lxc
+/nodes/{node}/qemu/{vmid}/status/current
+/nodes/{node}/lxc/{vmid}/status/current
+/nodes/{node}/storage
+/nodes/{node}/storage/{storage}/status

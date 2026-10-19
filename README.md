@@ -86,6 +86,14 @@ Under the hood the plugin also contributes three **domain backends** over the pl
 
 The plugin authenticates with a PVE API token. [docs/tokens.md](docs/tokens.md) covers both paths: generate one **by hand** (network-first / remote), or have the plugin **self-provision** a least-privilege token via `proxmox.access_bootstrap`. The secret is held in orca's secrets domain and never written in plaintext.
 
+### Generated API verbs and permissions
+
+Every PVE API operation is also surfaced as a generated `proxmox.<method>_<op>` verb. Writes are *role: admin* and dry-run unless `execute: true`. GETs run without `execute`, except the action-like GETs in [specs/gated_gets.txt](specs/gated_gets.txt) (node-side fetches and scans, consoles and tunnels, guest and backup file contents, credential and cluster-join reads), which are dry-run unless `execute: true`. Only the GET paths in [specs/read_allowlist.txt](specs/read_allowlist.txt) (inventory and status listings) are *role: read*; every other GET — guest configs, snapshot and storage content listings, file reads, logs, consoles, `/access`, scans, notification and ACME settings — is *role: admin*.
+
+PVE permissions are not applied per orca caller: every verb runs as the endpoint's single token, so the orca role is the only per-caller check. Follow-up:
+
+- [ ] Run the read-role surface under a separate `PVEAuditor` token so a read-role caller is also limited on the PVE side.
+
 ## Backups
 
 The `pve-node-state` kind has one slot per node (node-scoped API reads, plus root-only host files when orca's privileged seam is granted and the node is this host) and one `cluster:<name>` slot for cluster-scoped reads, keyed on the cluster name from `/cluster/status` (`endpoint/<endpoint>` on a standalone node, which needs `/cluster/status` to list exactly the one node `/nodes` lists). Slot ids recorded under the older `cluster:<endpoint>` form are orphaned by this key change. The cluster slot captures `access/users` once, which includes user PII (emails, names, comments) but no secrets: tokens are not listed. ACLs are not capturable with the runtime token and are listed in `api/SKIPPED`. When `/cluster/status` confirms a standalone node, `GET /nodes` stands in for `/cluster/config/nodes` and the absent totem is recorded in `api/SKIPPED`; on a cluster, a failed membership read fails the slot. Until orca core reads the `partial` field, a partial result's `note` starts with `PARTIAL: <n> warnings`.

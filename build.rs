@@ -4,6 +4,9 @@
 //! node (Proxmox ships `apidoc.js`, not OpenAPI):
 //!   cargo run --example pve_to_openapi -- apidoc.js > specs/proxmox.openapi.json
 
+#[path = "build/ungate.rs"]
+mod ungate;
+
 fn main() {
     let specs_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("specs");
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
@@ -27,8 +30,39 @@ fn main() {
     )
     .expect("proxmox openapi codegen");
 
-    // Writes surface as `role = "admin"`; `x-orca-*` spec markers adjust per
-    // operation (see `plugin_toolkit_build::surface`).
     plugin_toolkit_build::surface::openapi::generate(&specs_dir, &out_dir, "proxmox")
         .expect("proxmox surface codegen");
+
+    let allowlist_path = specs_dir.join("read_allowlist.txt");
+    println!("cargo:rerun-if-changed={}", allowlist_path.display());
+    println!("cargo:rerun-if-changed=build/ungate.rs");
+    let gated_path = specs_dir.join("gated_gets.txt");
+    println!("cargo:rerun-if-changed={}", gated_path.display());
+    let allow = ungate::parse_allowlist(
+        &std::fs::read_to_string(&allowlist_path).expect("read read_allowlist.txt"),
+    );
+    let gated = ungate::parse_allowlist(
+        &std::fs::read_to_string(&gated_path).expect("read gated_gets.txt"),
+    );
+    let surface = out_dir.join("proxmox_surface.rs");
+    let out = ungate::classify_gets(
+        &std::fs::read_to_string(&surface).expect("read proxmox surface"),
+        &allow,
+        &gated,
+    );
+    assert!(
+        out.unused.is_empty(),
+        "read_allowlist.txt / gated_gets.txt name paths with no surfaced GET: {:?}",
+        out.unused
+    );
+    assert_eq!(
+        out.rewritten, out.gets,
+        "every surfaced GET must be classified"
+    );
+    std::fs::write(
+        out_dir.join("proxmox_surface_source.rs"),
+        format!("{:?}", out.source),
+    )
+    .expect("write proxmox surface source");
+    std::fs::write(&surface, out.source).expect("write proxmox surface");
 }
