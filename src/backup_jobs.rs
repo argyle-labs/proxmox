@@ -869,13 +869,11 @@ pub fn render_pxarexclude(patterns: &[String]) -> Result<String> {
 pub async fn pxarexclude(
     io: &dyn GuestIo,
     ct: &lxc_guest::CtRef,
-    local_node: &str,
     args: &PxarExcludeArgs,
     caller: Option<&CallerIdentity>,
 ) -> Result<Change<PxarExcludeApplied>> {
     const TOOL: &str = "proxmox.guest.pxarexclude";
     let want = render_pxarexclude(&args.patterns)?;
-    lxc_guest::require_local(ct, local_node)?;
     let vmid = ct.vmid as u32;
     let current = lxc_guest::read_file(io, vmid, PXAREXCLUDE).await?;
     let changed = current.as_deref().map(str::trim) != Some(want.trim());
@@ -915,8 +913,7 @@ pub async fn pxarexclude(
 
 /// [MUTATES STATE] Replace a container's `/.pxarexclude`, the file-level
 /// exclude list vzdump's pxar archiver honours (e.g. `/data` to keep bulk data
-/// out of the container backup). LXC only; the container must run on this
-/// plugin's node. Without `execute` returns the diff.
+/// out of the container backup). Unsupported: needs in-guest orca member.
 #[orca_tool(
     domain = "proxmox",
     verb = "guest.pxarexclude",
@@ -929,19 +926,12 @@ async fn proxmox_guest_pxarexclude(
     ctx: &ToolCtx,
 ) -> Result<Change<PxarExcludeApplied>> {
     execute::require_admin("proxmox.guest.pxarexclude", ctx.caller().as_ref())?;
+    lxc_guest::unsupported(args.ctid)?;
     let client = resolve_config(&args.endpoint)
         .await?
         .build_generated_client()?;
     let ct = lxc_guest::find_ct(&client, args.ctid).await?;
-    lxc_guest::ensure_local(&ct)?;
-    pxarexclude(
-        &lxc_guest::SeamIo,
-        &ct,
-        &crate::diagnostics::local_node(),
-        &args,
-        ctx.caller().as_ref(),
-    )
-    .await
+    pxarexclude(&lxc_guest::SeamIo, &ct, &args, ctx.caller().as_ref()).await
 }
 
 // ── schedules ───────────────────────────────────────────────────────────────
@@ -1926,9 +1916,7 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        let plan = rt
-            .block_on(pxarexclude(&io, &ct, "hyp1", &args, None))
-            .unwrap();
+        let plan = rt.block_on(pxarexclude(&io, &ct, &args, None)).unwrap();
         let Change::Plan(p) = plan else { panic!() };
         assert_eq!(p.changes[0].action, "create");
         assert_eq!(p.changes[0].detail.as_deref(), Some("+/data"));
@@ -1939,7 +1927,7 @@ mod tests {
             ..args
         };
         let out = rt
-            .block_on(pxarexclude(&io, &ct, "hyp1", &exec, Some(&admin())))
+            .block_on(pxarexclude(&io, &ct, &exec, Some(&admin())))
             .unwrap();
         assert!(matches!(out, Change::Applied(a) if a.changed));
         assert_eq!(
@@ -1953,34 +1941,9 @@ mod tests {
 
         let same = FakeIo::with(&[("head -c 65536 -- /.pxarexclude", fake::ok("/data"))]);
         let out = rt
-            .block_on(pxarexclude(&same, &ct, "hyp1", &exec, Some(&admin())))
+            .block_on(pxarexclude(&same, &ct, &exec, Some(&admin())))
             .unwrap();
         assert!(matches!(out, Change::Applied(a) if !a.changed));
         assert!(same.writes.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn pxarexclude_refuses_a_container_on_another_node() {
-        let ct = lxc_guest::CtRef {
-            node: "hyp2".into(),
-            vmid: 116,
-            name: None,
-            running: true,
-        };
-        let args = PxarExcludeArgs {
-            endpoint: "pve".into(),
-            ctid: 116,
-            patterns: vec!["/data".into()],
-            execute: false,
-        };
-        let io = FakeIo::default();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let err = rt
-            .block_on(pxarexclude(&io, &ct, "hyp1", &args, None))
-            .unwrap_err();
-        assert!(err.to_string().contains("runs on node 'hyp2'"));
-        assert!(io.execs.lock().unwrap().is_empty());
     }
 }

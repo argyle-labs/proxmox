@@ -862,9 +862,7 @@ impl ProxmoxUnitProvider {
             )?)
         } else {
             crate::execute::authorize_execute(TOOL, args.caller.as_ref())?;
-            let client = crate::tools::make_client(&endpoint).await?;
-            let ct = crate::lxc_guest::find_ct(&client, ctid).await?;
-            crate::lxc_guest::ensure_local(&ct)?;
+            crate::lxc_guest::unsupported(ctid)?;
             Change::Applied(
                 crate::guest_standard::run_update(
                     &crate::lxc_guest::SeamIo,

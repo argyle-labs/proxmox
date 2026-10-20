@@ -45,14 +45,14 @@ Every VM and LXC across every enabled endpoint is a **unit** (`kind = vm` or `lx
 | verb | action(s) | what it does |
 | --- | --- | --- |
 | `list` | — | enumerate guests across the cluster (`/cluster/resources`) |
-| `detail` | — | inspect one guest (typed, proxmox-rich payload); held to the resource floor; in-guest probes are unsupported until an in-guest orca member exists |
+| `detail` | — | inspect one guest (typed, proxmox-rich payload); held to the resource floor |
 | `update` | `start` | start the guest |
 | `update` | `stop` | hard-stop the guest |
 | `update` | `shutdown` | ACPI shutdown |
 | `update` | `reboot` | reboot the guest |
 | `update` | `backup` | vzdump the guest to backup storage, waited on; returns a `BackupRef` |
 | `update` | `restore` | restore the guest in place from a `BackupRef` |
-| `update` | `update` | LXC only: unsupported on execute (needs in-guest orca member); a plan unless the payload sets `"execute": true` (see [docs/guest-standard.md](docs/guest-standard.md)) |
+| `update` | `update` | LXC only: returns the backup-then-update plan; with `"execute": true` in the payload it is unsupported (needs in-guest orca member) (see [docs/guest-standard.md](docs/guest-standard.md)) |
 | `create` | `provision` | provision a new VM/LXC (needs a typed payload; LXC needs `ostemplate`) |
 | `delete` | — | destroy the guest |
 
@@ -72,10 +72,11 @@ Every VM and LXC across every enabled endpoint is a **unit** (`kind = vm` or `lx
 | `proxmox.backup_job.list` | scheduled vzdump jobs (`/cluster/backup`): schedule, storage, guest selection, mode, compress, notes template, retention |
 | `proxmox.backup_job.upsert` | create or update a vzdump job; `prune_backups` defaults to `keep-last=10` *(role: admin; returns the diff against the current job unless `execute: true`)* |
 | `proxmox.backup_job.delete` | delete a vzdump job *(role: admin; dry-run unless `execute: true`)* |
-| `proxmox.guest.pxarexclude` | replace an LXC's `/.pxarexclude`; unsupported on execute: needs in-guest orca member *(role: admin; dry-run unless `execute: true`)* |
-| `proxmox.guest.standard.audit` | an LXC's guest standard: OS, root console autologin, the orca `update` gate, the app's own updater, and a leftover forced-command backup key ([docs/guest-standard.md](docs/guest-standard.md)) |
-| `proxmox.guest.standard.apply` | install root console autologin and the `update` gate in an LXC; idempotent *(role: admin; dry-run unless `execute: true`)* |
-| `proxmox.guest.update` | back an LXC up through the PVE API, then run its updater *(role: admin; dry-run unless `execute: true`)* |
+| `proxmox.guest.pxarexclude` | replace an LXC's `/.pxarexclude`. Unsupported: needs in-guest orca member *(role: admin)* |
+| `proxmox.guest.standard.audit` | an LXC's guest standard: OS, root console autologin, the orca `update` gate, the app's own updater, and a leftover forced-command backup key. Unsupported: needs in-guest orca member ([docs/guest-standard.md](docs/guest-standard.md)) |
+| `proxmox.guest.standard.apply` | install root console autologin and the `update` gate in an LXC. Unsupported: needs in-guest orca member *(role: admin)* |
+| `proxmox.guest.update` | back an LXC up through the PVE API, then run its updater. Unsupported: needs in-guest orca member *(role: admin)* |
+| `proxmox.guest.file_pull` | copy a file out of a guest. Unsupported for LXC (needs in-guest orca member); refused for VMs *(role: admin)* |
 | `proxmox.lxc_data.plan` | per LXC on this node: its mounts, the app's data paths (per-app table), where each lives (rootfs / volume / bind) and how it is backed up (vzdump / `lxc-bind` host capture / uncovered) |
 
 > `proxmox.action` overlaps with the unit `update` verb — both power-manage a guest. Use the unit surface for orca-managed fleet lifecycle; `proxmox.action` is the direct tool form.

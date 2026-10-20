@@ -1,7 +1,7 @@
 //! Guest standard for LXC containers: a root console that logs in without a
 //! password, and a one-word `update` that only runs after an orca backup.
 //!
-//! * [`probe`] reads the facts through allowlisted `stat`/`head`/`ls`/`systemctl show`,
+//! * [`probe`] reads the facts through `stat`/`head`/`ls`/`systemctl show`,
 //!   feeding `UnitFacts::has_root_console` / `has_update_command`.
 //! * `proxmox.guest.standard.audit` (read) reports them per container, checked
 //!   against [`standard_guard`].
@@ -12,17 +12,15 @@
 //!   `update` (dry-run unless its payload sets `execute`) take a vzdump backup
 //!   through the PVE API, record it in the container, then run the updater.
 //!
+//! The PVE REST API cannot exec in an LXC, so every in-container step is
+//! unsupported until an in-guest orca member serves it.
+//!
 //! The `update` gate replaces the hand-rolled forced-command ssh key
 //! ([`LEGACY_BACKUP_KEY`] → the host's `orca-guest-backup`): orca takes the
 //! backup through the PVE API, so the guest holds no credential to its host.
 //! The probe reports a leftover key so it can be retired. The gate is a safety
 //! interlock against updating without a restore point, not a security control:
 //! root in the container can always run the updater directly.
-//!
-//! Every in-container command goes through orca's lxc-exec allowlist. A step
-//! outside it ([`lxc_guest::PROPOSED_ALLOWLIST`]) is named in the plan as
-//! `needs allowlist: X` and refused before anything runs, except the Alpine
-//! inittab reload, which is deferred to the container's next start.
 
 use std::time::Duration;
 
@@ -31,7 +29,7 @@ use plugin_toolkit::contract::{BackupRef, BoxFuture, CallerIdentity, UnitFacts, 
 use plugin_toolkit::prelude::*;
 
 use crate::execute::{self, Change};
-use crate::lxc_guest::{self, CtRef, GuestIo, needs_allowlist};
+use crate::lxc_guest::{self, CtRef, GuestIo};
 use crate::tools::resolve_config;
 
 pub const DEBIAN_AUTOLOGIN: &str = "/etc/systemd/system/container-getty@.service.d/autologin.conf";
@@ -456,9 +454,6 @@ impl Step {
 
     fn refused(&self) -> Option<String> {
         match self {
-            Step::Exec { argv, why, .. } => {
-                needs_allowlist(&argv[0]).map(|n| format!("{n} ({why}: `{}`)", argv.join(" ")))
-            }
             Step::Refuse { target, reason } => Some(format!("{target}: {reason}")),
             _ => None,
         }
@@ -703,7 +698,7 @@ fn plan_notes(steps: &[Step]) -> Vec<String> {
         .collect()
 }
 
-/// Refuse up front so a plan never half-applies and then hits the allowlist.
+/// Refuse up front so a plan never half-applies.
 fn refuse_blocked(tool: &str, steps: &[Step]) -> Result<()> {
     let b = blockers(steps);
     if !b.is_empty() {
@@ -1315,10 +1310,9 @@ impl PreUpdateBackup for UnitBackup {
 // ── verbs ───────────────────────────────────────────────────────────────────
 
 async fn local_ct(endpoint: &str, ctid: u64) -> Result<CtRef> {
+    lxc_guest::unsupported(ctid)?;
     let client = resolve_config(endpoint).await?.build_generated_client()?;
-    let ct = lxc_guest::find_ct(&client, ctid).await?;
-    lxc_guest::ensure_local(&ct)?;
-    Ok(ct)
+    lxc_guest::find_ct(&client, ctid).await
 }
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
@@ -1343,8 +1337,8 @@ pub struct StandardAudit {
 }
 
 /// Probe one container's guest standard: OS, root console autologin, the orca
-/// `update` gate, and community-scripts' updater. Read-only; the container must
-/// run on this plugin's node.
+/// `update` gate, and community-scripts' updater. Unsupported: needs in-guest
+/// orca member.
 #[orca_tool(
     domain = "proxmox",
     verb = "guest.standard.audit",
@@ -1459,8 +1453,7 @@ pub async fn apply(
 
 /// [MUTATES STATE] Install the guest standard in an LXC: root console
 /// autologin (Debian getty drop-in / Alpine inittab wrapper) and the `update`
-/// gate. The container must run on this plugin's node. Without `execute`
-/// returns the plan, naming any step orca's lxc-exec allowlist would refuse.
+/// gate. Unsupported: needs in-guest orca member.
 #[orca_tool(
     domain = "proxmox",
     verb = "guest.standard.apply",
@@ -1500,8 +1493,7 @@ pub struct GuestUpdateArgs {
 
 /// [MUTATES STATE] Back an LXC up through the PVE API (vzdump, waited on),
 /// record the backup in the container so its `update` gate opens for an hour,
-/// then run the updater. Refused before the backup if the updater needs a
-/// command outside orca's lxc-exec allowlist.
+/// then run the updater. Unsupported: needs in-guest orca member.
 #[orca_tool(
     domain = "proxmox",
     verb = "guest.update",
@@ -1928,107 +1920,6 @@ ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,3840
         };
         assert!(p.changes.is_empty(), "{:?}", p.changes);
         assert!(p.summary.ends_with("nothing to change"));
-    }
-
-    /// PVE's `Alpine::setup_init` drops and regenerates every line this matches
-    /// unless `/etc/.pve-ignore.inittab` exists.
-    fn pve_regenerates(line: &str) -> bool {
-        regex::Regex::new(r"^\s*tty\d+:\d*:[^:]*:.*getty")
-            .unwrap()
-            .is_match(line)
-    }
-
-    #[test]
-    fn alpine_apply_writes_the_pve_ignore_marker_and_defers_the_reload() {
-        let mut replies = alpine_probe(ALPINE_INITTAB, false);
-        replies.retain(|(k, _)| *k != read(ALPINE_AUTOLOGIN));
-        replies.push((read(ALPINE_AUTOLOGIN), fake::missing(ALPINE_AUTOLOGIN)));
-        let io = io_of(replies);
-        let mut args = StandardApplyArgs {
-            update_gate: false,
-            ..apply_args(120)
-        };
-        let Change::Plan(p) = rt().block_on(apply(&io, &args, None)).unwrap() else {
-            panic!()
-        };
-        assert_eq!(p.changes.len(), 4, "{:?}", p.changes);
-        assert_eq!(p.changes[3].action, "deferred");
-        assert!(
-            p.summary.contains("deferred to the container's next start")
-                && p.summary.contains("needs allowlist: kill"),
-            "{}",
-            p.summary
-        );
-        assert!(io.writes.lock().unwrap().is_empty());
-
-        args.execute = true;
-        let Change::Applied(a) = rt().block_on(apply(&io, &args, Some(&admin()))).unwrap() else {
-            panic!()
-        };
-        assert_eq!(a.steps[3].action, "deferred");
-        let writes = io.writes.lock().unwrap();
-        assert_eq!(
-            writes[0],
-            (
-                PVE_IGNORE_INITTAB.into(),
-                String::new(),
-                Some("0644".into())
-            )
-        );
-        assert_eq!(
-            writes[1],
-            (
-                ALPINE_AUTOLOGIN.into(),
-                ALPINE_AUTOLOGIN_SH.into(),
-                Some("0755".into())
-            )
-        );
-        assert_eq!(writes[2].0, INITTAB);
-        let rewritten = &writes[2].1;
-        assert!(tty1_uses_autologin(rewritten));
-        assert!(
-            rewritten.lines().any(pve_regenerates),
-            "the rewritten tty lines are ones PVE regenerates, hence the marker"
-        );
-        assert!(
-            !io.execs
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|e| e.starts_with("kill")),
-            "the refused reload never reaches the seam"
-        );
-    }
-
-    #[test]
-    fn gate_is_refused_when_its_updater_cannot_run() {
-        let io = io_of(debian(GETTY_UNIT, None, true));
-        let args = StandardApplyArgs {
-            console: false,
-            ..apply_args(116)
-        };
-        let Change::Plan(p) = rt().block_on(apply(&io, &args, None)).unwrap() else {
-            panic!()
-        };
-        assert_eq!(p.changes[0].action, "refused");
-        assert!(
-            p.summary.contains("needs allowlist: update"),
-            "{}",
-            p.summary
-        );
-        let err = rt()
-            .block_on(apply(
-                &io,
-                &StandardApplyArgs {
-                    execute: true,
-                    ..args
-                },
-                Some(&admin()),
-            ))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("could never open"), "{err}");
-        assert!(io.writes.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2522,39 +2413,6 @@ ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,3840
         assert!(err.contains("already in progress"), "{err}");
         drop(held);
         UpdateLock::take(207).unwrap();
-    }
-
-    #[test]
-    fn community_updater_is_refused_before_the_backup() {
-        let io = io_of(debian(GETTY_UNIT, None, true));
-        let backup = FakeBackup(Default::default());
-        let err = rt()
-            .block_on(run_update(
-                &io,
-                &backup,
-                208,
-                &GuestUpdatePayload::default(),
-            ))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("needs allowlist: update"), "{err}");
-        assert_eq!(
-            *backup.0.lock().unwrap(),
-            0,
-            "no backup for an update that cannot run"
-        );
-        assert!(io.writes.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn unsupported_os_updater_pairs_are_refused() {
-        let alpine = facts(Os::Alpine);
-        let b = blockers(&updater_commands(Updater::Auto, &alpine).unwrap());
-        assert!(b[0].starts_with("needs allowlist: apk"), "{b:?}");
-        assert!(updater_commands(Updater::Apt, &alpine).is_err());
-        assert!(updater_commands(Updater::Apk, &facts(Os::Debian)).is_err());
-        assert!(updater_commands(Updater::Community, &facts(Os::Debian)).is_err());
-        assert!(updater_commands(Updater::Auto, &facts(Os::Other)).is_err());
     }
 
     #[test]

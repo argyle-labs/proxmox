@@ -1,74 +1,16 @@
-//! In-container I/O for LXC guests. The PVE REST API has no exec or file write
-//! into an LXC, so [`SeamIo`] refuses every call until an in-guest orca member
-//! serves it.
-
 use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::prelude::*;
 
 use crate::generated::{self, types as gtypes};
 
-/// Mirrors `system::lxc_exec::ALLOWED_COMMANDS` in orca. A command outside it
-/// is refused here, before any step of a plan runs, so a verb never applies
-/// half its changes and then hits the root-side refusal.
-pub const EXEC_ALLOWLIST: &[&str] = &[
-    "apt-get",
-    "apt",
-    "dpkg",
-    "dpkg-query",
-    "systemctl",
-    "true",
-    "df",
-    "cat",
-    "ls",
-    "stat",
-    "head",
-    "tail",
-];
-
-/// Entries the guest standard needs on orca's root-side allowlist (orca#769),
-/// each with why. Until orca ships them, steps using them are named in the
-/// dry-run plan and refused or deferred before anything runs. `/usr/bin/update`
-/// is an absolute path because a bare `update` basename would admit any
-/// program of that name anywhere in the container.
-///
-/// `sh` is absent: every step execs its program directly, and `sh -c` would
-/// let the exec seam run any command line it is handed.
-pub const PROPOSED_ALLOWLIST: &[(&str, &str)] = &[
-    (
-        "kill",
-        "`kill -HUP 1`: busybox init re-reads /etc/inittab only on SIGHUP, so the \
-         Alpine console autologin is live without restarting the container",
-    ),
-    (
-        "apk",
-        "`apk update` / `apk upgrade`: the Alpine package updater, the apt-get \
-         equivalent already allowed",
-    ),
-    (
-        "/usr/bin/update",
-        "the app's own updater (community-scripts, or the Gitea \
-         and Caddy updaters that validate and roll back), run after orca's backup",
-    ),
-];
-
-/// `Some("needs allowlist: <cmd>")` when orca's lxc-exec seam would refuse
-/// `argv0`.
-pub fn needs_allowlist(argv0: &str) -> Option<String> {
-    let base = argv0.rsplit('/').next().unwrap_or(argv0);
-    (!EXEC_ALLOWLIST.contains(&base)).then(|| format!("needs allowlist: {base}"))
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExecResult {
     pub success: bool,
     pub exit_code: Option<i32>,
-    /// Trimmed by the seam.
     pub stdout: String,
     pub stderr: String,
 }
 
-/// The two in-container operations, behind a trait so the verbs are testable
-/// without `sudo` or `pct`.
 pub trait GuestIo: Sync {
     fn exec<'a>(&'a self, vmid: u32, argv: &'a [&'a str]) -> BoxFuture<'a, Result<ExecResult>>;
     fn write<'a>(
@@ -80,8 +22,11 @@ pub trait GuestIo: Sync {
     ) -> BoxFuture<'a, Result<()>>;
 }
 
-/// In-container I/O the PVE REST API cannot do: every call is refused.
 pub struct SeamIo;
+
+pub fn unsupported(vmid: u64) -> Result<()> {
+    bail!("CT {vmid}: {UNSUPPORTED}")
+}
 
 pub const UNSUPPORTED: &str = "unsupported: needs in-guest orca member (the PVE REST API cannot exec in or write files into an LXC)";
 
@@ -185,10 +130,7 @@ pub async fn read_exact(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<Optio
 }
 
 /// Refuse a push to `path` unless it is a regular file or absent and every
-/// existing parent is a real directory. `pct push` creates the file after
-/// entering the container's mount namespace (and user namespace when
-/// unprivileged), so a symlink cannot reach outside the container; this guards
-/// against writing through a link or over a non-file by accident.
+/// existing parent is a real directory.
 pub async fn check_push_target(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<()> {
     let mut paths: Vec<String> = std::path::Path::new(path)
         .ancestors()
@@ -340,51 +282,6 @@ fn require_audit(vmid: u64, perms: &serde_json::Map<String, serde_json::Value>) 
     Ok(())
 }
 
-/// In-container ops run `pct` on this node, so the container must live here.
-pub fn require_local(ct: &CtRef, local: &str) -> Result<()> {
-    if ct.node != local {
-        bail!(
-            "CT {} runs on node '{}' but this proxmox plugin runs on '{local}'; in-container \
-             reads and writes go through `pct` on the container's own node, so run this on \
-             the orca instance on '{}'",
-            ct.vmid,
-            ct.node,
-            ct.node
-        );
-    }
-    if !ct.running {
-        bail!(
-            "CT {} is not running; in-container reads and writes need it running",
-            ct.vmid
-        );
-    }
-    Ok(())
-}
-
-/// `/etc/pve/lxc` holds only this node's containers (pmxcfs links it to
-/// `nodes/<this node>/lxc`), so a conf there proves the container is local even
-/// when the plugin's hostname differs from its PVE node name.
-pub const PVE_LXC_CONF_DIR: &str = "/etc/pve/lxc";
-
-pub fn require_local_conf(dir: &std::path::Path, vmid: u64) -> Result<()> {
-    let conf = dir.join(format!("{vmid}.conf"));
-    if !conf.exists() {
-        bail!(
-            "CT {vmid}: {} is not on this node, so `pct` here cannot reach it; run this on \
-             the orca instance on the container's node",
-            conf.display()
-        );
-    }
-    Ok(())
-}
-
-/// [`require_local`] by node name, then by the node-local conf, before any
-/// in-container exec.
-pub fn ensure_local(ct: &CtRef) -> Result<()> {
-    require_local(ct, &crate::diagnostics::local_node())?;
-    require_local_conf(std::path::Path::new(PVE_LXC_CONF_DIR), ct.vmid)
-}
-
 /// Recording fake for tests: answers `exec` from a table keyed by the joined
 /// argv, records every write.
 #[cfg(test)]
@@ -437,9 +334,6 @@ pub mod fake {
             argv: &'a [&'a str],
         ) -> BoxFuture<'a, Result<ExecResult>> {
             Box::pin(async move {
-                if let Some(need) = needs_allowlist(argv[0]) {
-                    bail!("{need}");
-                }
                 let key = argv.join(" ");
                 self.execs.lock().unwrap().push(key.clone());
                 let reply = |k: &str| {
@@ -512,28 +406,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allowlist_check_uses_the_basename() {
-        assert_eq!(needs_allowlist("cat"), None);
-        assert_eq!(needs_allowlist("/usr/bin/apt-get"), None);
-        assert_eq!(
-            needs_allowlist("apk").as_deref(),
-            Some("needs allowlist: apk")
-        );
-        assert_eq!(
-            needs_allowlist("/bin/kill").as_deref(),
-            Some("needs allowlist: kill")
-        );
-    }
-
-    #[test]
-    fn proposed_entries_are_not_already_allowed() {
-        for (cmd, why) in PROPOSED_ALLOWLIST {
-            assert!(needs_allowlist(cmd).is_some(), "{cmd} is already allowed");
-            assert!(!why.is_empty());
-        }
-    }
-
-    #[test]
     fn an_empty_listing_is_absent_only_with_vm_audit() {
         let check = |body: &str| require_audit(110, &serde_json::from_str(body).unwrap());
         let err = check(r#"{"/vms/110":{"VM.Console":1}}"#)
@@ -543,28 +415,6 @@ mod tests {
         assert!(check("{}").is_err());
         assert!(check(r#"{"/vms/110":{"VM.Audit":0}}"#).is_ok());
         assert!(check(r#"{"/vms/110":{"VM.Audit":1}}"#).is_ok());
-    }
-
-    fn ct(node: &str, running: bool) -> CtRef {
-        CtRef {
-            node: node.into(),
-            vmid: 116,
-            name: None,
-            running,
-        }
-    }
-
-    #[test]
-    fn remote_or_stopped_containers_are_refused() {
-        assert!(require_local(&ct("hyp1", true), "hyp1").is_ok());
-        let err = require_local(&ct("hyp2", true), "hyp1")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("runs on node 'hyp2'"), "{err}");
-        let err = require_local(&ct("hyp1", false), "hyp1")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not running"), "{err}");
     }
 
     #[tokio::test]
@@ -679,16 +529,5 @@ mod tests {
             assert!(err.contains("unanswered"), "{p}: {err}");
         }
         assert!(io.writes.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn locality_needs_the_node_local_conf() {
-        let dir = std::env::temp_dir().join(format!("pve-lxc-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("116.conf"), "arch: amd64\n").unwrap();
-        assert!(require_local_conf(&dir, 116).is_ok());
-        let err = require_local_conf(&dir, 117).unwrap_err().to_string();
-        assert!(err.contains("117.conf is not on this node"), "{err}");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

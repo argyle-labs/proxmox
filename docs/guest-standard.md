@@ -2,7 +2,7 @@
 
 > **Unsupported today.** Every in-container read, write and command below needs
 > exec or file I/O inside the LXC, which the PVE REST API does not offer. The
-> plugin runs no root or `pct` path, so audit, apply and update refuse with
+> plugin runs no root or `pct` path, so audit, apply, update and pxarexclude refuse with
 > `unsupported: needs in-guest orca member` until such a member exists.
 
 Every LXC is held to two things beyond its resource floor:
@@ -11,13 +11,9 @@ Every LXC is held to two things beyond its resource floor:
 - **A one-word `update`.** It runs the container's updater only after orca has
   backed the container up.
 
-`unit.detail` probes a running LXC on the plugin's own node and fills the guard's
-`has_root_console` / `has_update_command` facts. A probed LXC is then held to
-`require_root_console` and `require_update_command`, and a missing piece shows
-in `guard_violations`. If the probe itself fails or times out, that shows as a
-`guest standard probe failed: …` violation, never as a pass. An unprobed guest
-(a VM, a stopped or remote LXC, or a `list` row) is held to the resource floor
-only, so facts nobody read never fail closed.
+`unit.detail` does not probe guests, so every guest is held to the resource
+floor only. The unit `update` action still returns its plan; executing it is
+unsupported.
 
 ## Security notes
 
