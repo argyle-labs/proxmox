@@ -408,6 +408,14 @@ fn in_guest_verbs_are_unsupported_before_any_capability() {
             "proxmox.guest.pxarexclude",
             serde_json::json!({"endpoint": "pve", "ctid": 116, "patterns": ["/data"]}),
         ),
+        (
+            "proxmox.guest.standard.apply",
+            serde_json::json!({"endpoint": "pve", "ctid": 116}),
+        ),
+        (
+            "proxmox.guest.update",
+            serde_json::json!({"endpoint": "pve", "ctid": 116}),
+        ),
     ] {
         let ctx = test_ctx().with_auth(admin.clone());
         let err = plugin_toolkit::capsink::with_cap_sink(
