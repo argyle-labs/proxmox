@@ -1,5 +1,10 @@
 # Guest standard: root console autologin and a backup-gated `update`
 
+> **Unsupported today.** Every in-container read, write and command below needs
+> exec or file I/O inside the LXC, which the PVE REST API does not offer. The
+> plugin runs no root or `pct` path, so audit, apply and update refuse with
+> `unsupported: needs in-guest orca member` until such a member exists.
+
 Every LXC is held to two things beyond its resource floor:
 
 - **Root console autologin.** The PVE console logs straight in as root.
