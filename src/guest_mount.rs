@@ -21,30 +21,20 @@
 //! A change PVE cannot hotplug lands in `[pve:pending]` and is reported as
 //! pending a restart.
 //!
-//! [`OP_DROP_RAW_ENTRY`] removes a raw `lxc.mount.entry` for a guest mount
-//! target: the PVE API cannot write `lxc.*` keys, so this edit of
-//! `/etc/pve/lxc/<vmid>.conf` runs through orca's privileged seam
-//! ([`privileged_ops`]), which an admin grants per plugin. There [`edit_raw_conf_in`]
-//! holds PVE's own per-CT config flock, re-reads the file under it, edits only
-//! the live section, and replaces it atomically.
+//! A raw `lxc.mount.entry` for a guest mount target cannot be removed: the PVE
+//! API cannot write `lxc.*` keys, so that drop is refused as unsupported.
 //!
 //! VM guests (their own kernel mounts via cloud-init/fstab) are a later phase;
 //! this domain handles LXC and returns a clear error for a VM vmid.
 
-use std::io::Write;
 use std::net::IpAddr;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
 
 use plugin_toolkit::abi::{BackendDef, ColumnDef, DbOp, DbRow, DbValue, TableDef};
-use plugin_toolkit::privileged::PrivilegedOps;
 use plugin_toolkit::reqwest;
 use plugin_toolkit::runtime::{ToDbValue, db_op, field_from_row};
 use plugin_toolkit::serde_json::{self, Value};
 use plugin_toolkit::storage::{GuestMountSpec, MountHealth, parse_option_string};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::Config;
 use crate::generated::{self, types as gtypes};
@@ -52,14 +42,8 @@ use crate::generated::{self, types as gtypes};
 /// Invoke-name prefix for this domain's ops (`proxmox.__guest_mount.*`).
 pub const GM_PREFIX: &str = "proxmox.__guest_mount";
 const PROVIDER: &str = "proxmox";
-/// PVE's `lock_config` waits 10s for the config flock.
-const CONF_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
-/// A temp file older than this is stale even if its pid has been reused.
-const TEMP_STALE_AGE: Duration = Duration::from_secs(600);
 /// The only PVE user allowed to set a bind `mpN`.
 const ROOT_USER: &str = "root@pam";
-/// Privileged-seam op removing a raw `lxc.mount.entry` for one guest target.
-pub const OP_DROP_RAW_ENTRY: &str = "guest_mount.drop_raw_entry";
 /// orca core's settings table and the key holding this host's system id.
 const SETTINGS_TABLE: &str = "settings";
 const LOCAL_SYSTEM_ID_SETTING: &str = "host.system_id";
@@ -755,7 +739,7 @@ pub(crate) trait GuestMountIo {
     async fn delete_placement(&self, id: &str) -> Result<(), String>;
     /// This orca host's system id, the `host` of placements it converges.
     async fn local_host(&self) -> Result<String, String>;
-    /// Remove the CT's raw `lxc.mount.entry` for `target` ([`OP_DROP_RAW_ENTRY`]).
+    /// Remove the CT's raw `lxc.mount.entry` for `target`.
     async fn drop_raw_entry(&self, vmid: u64, target: &str) -> Result<RawEdit, String>;
     /// The CT's uptime in seconds while running; `None` when it is not.
     /// A running CT reporting no uptime answers `u64::MAX`.
@@ -1131,11 +1115,10 @@ impl GuestMountIo for PveIo {
     }
 
     async fn drop_raw_entry(&self, vmid: u64, target: &str) -> Result<RawEdit, String> {
-        let op = DropRawEntryOp {
-            vmid,
-            target: target.to_string(),
-        };
-        privileged(OP_DROP_RAW_ENTRY, &op).await
+        Err(format!(
+            "CT {vmid}: dropping the raw lxc.mount.entry for {target}: unsupported: needs \
+             in-guest orca member (the PVE REST API cannot write raw lxc.* keys); remove it by hand"
+        ))
     }
 
     async fn uptime_secs(&self, vmid: u64) -> Result<Option<u64>, String> {
@@ -1452,13 +1435,6 @@ async fn get_data(http: &reqwest::Client, url: &str) -> Result<Value, String> {
         .ok_or_else(|| format!("GET {url}: no data"))
 }
 
-async fn privileged<P: Serialize>(op: &str, payload: &P) -> Result<RawEdit, String> {
-    let detail = plugin_toolkit::privileged::apply(PROVIDER, op, Some(payload))
-        .await
-        .map_err(|e| format!("{op} via orca's privileged seam: {e:#}"))?;
-    RawEdit::from_detail(&detail)
-}
-
 // ── Mount point values ──────────────────────────────────────────────────────
 
 /// PVE allows `mp0`..`mp255`.
@@ -1514,64 +1490,7 @@ fn render_mp_value(src: &str, target: &str, ro: bool, extras: &[&str]) -> String
     out
 }
 
-/// The closed op set this plugin serves as root in `--privileged-op` mode.
-pub fn privileged_ops() -> PrivilegedOps {
-    PrivilegedOps::new().op(OP_DROP_RAW_ENTRY, |op: DropRawEntryOp| async move {
-        root_drop_raw_entry(Path::new("/"), &op)
-            .map(|e| e.detail().to_string())
-            .map_err(plugin_toolkit::anyhow::Error::msg)
-    })
-}
-
-/// Payload of [`OP_DROP_RAW_ENTRY`]: `target` is the absolute guest mountpoint.
-#[derive(Serialize, Deserialize)]
-pub(crate) struct DropRawEntryOp {
-    pub(crate) vmid: u64,
-    pub(crate) target: String,
-}
-
-/// Root side of [`OP_DROP_RAW_ENTRY`].
-fn root_drop_raw_entry(root: &Path, op: &DropRawEntryOp) -> Result<RawEdit, String> {
-    check_target(&op.target)?;
-    sweep_stale_temps_in(root, pid_alive);
-    let rel = relative_mountpoint(&op.target);
-    edit_raw_conf_in(root, op.vmid, |live| drop_mount_entry(live, &rel))
-}
-
-/// `live` without its `lxc.mount.entry` lines mounting at `rel`; `None` if none.
-fn drop_mount_entry(live: &str, rel: &str) -> Option<String> {
-    let mut dropped = false;
-    let out: String = live
-        .split_inclusive('\n')
-        .filter(|line| {
-            let hit = raw_mount_entry_value(line).and_then(entry_mountpoint) == Some(rel);
-            dropped |= hit;
-            !hit
-        })
-        .collect();
-    dropped.then_some(out)
-}
-
 // ── Node-local paths ────────────────────────────────────────────────────────
-
-fn lxc_conf_path_in(root: &Path, vmid: u64) -> Result<String, String> {
-    let lxc = root.join(format!("etc/pve/lxc/{vmid}.conf"));
-    if lxc.exists() {
-        return Ok(lxc.to_string_lossy().into_owned());
-    }
-    if root
-        .join(format!("etc/pve/qemu-server/{vmid}.conf"))
-        .exists()
-    {
-        return Err(format!(
-            "guest {vmid} is a VM; VM guest mounts (cloud-init/fstab) are not yet supported"
-        ));
-    }
-    Err(format!(
-        "no LXC config found at {} (guest {vmid} not on this node?)",
-        lxc.display()
-    ))
-}
 
 /// Host path a CT's network share is staged at: `/mnt/orca-guest/<vmid>/<slug>`.
 fn host_stage_path(vmid: u64, target: &str) -> String {
@@ -1617,16 +1536,6 @@ fn relative_mountpoint(target: &str) -> String {
     target.trim_start_matches('/').to_string()
 }
 
-/// The value of a conf line PVE parses as `lxc.mount.entry`
-/// (`^\s*lxc.mount.entry\s*[:=]`).
-fn raw_mount_entry_value(line: &str) -> Option<&str> {
-    let rest = line
-        .trim_start()
-        .strip_prefix("lxc.mount.entry")?
-        .trim_start();
-    rest.strip_prefix([':', '='])
-}
-
 /// An `lxc.mount.entry`'s mountpoint field, normalized: lxc resolves it
 /// against the rootfs, so `./mnt/a`, `/mnt/a` and `mnt/a/` all name `mnt/a`.
 fn entry_mountpoint(entry: &str) -> Option<&str> {
@@ -1642,113 +1551,12 @@ fn entry_mountpoint(entry: &str) -> Option<&str> {
     Some(mp.trim_end_matches('/'))
 }
 
-// ── Safe file writes ────────────────────────────────────────────────────────
+// ── Raw entry drops ─────────────────────────────────────────────────────────
 
-/// Create a fresh temp file beside `path` with `mode` set at creation, so the
-/// contents are never readable under a looser mode. Named
-/// `.<name>.tmp.<pid>.<seq>` for [`sweep_stale_temps_in`].
-fn create_temp_beside(path: &Path, mode: u32) -> std::io::Result<(std::fs::File, PathBuf)> {
-    let name = path
-        .file_name()
-        .ok_or_else(|| std::io::Error::other("path has no file name"))?
-        .to_string_lossy();
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = path.with_file_name(format!(".{name}.tmp.{}.{seq}", std::process::id()));
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(&tmp)?;
-    Ok((file, tmp))
-}
-
-/// Write `contents` to `path` atomically: temp file in the same dir, `sync_all`,
-/// then rename. Mode and owner are fixed up only when the temp file differs, so
-/// pmxcfs (which rejects chmod/chown but already applies its fixed ones) works.
-fn atomic_write(
-    path: &Path,
-    contents: &[u8],
-    mode: u32,
-    owner: Option<(u32, u32)>,
-) -> std::io::Result<()> {
-    let (mut file, tmp) = create_temp_beside(path, mode)?;
-    let result = (|| {
-        file.write_all(contents)?;
-        let meta = file.metadata()?;
-        if meta.mode() & 0o7777 != mode {
-            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
-        }
-        if let Some((uid, gid)) = owner
-            && (meta.uid() != uid || meta.gid() != gid)
-        {
-            std::os::unix::fs::fchown(&file, Some(uid), Some(gid))?;
-        }
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)
-    })();
-    if result.is_err() {
-        std::fs::remove_file(&tmp).ok();
-    }
-    result
-}
-
-/// [`atomic_write`] over an existing file, keeping its mode and owner.
-fn atomic_replace(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let meta = std::fs::metadata(path)?;
-    atomic_write(
-        path,
-        contents,
-        meta.mode() & 0o7777,
-        Some((meta.uid(), meta.gid())),
-    )
-}
-
-fn older_than(path: &Path, age: Duration) -> bool {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .is_some_and(|d| d > age)
-}
-
-fn pid_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
-}
-
-/// The pid in a `.<name>.conf.tmp.<pid>.<seq>` temp name, or `None` if `name`
-/// is not one of ours.
-fn temp_pid(name: &str) -> Option<u32> {
-    let (head, seq) = name.strip_prefix('.')?.rsplit_once('.')?;
-    let (head, pid) = head.rsplit_once('.')?;
-    let base = head.strip_suffix(".tmp")?;
-    (seq.bytes().all(|b| b.is_ascii_digit()) && base.ends_with(".conf"))
-        .then(|| pid.parse().ok())?
-}
-
-/// Delete temp files a crashed write left in `/etc/pve/lxc`: those whose writer
-/// is gone, or that are older than [`TEMP_STALE_AGE`] (the pid may have been
-/// reused). A live writer's fresh temp is left alone.
-fn sweep_stale_temps_in(root: &Path, alive: impl Fn(u32) -> bool) {
-    let me = std::process::id();
-    let Ok(entries) = std::fs::read_dir(root.join("etc/pve/lxc")) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Some(pid) = temp_pid(&entry.file_name().to_string_lossy()) else {
-            continue;
-        };
-        if pid != me && (!alive(pid) || older_than(&entry.path(), TEMP_STALE_AGE)) {
-            std::fs::remove_file(entry.path()).ok();
-        }
-    }
-}
-
-// ── Raw conf edits ──────────────────────────────────────────────────────────
-
-/// Result of [`edit_raw_conf_in`].
+/// Result of a raw `lxc.mount.entry` drop.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RawEdit {
+    #[cfg_attr(not(test), allow(dead_code))]
     Unchanged,
     /// Written; lxc reads `lxc.*` lines only at container start.
     Written,
@@ -1761,100 +1569,6 @@ impl RawEdit {
             Self::Written => "written",
         }
     }
-
-    fn from_detail(detail: &str) -> Result<Self, String> {
-        match detail.trim() {
-            "unchanged" => Ok(Self::Unchanged),
-            "written" => Ok(Self::Written),
-            other => Err(format!("unexpected privileged reply '{other}'")),
-        }
-    }
-}
-
-/// Take `path`'s exclusive flock, polling until `timeout`.
-fn lock_exclusive(path: &Path, timeout: Duration) -> Result<std::fs::File, String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| format!("open {}: {e}", path.display()))?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(format!(
-                    "timed out after {}s waiting for {}",
-                    timeout.as_secs(),
-                    path.display()
-                ));
-            }
-            Err(std::fs::TryLockError::Error(e)) => {
-                return Err(format!("lock {}: {e}", path.display()));
-            }
-        }
-    }
-}
-
-/// Split a CT conf into its live section and the rest, which starts at the first
-/// `[snapshot]` header and is returned untouched.
-fn split_live_section(conf: &str) -> (&str, &str) {
-    let mut offset = 0;
-    for line in conf.split_inclusive('\n') {
-        if line.trim_start().starts_with('[') {
-            return conf.split_at(offset);
-        }
-        offset += line.len();
-    }
-    (conf, "")
-}
-
-/// Apply `edit` to the live section of `conf`; `None` when it makes no change.
-fn edit_live_section<F>(conf: &str, edit: F) -> Option<String>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    let (live, snapshots) = split_live_section(conf);
-    let mut out = edit(live)?;
-    if !snapshots.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(snapshots);
-    Some(out)
-}
-
-fn read_conf(path: &str) -> Result<String, String> {
-    std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))
-}
-
-/// Raw `lxc.*` lines have no PVE API or CLI, so the conf is edited locally as
-/// root. The edit runs under PVE's own config flock, re-reads the file under it,
-/// touches only the live section, and replaces the file atomically. `edit`
-/// returns the new live section, or `None` for no change. Errors for a VM vmid.
-fn edit_raw_conf_in<F>(root: &Path, vmid: u64, edit: F) -> Result<RawEdit, String>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    let path = lxc_conf_path_in(root, vmid)?;
-    if edit_live_section(&read_conf(&path)?, &edit).is_none() {
-        return Ok(RawEdit::Unchanged);
-    }
-    // PVE's per-CT config lock (`PVE::LXC::Config::config_file_lock`).
-    let lock = root.join(format!("run/lock/lxc/pve-config-{vmid}.lock"));
-    let _lock = lock_exclusive(&lock, CONF_LOCK_TIMEOUT)
-        .map_err(|e| format!("CT {vmid} config lock: {e}"))?;
-    let Some(rewritten) = edit_live_section(&read_conf(&path)?, &edit) else {
-        return Ok(RawEdit::Unchanged);
-    };
-    atomic_replace(Path::new(&path), rewritten.as_bytes())
-        .map_err(|e| format!("write {path}: {e}"))?;
-    Ok(RawEdit::Written)
 }
 
 #[cfg(test)]
@@ -1868,18 +1582,6 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
-    }
-
-    fn scratch(name: &str) -> PathBuf {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let d = std::env::temp_dir().join(format!(
-            "proxmox-gm-{name}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::remove_dir_all(&d).ok();
-        std::fs::create_dir_all(&d).unwrap();
-        d
     }
 
     // ── fake API ────────────────────────────────────────────────────────────
@@ -2491,7 +2193,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_entry_forms_match_on_both_sides() {
+    fn raw_entry_forms_match() {
         for e in [
             "//w/a mnt/a cifs 0 0",
             "//w/a ./mnt/a cifs 0 0",
@@ -2501,22 +2203,6 @@ mod tests {
             assert!(ct_conf(&[], &[e]).has_raw_entry("/mnt/a"), "{e}");
         }
         assert!(!ct_conf(&[], &["//w/a mnt/ab cifs 0 0"]).has_raw_entry("/mnt/a"));
-        for line in [
-            "lxc.mount.entry: //w/a mnt/a cifs 0 0\n",
-            "  lxc.mount.entry = //w/a ./mnt/a cifs 0 0\n",
-            "lxc.mount.entry=//w/a /mnt/a/ cifs 0 0\n",
-            "\tlxc.mount.entry  :  //w/a mnt/a/ cifs 0 0\n",
-        ] {
-            assert_eq!(
-                drop_mount_entry(&format!("arch: amd64\n{line}"), "mnt/a").as_deref(),
-                Some("arch: amd64\n"),
-                "{line}"
-            );
-        }
-        assert_eq!(
-            drop_mount_entry("lxc.mount.entry.x: a mnt/a b 0 0\n", "mnt/a"),
-            None
-        );
     }
 
     #[test]
@@ -2742,39 +2428,6 @@ mod tests {
         let fake = Fake::new(vec![ct_conf(&[], &[entry.as_str()])]).with_placements(rows);
         assert!(rt().block_on(sweep_stages(&fake)).unwrap().is_empty());
         assert!(fake.calls().is_empty());
-    }
-
-    #[test]
-    fn root_drop_raw_entry_removes_only_the_live_target_line() {
-        let conf = "arch: amd64\n\
-                    lxc.mount.entry: //w/a mnt/a cifs create=dir 0 0\n\
-                    lxc.mount.entry: //w/b mnt/ab cifs create=dir 0 0\n\
-                    [snap1]\n\
-                    lxc.mount.entry: //w/a mnt/a cifs create=dir 0 0\n";
-        let root = pve_root("dropraw", 120, conf);
-        let op = |target: &str| DropRawEntryOp {
-            vmid: 120,
-            target: target.to_string(),
-        };
-        assert_eq!(
-            root_drop_raw_entry(&root, &op("/mnt/a")).unwrap(),
-            RawEdit::Written
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join("etc/pve/lxc/120.conf")).unwrap(),
-            "arch: amd64\n\
-             lxc.mount.entry: //w/b mnt/ab cifs create=dir 0 0\n\
-             [snap1]\n\
-             lxc.mount.entry: //w/a mnt/a cifs create=dir 0 0\n"
-        );
-        assert_eq!(
-            root_drop_raw_entry(&root, &op("/mnt/a")).unwrap(),
-            RawEdit::Unchanged
-        );
-        for bad in ["mnt/a", "/mnt/../etc", "/mnt/a b", ""] {
-            assert!(root_drop_raw_entry(&root, &op(bad)).is_err(), "{bad}");
-        }
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -3090,140 +2743,5 @@ mod tests {
         assert!(!rt.block_on(url_is_this_host("https://192.0.2.1:8006")));
         assert!(!ip_is_local("0.0.0.0".parse().unwrap()));
         assert!(ip_is_local("127.0.0.1".parse().unwrap()));
-    }
-
-    #[test]
-    fn raw_edit_is_rechecked_against_the_config_under_the_lock() {
-        let root = pve_root("shmlock", 120, "memory: 4096\n");
-        let lxc = root.join("etc/pve/lxc/120.conf");
-        let calls = std::cell::Cell::new(0);
-        let edit = edit_raw_conf_in(&root, 120, |conf| {
-            calls.set(calls.get() + 1);
-            if calls.get() == 1 {
-                std::fs::write(&lxc, "memory: 256\n").unwrap();
-            }
-            (!conf.contains("memory: 256")).then(|| format!("{conf}x\n"))
-        })
-        .unwrap();
-        assert_eq!(edit, RawEdit::Unchanged);
-        assert_eq!(std::fs::read_to_string(&lxc).unwrap(), "memory: 256\n");
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    fn pve_root(name: &str, vmid: u64, conf: &str) -> PathBuf {
-        let root = scratch(name);
-        std::fs::create_dir_all(root.join("etc/pve/lxc")).unwrap();
-        std::fs::write(root.join(format!("etc/pve/lxc/{vmid}.conf")), conf).unwrap();
-        root
-    }
-
-    fn age(path: &Path, by: Duration) {
-        std::fs::File::options()
-            .write(true)
-            .open(path)
-            .unwrap()
-            .set_modified(SystemTime::now() - by)
-            .unwrap();
-    }
-
-    #[test]
-    fn temp_names_parse_their_pid() {
-        assert_eq!(temp_pid(".110.conf.tmp.42.0"), Some(42));
-        assert_eq!(temp_pid(".guest-110-mnt-a.secret.tmp.7.3"), None);
-        assert_eq!(temp_pid(".hidden"), None);
-        assert_eq!(temp_pid("110.conf"), None);
-        assert_eq!(temp_pid(".x.tmp.1.2"), None);
-        assert_eq!(temp_pid(".110.conf.tmp.x.0"), None);
-    }
-
-    #[test]
-    fn sweep_removes_dead_or_old_temps_only() {
-        let root = pve_root("sweep", 110, "arch: amd64\n");
-        let lxc = root.join("etc/pve/lxc");
-        let me = std::process::id();
-        let files = [
-            lxc.join(".110.conf.tmp.1000001.0"),
-            lxc.join(".110.conf.tmp.1000002.0"),
-            lxc.join(".110.conf.tmp.1000003.0"),
-            lxc.join(format!(".110.conf.tmp.{me}.0")),
-            lxc.join(".hidden"),
-        ];
-        for f in &files {
-            std::fs::write(f, "x").unwrap();
-        }
-        age(&files[2], TEMP_STALE_AGE * 2);
-        sweep_stale_temps_in(&root, |pid| pid != 1_000_001);
-        let left: Vec<bool> = files.iter().map(|f| f.exists()).collect();
-        assert_eq!(left, [false, true, false, true, true]);
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn temp_file_mode_is_set_at_creation() {
-        let dir = scratch("temp-mode");
-        let (file, _tmp) = create_temp_beside(&dir.join("x.conf"), 0o600).unwrap();
-        assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn edit_never_touches_snapshot_sections() {
-        let snap = "[snap1]\nmemory: 512\n";
-        let conf = format!("arch: amd64\n{snap}");
-        let out = edit_live_section(&conf, |c| Some(format!("{c}memory: 1024\n"))).unwrap();
-        assert_eq!(out, format!("arch: amd64\nmemory: 1024\n{snap}"));
-    }
-
-    #[test]
-    fn edit_raw_conf_waits_on_the_pve_lock_and_refuses_a_vm() {
-        let root = pve_root("edit", 110, "arch: amd64\n[pve:pending]\nmemory: 1024\n");
-        let append = |c: &str| (!c.contains("swap")).then(|| format!("{c}swap: 0\n"));
-        let held = lock_exclusive(
-            &root.join("run/lock/lxc/pve-config-110.lock"),
-            Duration::ZERO,
-        )
-        .unwrap();
-        let err = edit_raw_conf_in(&root, 110, append).unwrap_err();
-        assert!(err.contains("config lock"), "{err}");
-        drop(held);
-        assert_eq!(
-            edit_raw_conf_in(&root, 110, append).unwrap(),
-            RawEdit::Written
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join("etc/pve/lxc/110.conf")).unwrap(),
-            "arch: amd64\nswap: 0\n[pve:pending]\nmemory: 1024\n"
-        );
-        assert_eq!(
-            edit_raw_conf_in(&root, 110, append).unwrap(),
-            RawEdit::Unchanged
-        );
-
-        std::fs::create_dir_all(root.join("etc/pve/qemu-server")).unwrap();
-        std::fs::write(root.join("etc/pve/qemu-server/200.conf"), "").unwrap();
-        let err = edit_raw_conf_in(&root, 200, |_| Some(String::new())).unwrap_err();
-        assert!(err.contains("is a VM"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn atomic_replace_preserves_mode_and_leaves_no_temp() {
-        let dir = scratch("replace");
-        let path = dir.join("110.conf");
-        std::fs::write(&path, "arch: amd64\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-        atomic_replace(&path, b"arch: arm64\n").unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "arch: arm64\n");
-        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o640);
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn raw_edit_detail_round_trips() {
-        for e in [RawEdit::Unchanged, RawEdit::Written] {
-            assert_eq!(RawEdit::from_detail(e.detail()).unwrap(), e);
-        }
-        assert!(RawEdit::from_detail("pending").is_err());
     }
 }

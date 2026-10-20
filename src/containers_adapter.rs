@@ -123,16 +123,15 @@ impl RuntimeAdapter for LxcProxmoxApiAdapter {
     /// Liveness probe.
     ///
     /// For recognized media guests (Plex, Jellyfin) the probe hits the real
-    /// service surface over HTTP — `pct exec true` only proves PID 1 is alive,
+    /// service surface over HTTP — the API status only proves the CT is running,
     /// not that the media server is actually serving. A guest whose mount came
-    /// back but whose service is still hung would read "Live" under the exec
+    /// back but whose service is still hung would read "Live" under the status
     /// probe and never get recovered; the service probe closes that gap (per
     /// [[feedback-self-healing-is-mandatory]]: probes do real I/O against the
     /// surface that matters).
     ///
-    /// For everything else it falls back to the local-subprocess probe:
-    /// `pct exec <vmid> -- true` with a tight timeout. See
-    /// [[feedback-api-first-liveness-exception]].
+    /// For everything else it reads `status/current` through the PVE API with a
+    /// tight timeout; a hung status read is reported as wedged.
     async fn probe_liveness(&self, container: &Container) -> Liveness {
         if container.runtime != RuntimeKind::Lxc {
             return Liveness::NotApplicable;
@@ -142,21 +141,19 @@ impl RuntimeAdapter for LxcProxmoxApiAdapter {
             return probe_http_service(&self.http, &host, port).await;
         }
 
-        let mut cmd = tokio::process::Command::new("pct");
-        cmd.arg("exec").arg(&container.id).arg("--").arg("true");
-        cmd.kill_on_drop(true);
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(_) => return Liveness::Unknown,
+        let Ok(vmid) = container.id.parse::<i64>() else {
+            return Liveness::Unknown;
         };
-        match tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), child.wait()).await {
-            Ok(Ok(status)) if status.success() => Liveness::Live,
-            Ok(Ok(_)) => Liveness::Unknown,
+        let status = self
+            .client
+            .get_vm_status_nodes_node_lxc_vmid_status_current(&container.host, vmid);
+        match tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), status).await {
+            Ok(Ok(st)) => match st.into_inner().status.to_string().as_str() {
+                "running" => Liveness::Live,
+                _ => Liveness::Unknown,
+            },
             Ok(Err(_)) => Liveness::Unknown,
-            Err(_) => {
-                drop(child.start_kill());
-                Liveness::Wedged
-            }
+            Err(_) => Liveness::Wedged,
         }
     }
 

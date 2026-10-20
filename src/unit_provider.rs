@@ -437,28 +437,6 @@ fn facts_of(g: &GuestSummary) -> UnitFacts {
     )
 }
 
-/// Fold a guest-standard probe into `g`'s guard result. A failed probe is a
-/// violation, never a silent pass.
-fn apply_probe(
-    kind: GuestKind,
-    g: &mut GuestSummary,
-    probed: Result<crate::guest_standard::StandardFacts>,
-) {
-    match probed {
-        Ok(f) => {
-            g.standard = Some(f);
-            g.guard_violations = live_guard(kind, g)
-                .check(&facts_of(g))
-                .iter()
-                .map(GuardViolation::reason)
-                .collect();
-        }
-        Err(e) => g
-            .guard_violations
-            .push(format!("guest standard probe failed: {e:#}")),
-    }
-}
-
 /// The guard a live guest is held to: the guest standard once probed, the
 /// resource floor otherwise.
 fn live_guard(kind: GuestKind, g: &GuestSummary) -> UnitGuard {
@@ -726,20 +704,6 @@ impl ProxmoxUnitProvider {
             .await
             .ok()
             .and_then(|s| s.name);
-        // In-container probes run `pct` locally, so only a running LXC on this
-        // node can be probed; elsewhere the resource floor alone applies.
-        if kind == GuestKind::Lxc
-            && guest.status.as_deref() == Some("running")
-            && guest.node == crate::diagnostics::local_node()
-            && crate::lxc_guest::require_local_conf(
-                std::path::Path::new(crate::lxc_guest::PVE_LXC_CONF_DIR),
-                vmid,
-            )
-            .is_ok()
-        {
-            let probed = crate::guest_standard::probe(&crate::lxc_guest::SeamIo, vmid as u32).await;
-            apply_probe(kind, &mut guest, probed);
-        }
         Ok(VerbOutcome::Item(Self::list_item(&guest)))
     }
 
@@ -1739,17 +1703,6 @@ mod tests {
             live_guard(GuestKind::Lxc, &g).check(&facts_of(&g)),
             vec![GuardViolation::NoRootConsole]
         );
-    }
-
-    #[test]
-    fn a_failed_probe_is_a_guard_violation() {
-        let mut g = guest("n", None, "lxc", 100);
-        apply_probe(GuestKind::Lxc, &mut g, Err(anyhow!("timed out")));
-        assert_eq!(
-            g.guard_violations,
-            vec!["guest standard probe failed: timed out"]
-        );
-        assert!(g.standard.is_none());
     }
 
     fn guest_update(

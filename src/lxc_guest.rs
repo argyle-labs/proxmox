@@ -1,9 +1,6 @@
-//! In-container I/O for LXC guests through orca's privileged seams: `orca admin
-//! lxc-exec` (allowlisted argv) and `orca admin lxc-push` (file write).
-//!
-//! Both seams run `pct` on the node the plugin runs on, so a container is
-//! reachable only from the plugin instance on its own node; [`require_local`]
-//! turns a remote one into a clear error instead of a confusing `pct` failure.
+//! In-container I/O for LXC guests. The PVE REST API has no exec or file write
+//! into an LXC, so [`SeamIo`] refuses every call until an in-guest orca member
+//! serves it.
 
 use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::prelude::*;
@@ -83,50 +80,25 @@ pub trait GuestIo: Sync {
     ) -> BoxFuture<'a, Result<()>>;
 }
 
-/// The real seams.
+/// In-container I/O the PVE REST API cannot do: every call is refused.
 pub struct SeamIo;
 
+pub const UNSUPPORTED: &str = "unsupported: needs in-guest orca member (the PVE REST API cannot exec in or write files into an LXC)";
+
 impl GuestIo for SeamIo {
-    fn exec<'a>(&'a self, vmid: u32, argv: &'a [&'a str]) -> BoxFuture<'a, Result<ExecResult>> {
-        Box::pin(async move {
-            let argv0 = argv.first().copied().unwrap_or_default();
-            if let Some(need) = needs_allowlist(argv0) {
-                bail!("{need} (orca's lxc-exec seam refuses it; tracked in orca#769)");
-            }
-            let r = plugin_toolkit::lxc_exec::lxc_exec(vmid, argv).await?;
-            if !r.error.is_empty() {
-                if r.error.contains("refused command") {
-                    bail!("needs allowlist: {argv0} ({})", r.error);
-                }
-                bail!("lxc-exec in CT {vmid}: {}", r.error);
-            }
-            Ok(ExecResult {
-                success: r.success,
-                exit_code: r.exit_code,
-                stdout: r.stdout,
-                stderr: r.stderr,
-            })
-        })
+    fn exec<'a>(&'a self, vmid: u32, _argv: &'a [&'a str]) -> BoxFuture<'a, Result<ExecResult>> {
+        Box::pin(async move { bail!("CT {vmid}: {UNSUPPORTED}") })
     }
 
     fn write<'a>(
         &'a self,
         vmid: u32,
-        path: &'a str,
-        contents: &'a [u8],
-        mode: Option<&'a str>,
+        _path: &'a str,
+        _contents: &'a [u8],
+        _mode: Option<&'a str>,
     ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(push(vmid, path, contents, mode))
+        Box::pin(async move { bail!("CT {vmid}: {UNSUPPORTED}") })
     }
-}
-
-async fn push(vmid: u32, path: &str, contents: &[u8], mode: Option<&str>) -> Result<()> {
-    let r =
-        plugin_toolkit::lxc_push::lxc_push(vmid, path, contents, mode, Some("root:root")).await?;
-    if !r.ok {
-        bail!("write {path} into CT {vmid}: {}", r.error);
-    }
-    Ok(())
 }
 
 /// Largest file [`read_file`] returns. Paths are guest-controlled, so a read
