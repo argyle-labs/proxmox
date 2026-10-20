@@ -43,6 +43,7 @@ fn main() -> plugin_toolkit::anyhow::Result<()> {
     let mut plugin = Plugin::named("proxmox")
         .version(env!("CARGO_PKG_VERSION"))
         .tools(["proxmox."])
+        .api_surface("proxmox", proxmox::API_SURFACE)
         .schema_json(proxmox::deploy::schemas_json())
         .unit(proxmox::unit_provider::ProxmoxUnitProvider::new())
         .topology(proxmox::topology::ProxmoxTopology)

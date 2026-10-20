@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-#[path = "../build/ungate.rs"]
-mod ungate;
+use plugin_toolkit::serde_json::{self, Value};
 
 const ALLOWLIST: &str = include_str!("../specs/read_allowlist.txt");
 const GATED: &str = include_str!("../specs/gated_gets.txt");
-const SURFACED_GETS: usize = 228;
+const SURFACED_GETS: usize = 324;
 
 const NO_TOOL_GETS: &[&str] = &[
     "/nodes/{node}/qemu/{vmid}/agent/exec-status",
@@ -82,73 +81,130 @@ const DENIED: &[&str] = &[
     "/nodes/{node}/storage/{storage}/content",
 ];
 
-fn surfaced_gets() -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    let mut lines = proxmox::SURFACE_SOURCE.lines();
-    while let Some(line) = lines.next() {
-        if let Some(path) = line
-            .strip_prefix("/// Auto-generated from `GET ")
-            .and_then(|r| r.strip_suffix("`."))
-        {
-            let attr = lines.next().expect("attribute after doc line");
-            out.insert(path.to_string(), attr.to_string());
-        }
-    }
-    out
+fn parse_list(text: &str) -> BTreeSet<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect()
 }
 
-fn role_of(attr: &str) -> &str {
-    let rest = attr.split("role = \"").nth(1).expect("role set");
-    &rest[..rest.find('"').unwrap()]
+fn surface() -> Value {
+    serde_json::from_slice(proxmox::API_SURFACE).expect("api surface is JSON")
+}
+
+fn ops() -> Vec<Value> {
+    surface()["ops"].as_array().expect("ops").clone()
+}
+
+fn surfaced_gets() -> BTreeMap<String, Value> {
+    ops()
+        .into_iter()
+        .filter(|op| op["method"] == "GET" && op["internal"] != true)
+        .map(|op| (op["path"].as_str().unwrap().to_string(), op))
+        .collect()
+}
+
+fn role_of(op: &Value) -> &str {
+    op["policy"]["role"].as_str().expect("role set")
+}
+
+fn gated(op: &Value) -> bool {
+    op["policy"]["execute_gated"] == true
+}
+
+#[test]
+fn surface_binds_pve_auth_envelope_and_root() {
+    let s = surface();
+    assert_eq!(s["format"], "orca.api-surface/v1");
+    assert_eq!(s["surface"], "proxmox");
+    assert_eq!(s["base"]["api_root"], "/api2/json");
+    assert_eq!(s["auth"]["header"], "Authorization");
+    assert_eq!(
+        s["auth"]["template"],
+        "PVEAPIToken={endpoint.token_id}={secret}"
+    );
+    assert_eq!(s["auth"]["secret"], "proxmox.{endpoint}.token_secret");
+    assert_eq!(s["response"]["envelope"], "/data");
+    assert_eq!(s["response"]["lenient_bool"], true);
+    assert_eq!(s["response"]["lenient_number"], true);
+    assert_eq!(s["endpoint"]["table"], "endpoints");
+    assert_eq!(s["endpoint"]["key"], "name");
+}
+
+#[test]
+fn every_op_is_a_proxmox_tool_with_a_unique_name() {
+    let mut seen = BTreeSet::new();
+    for op in ops() {
+        let name = op["tool"].as_str().unwrap().to_string();
+        assert!(name.starts_with("proxmox."), "{name}");
+        assert!(seen.insert(name.clone()), "duplicate {name}");
+    }
+}
+
+#[test]
+fn no_hand_written_tool_shadows_a_surface_op() {
+    let manifest = plugin_toolkit::dispatch::tool_manifest_json();
+    let tools: Vec<Value> = serde_json::from_str(&manifest).expect("manifest");
+    let names: BTreeSet<String> = ops()
+        .iter()
+        .map(|op| op["tool"].as_str().unwrap().to_string())
+        .collect();
+    for t in tools {
+        let name = t["name"].as_str().unwrap();
+        assert!(
+            !names.contains(name),
+            "{name} is both a tool and a surface op"
+        );
+    }
 }
 
 #[test]
 fn only_action_gets_need_execute_and_no_get_is_a_mutation() {
     let gets = surfaced_gets();
     assert_eq!(gets.len(), SURFACED_GETS);
-    let gated = ungate::parse_allowlist(GATED);
-    for (path, attr) in &gets {
-        let want = format!("execute_gated = {}", gated.contains(path));
-        assert!(attr.contains(&want), "{path}: {attr}");
-        assert!(attr.contains("data_mutation = false"), "{path}: {attr}");
+    let gated_list = parse_list(GATED);
+    for (path, op) in &gets {
+        assert_eq!(gated(op), gated_list.contains(path), "{path}");
+        assert_eq!(op["policy"]["data_mutation"], false, "{path}");
     }
 }
 
 #[test]
 fn action_gets_are_pinned_admin_and_gated() {
-    let gated = ungate::parse_allowlist(GATED);
-    assert_eq!(gated.len(), GATED_GETS);
+    let gated_list = parse_list(GATED);
+    assert_eq!(gated_list.len(), GATED_GETS);
     for path in CREDENTIAL_GETS {
-        assert!(gated.contains(*path), "{path} not in gated_gets.txt");
+        assert!(gated_list.contains(*path), "{path} not in gated_gets.txt");
     }
     let gets = surfaced_gets();
-    for path in &gated {
+    for path in &gated_list {
         if NO_TOOL_GETS.contains(&path.as_str()) {
             assert!(!gets.contains_key(path), "{path} is surfaced");
             continue;
         }
-        let attr = &gets[path];
-        assert_eq!(role_of(attr), "admin", "{path}");
-        assert!(attr.contains("execute_gated = true"), "{path}: {attr}");
+        let op = &gets[path];
+        assert_eq!(role_of(op), "admin", "{path}");
+        assert!(gated(op), "{path}");
     }
 }
 
 #[test]
 fn only_allowlisted_gets_are_read_role() {
-    let allow = ungate::parse_allowlist(ALLOWLIST);
-    for (path, attr) in surfaced_gets() {
+    let allow = parse_list(ALLOWLIST);
+    for (path, op) in surfaced_gets() {
         let want = if allow.contains(&path) {
             "read"
         } else {
             "admin"
         };
-        assert_eq!(role_of(&attr), want, "{path}");
+        assert_eq!(role_of(&op), want, "{path}");
     }
 }
 
 #[test]
 fn sensitive_gets_are_pinned_admin() {
-    let allow = ungate::parse_allowlist(ALLOWLIST);
+    let allow = parse_list(ALLOWLIST);
     let gets = surfaced_gets();
     for path in DENIED {
         assert!(!allow.contains(*path), "{path} is allowlisted");
@@ -156,14 +212,14 @@ fn sensitive_gets_are_pinned_admin() {
             assert!(!gets.contains_key(*path), "{path} is surfaced");
             continue;
         }
-        let attr = gets
+        let op = gets
             .get(*path)
             .unwrap_or_else(|| panic!("{path} not surfaced"));
-        assert_eq!(role_of(attr), "admin", "{path}");
+        assert_eq!(role_of(op), "admin", "{path}");
     }
-    for (path, attr) in &gets {
+    for (path, op) in &gets {
         if path.starts_with("/access") {
-            assert_eq!(role_of(attr), "admin", "{path}");
+            assert_eq!(role_of(op), "admin", "{path}");
         }
     }
 }
@@ -183,154 +239,20 @@ fn inventory_and_status_gets_are_read_role() {
     }
 }
 
-fn allow(paths: &[&str]) -> BTreeSet<String> {
-    paths.iter().map(|p| p.to_string()).collect()
-}
-
 #[test]
-fn rewrite_classifies_through_interleaved_attributes() {
-    let src = "/// Auto-generated from `GET /a`.\n\
-               #[allow(dead_code)]\n\
-               #[orca_tool(cli = \"skip\", verb = \"a\", domain = \"proxmox\")]\n\
-               /// Auto-generated from `GET /b`.\n\
-               #[orca_tool(domain = \"proxmox\", verb = \"b\", cli = \"skip\")]\n";
-    let out = ungate::classify_gets(src, &allow(&["/a"]), &BTreeSet::new());
-    assert!(out.unused.is_empty());
-    assert_eq!((out.gets, out.rewritten), (2, 2));
-    let lines: Vec<&str> = out.source.lines().collect();
-    assert_eq!(
-        lines[2],
-        "#[orca_tool(cli = \"skip\", verb = \"a\", domain = \"proxmox\", role = \"read\", \
-         execute_gated = false, data_mutation = false)]"
-    );
-    assert!(lines[4].ends_with("role = \"admin\", execute_gated = false, data_mutation = false)]"));
-}
-
-#[test]
-fn rewrite_drops_a_get_doc_line_not_followed_by_an_attribute() {
-    let src = "/// Auto-generated from `GET /a`.\n\
-               fn stray() {}\n\
-               #[orca_tool(domain = \"proxmox\", verb = \"x\", cli = \"skip\")]\n\
-               /// Auto-generated from `PUT /b`.\n\
-               #[orca_tool(domain = \"proxmox\", verb = \"b\", cli = \"skip\", role = \"admin\")]\n";
-    let out = ungate::classify_gets(src, &allow(&["/a"]), &BTreeSet::new());
-    assert_eq!(out.source, src);
-    assert_eq!((out.gets, out.rewritten), (1, 0));
-    assert_eq!(out.unused, allow(&["/a"]));
-}
-
-#[test]
-#[should_panic(expected = "already sets role")]
-fn rewrite_refuses_a_get_that_already_sets_a_role() {
-    ungate::classify_gets(
-        "/// Auto-generated from `GET /a`.\n#[orca_tool(verb = \"a\", role = \"any\")]\n",
-        &BTreeSet::new(),
-        &BTreeSet::new(),
-    );
-}
-
-#[test]
-fn rewrite_keeps_a_spec_admin_get_and_applies_its_gate() {
-    let src = "/// Auto-generated from `GET /tfa`.\n#[orca_tool(verb = \"t\", role = \"admin\")]\n";
-    let out = ungate::classify_gets(src, &BTreeSet::new(), &allow(&["/tfa"]));
-    assert_eq!(
-        out.source,
-        "/// Auto-generated from `GET /tfa`.\n\
-         #[orca_tool(verb = \"t\", role = \"admin\", execute_gated = true, data_mutation = false)]\n"
-    );
-    assert_eq!((out.gets, out.rewritten), (1, 1));
-}
-
-#[test]
-#[should_panic(expected = "x-orca-admin in the spec and read-allowlisted")]
-fn rewrite_refuses_to_allowlist_a_spec_admin_get() {
-    ungate::classify_gets(
-        "/// Auto-generated from `GET /tfa`.\n#[orca_tool(verb = \"t\", role = \"admin\")]\n",
-        &allow(&["/tfa"]),
-        &BTreeSet::new(),
-    );
-}
-
-#[test]
-fn rewrite_gates_listed_action_gets_and_reports_unmatched_entries() {
-    let src = "/// Auto-generated from `GET /scan`.\n#[orca_tool(verb = \"s\")]\n";
-    let out = ungate::classify_gets(src, &BTreeSet::new(), &allow(&["/scan", "/gone"]));
-    assert!(
-        out.source
-            .contains("role = \"admin\", execute_gated = true")
-    );
-    assert_eq!(out.unused, allow(&["/gone"]));
-}
-
-#[test]
-fn gated_get_marked_no_tool_warns_and_keeps_its_gate() {
-    let out = ungate::classify_gets("", &BTreeSet::new(), &allow(&["/dl"]));
-    let warnings = ungate::check_unused(&out.unused, &allow(&["/dl"]), &allow(&["/dl"]));
-    assert_eq!(
-        warnings,
-        ["gated GET /dl has no tool (x-orca-no-tool); gate kept"]
-    );
-}
-
-#[test]
-#[should_panic(expected = "no surfaced GET: /dl")]
-fn gated_get_missing_without_no_tool_marker_panics() {
-    let out = ungate::classify_gets("", &BTreeSet::new(), &allow(&["/dl"]));
-    ungate::check_unused(&out.unused, &allow(&["/dl"]), &BTreeSet::new());
-}
-
-#[test]
-fn gated_get_with_a_tool_is_gated_despite_no_tool_marker() {
-    let src = "/// Auto-generated from `GET /dl`.\n#[orca_tool(verb = \"d\")]\n";
-    let out = ungate::classify_gets(src, &BTreeSet::new(), &allow(&["/dl"]));
-    assert!(
-        out.source
-            .contains("role = \"admin\", execute_gated = true")
-    );
-    assert!(ungate::check_unused(&out.unused, &allow(&["/dl"]), &allow(&["/dl"])).is_empty());
-}
-
-#[test]
-#[should_panic(expected = "both read-allowlisted and gated")]
-fn rewrite_refuses_a_path_both_allowed_and_gated() {
-    ungate::classify_gets("", &allow(&["/a"]), &allow(&["/a"]));
-}
-
-fn tool_for(path: &str) -> String {
-    let attr = &surfaced_gets()[path];
-    let rest = attr.split("verb = \"").nth(1).unwrap();
-    format!("proxmox.{}", &rest[..rest.find('"').unwrap()])
-}
-
-#[allow(unused_imports)]
-use proxmox as _;
-
-fn read_principal_may_call(path: &str) -> bool {
-    use plugin_toolkit::dispatch::tool_roles::authorize;
-    let name = tool_for(path);
-    let role = plugin_toolkit::dispatch::required_role(&name).expect("registered");
-    let mutation = plugin_toolkit::dispatch::data_mutation_names().contains(&name.as_str());
-    authorize("read", false, role, mutation) || authorize("read", true, role, mutation)
-}
-
-#[test]
-fn read_principal_is_refused_admin_gets_and_allowed_allowlisted_ones() {
-    for path in [
-        "/nodes/{node}/lxc/{vmid}/config",
-        "/access/users",
-        "/nodes/{node}/scan/nfs",
-    ] {
-        assert!(!read_principal_may_call(path), "{path}");
-    }
-    for path in ["/cluster/resources", "/nodes/{node}/lxc"] {
-        assert!(read_principal_may_call(path), "{path}");
+fn writes_are_admin_execute_gated_and_not_data_mutations() {
+    for op in ops().iter().filter(|op| op["method"] != "GET") {
+        let name = op["tool"].as_str().unwrap();
+        assert!(gated(op), "{name}");
+        assert_eq!(role_of(op), "admin", "{name}");
+        assert_eq!(op["policy"]["data_mutation"], false, "{name}");
     }
 }
 
 #[test]
 fn allowlist_ignores_comments_and_blanks() {
     assert_eq!(
-        ungate::parse_allowlist("# c\n\n /version \n"),
-        allow(&["/version"])
+        parse_list("# c\n\n /version \n"),
+        BTreeSet::from(["/version".to_string()])
     );
 }
