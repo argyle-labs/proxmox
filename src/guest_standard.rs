@@ -1349,7 +1349,8 @@ pub struct StandardAudit {
     domain = "proxmox",
     verb = "guest.standard.audit",
     execute_gated = false,
-    role = "read"
+    role = "read",
+    reaches = ["lxc.exec"]
 )]
 async fn proxmox_guest_standard_audit(
     args: StandardAuditArgs,
@@ -1464,7 +1465,8 @@ pub async fn apply(
     domain = "proxmox",
     verb = "guest.standard.apply",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    reaches = ["lxc.exec", "lxc.push"]
 )]
 async fn proxmox_guest_standard_apply(
     args: StandardApplyArgs,
@@ -1504,7 +1506,8 @@ pub struct GuestUpdateArgs {
     domain = "proxmox",
     verb = "guest.update",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    reaches = ["lxc.exec", "lxc.push"]
 )]
 async fn proxmox_guest_update(
     args: GuestUpdateArgs,

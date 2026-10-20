@@ -921,7 +921,8 @@ pub async fn pxarexclude(
     domain = "proxmox",
     verb = "guest.pxarexclude",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    reaches = ["lxc.exec", "lxc.push"]
 )]
 async fn proxmox_guest_pxarexclude(
     args: PxarExcludeArgs,

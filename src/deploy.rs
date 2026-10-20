@@ -86,6 +86,7 @@ fn table_def() -> TableDef {
         not_null: true,
         primary_key: false,
         default: Some(format!("'{default}'")),
+        secret: false,
     };
     let int_nn = |name: &str, default: &str| ColumnDef {
         name: name.to_string(),
@@ -93,6 +94,7 @@ fn table_def() -> TableDef {
         not_null: true,
         primary_key: false,
         default: Some(default.to_string()),
+        secret: false,
     };
     TableDef {
         table: TABLE.to_string(),
@@ -103,6 +105,7 @@ fn table_def() -> TableDef {
                 not_null: true,
                 primary_key: true,
                 default: None,
+                secret: false,
             },
             text_nn("endpoint", ""),
             text_nn("kind", "lxc"),
