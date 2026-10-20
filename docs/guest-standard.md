@@ -2,7 +2,7 @@
 
 > **Unsupported today.** Every in-container read, write and command below needs
 > exec or file I/O inside the LXC, which the PVE REST API does not offer. The
-> plugin runs no root or `pct` path, so audit, apply and update refuse with
+> plugin has no root path, so audit, apply, update and pxarexclude refuse with
 > `unsupported: needs in-guest orca member` until such a member exists.
 
 Every LXC is held to two things beyond its resource floor:
@@ -11,13 +11,9 @@ Every LXC is held to two things beyond its resource floor:
 - **A one-word `update`.** It runs the container's updater only after orca has
   backed the container up.
 
-`unit.detail` probes a running LXC on the plugin's own node and fills the guard's
-`has_root_console` / `has_update_command` facts. A probed LXC is then held to
-`require_root_console` and `require_update_command`, and a missing piece shows
-in `guard_violations`. If the probe itself fails or times out, that shows as a
-`guest standard probe failed: …` violation, never as a pass. An unprobed guest
-(a VM, a stopped or remote LXC, or a `list` row) is held to the resource floor
-only, so facts nobody read never fail closed.
+`unit.detail` does not probe guests, so every guest is held to the resource
+floor only. The unit `update` action still returns its plan; executing it is
+unsupported.
 
 ## Security notes
 
@@ -31,24 +27,20 @@ only, so facts nobody read never fail closed.
 
 | verb | role | what it does |
 | --- | --- | --- |
-| `proxmox.guest.standard.audit` | read | probe one LXC and report its facts, guard violations and drift |
-| `proxmox.guest.standard.apply` | admin | install autologin and the `update` gate; dry-run unless `execute: true` |
-| `proxmox.guest.update` | admin | back up through the PVE API, then run the updater; dry-run unless `execute: true` |
-| `unit.update action=update` (lxc) | admin | the same backup-then-update; returns a plan unless the payload sets `"execute": true` |
+| `proxmox.guest.standard.audit` | read | unsupported |
+| `proxmox.guest.standard.apply` | admin | unsupported |
+| `proxmox.guest.update` | admin | unsupported |
+| `unit.update action=update` (lxc) | admin | returns a plan; unsupported with `"execute": true` in the payload |
 
 The unit action's dry run touches nothing, not even a read in the container, so
 it names how the updater is chosen rather than the exact commands.
-`proxmox.guest.update`'s dry run probes first and lists the exact steps.
 
-All of them run in-container work through `pct` on the node that runs the
-container. Before any exec they check that the node name matches and that
-`/etc/pve/lxc/<vmid>.conf` exists locally, because pmxcfs lists only this node's
-containers there.
+The rest of this document describes the steps an in-guest orca member would run.
 
 ## Probe (read-only)
 
-The probe uses only `stat`, `head`, `ls -d` and `systemctl show`, all already on
-the allowlist. It is bounded to 10 s.
+The probe uses only `stat`, `head`, `ls -d` and `systemctl show`. It is bounded
+to 10 s.
 
 Every file read first runs `stat -L -c '%F|%s' --`, then `head -c 65536 --`. The
 paths are inside the container, and a guest could point one at `/dev/zero` or a
@@ -59,8 +51,7 @@ FIFO. A read is refused when the file is:
   `stat`, not from what was read);
 - not valid UTF-8.
 
-`systemctl` output larger than 64 KiB is refused too. `test -e` would need its
-own allowlist entry, and `ls -d` gives the same answer.
+`systemctl` output larger than 64 KiB is refused too.
 
 | fact | read |
 | --- | --- |
@@ -74,14 +65,7 @@ own allowlist entry, and `ls -d` gives the same answer.
 
 ## Apply
 
-Every file orca writes goes through orca's `lxc-push` seam, which runs
-`pct push`. `pct push` enters the container's mount namespace before creating
-the file, and also its user namespace (as uid 0) for an unprivileged
-container. Paths, symlinks included, therefore resolve inside the container,
-with the access of the container's root; pve-container's `pct.pm` says so in
-its comment on `push`.
-
-Before each write, orca also checks the target and its existing parents with
+Before each write, orca checks the target and its existing parents with
 `stat -c '%n|%F' --`, as a guard against accidents. It refuses unless:
 
 - the target is a regular file or absent;
@@ -112,23 +96,19 @@ Alpine:
    `/sbin/getty -n -l /usr/local/sbin/autologin ...`. Other ids (such as
    `ttyS0`) and commented lines are left alone. A line that already passes
    `-l <program>` is also left alone and reported as drift.
-4. Run `kill -HUP 1`, because busybox init re-reads inittab only on SIGHUP. Until
-   orca allowlists `kill`, this step is **deferred**: the plan and the result
-   mark it `deferred`, and autologin takes effect at the container's next start.
+4. Run `kill -HUP 1`, because busybox init re-reads inittab only on SIGHUP.
 
 The `update` gate:
 
-- **The gate is refused if its updater cannot run.** That is the case when the
-  updater `auto` resolves to (`/usr/bin/update` or `apk`) is not allowlisted, or
-  the OS has no updater. A gate nothing could open would only break `update`.
+- **The gate is refused if the OS has no updater.** A gate nothing could open
+  would only break `update`.
 - **An existing `/usr/local/bin/update` without the orca marker** (such as the
   hand-rolled ssh gate) is refused unless `replace_gate: true` is passed. With
   it, the old script is kept as `/usr/local/bin/update.orca-replaced`, and the
   plan shows the diff.
   - The copy goes through orca, because the seam has no `cp`. The exec seam
     trims both ends of its output, so the copy is refused unless the read
-    length equals the on-disk size. A gate ending in a newline is refused
-    until core returns raw bytes or allowlists `cp`.
+    length equals the on-disk size, so a gate ending in a newline is refused.
   - If `.orca-replaced` already holds a different script, the replacement is
     refused, so neither script is lost.
 - **What gets written.** Otherwise the gate is written to
@@ -150,23 +130,22 @@ Everything that can refuse does so before the backup:
    - An explicit updater that does not fit the OS is refused, for example `apt`
      on Alpine, or `community` without `/usr/bin/update`.
    - So is an OS with no updater.
-2. Refuse if any updater command is outside the allowlist.
-3. Refuse if another update of the same CT is in progress in this plugin
+2. Refuse if another update of the same CT is in progress in this plugin
    process. This per-CT lock is held from the probe until the update finishes.
    A caller that drops the request releases the lock while the unit keeps
    running in the container. The unit's own running check (below) is the
    backstop for that case, and for another orca instance.
-4. On systemd guests, refuse if `orca-guest-update.service` is running, if it
+3. On systemd guests, refuse if `orca-guest-update.service` is running, if it
    loads from any file other than orca's `/run/systemd/system` one, or if it
    has drop-ins. The check reads `systemctl show -p FragmentPath -p DropInPaths`.
 
 Then:
 
-5. Back up through the unit `backup` action: vzdump through the PVE API, waited
+4. Back up through the unit `backup` action: vzdump through the PVE API, waited
    on. A failed backup aborts the update.
-6. Write the backup reference to `/run/orca-update-backup.json`, which opens the
+5. Write the backup reference to `/run/orca-update-backup.json`, which opens the
    in-guest gate for an hour.
-7. Run the updater.
+6. Run the updater.
    - **On Debian/Ubuntu** it runs as a oneshot systemd unit, so the 5-minute
      lxc-exec timeout cannot kill dpkg mid-upgrade.
      1. Orca writes `/run/systemd/system/orca-guest-update.service` with
@@ -204,7 +183,6 @@ Then:
         those values after the run, so systemd cannot reset them before orca
         reads them.
      6. The output is `systemctl status --lines=40`, capped at 64 KiB.
-       `journalctl` would need its own allowlist entry.
    - **On Alpine** the commands run directly through the seam, still under its
      5-minute timeout.
 
@@ -221,25 +199,3 @@ forced-command key (`/root/.orca/host_backup_key` →
 `/etc/pve/priv/authorized_keys`). The container no longer holds a credential to
 its host. The audit reports a leftover key as drift. Removing it, and its host
 line, is not yet an orca step.
-
-## lxc-exec allowlist additions
-
-orca's root-side `lxc-exec` allowlist (`system::lxc_exec::ALLOWED_COMMANDS`,
-tracked in orca#769) does not yet carry these. The plugin mirrors the current
-list (`lxc_guest::EXEC_ALLOWLIST`) and the needed additions
-(`lxc_guest::PROPOSED_ALLOWLIST`). A step that needs one is named in the plan as
-`needs allowlist: <cmd>`.
-
-| entry | used for | why it is needed |
-| --- | --- | --- |
-| `kill` | `kill -HUP 1` | makes the Alpine inittab change live without a container restart |
-| `apk` | `apk update`, `apk upgrade` | the Alpine package updater, the counterpart of the allowed `apt-get` |
-| `/usr/bin/update` | the app's own updater | community-scripts, or a Gitea or Caddy updater that validates and rolls back, run only after orca's backup. Proposed as an absolute path, because the allowlist matches basenames today and a bare `update` would admit any program of that name. |
-
-`sh` is not requested. Every step execs its program directly, and `sh -c` would
-let the exec seam run any command line it is handed.
-
-The allowlist bounds what the exec seam runs. It is not a complete boundary for
-the container, because `lxc-push` already writes files as the container's root,
-including the update unit above. The plugin only ever puts commands that are
-themselves allowlisted into that unit.

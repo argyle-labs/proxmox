@@ -11,10 +11,7 @@
 //!   back empty, and each read the token cannot make ([`NOT_CAPTURABLE`]);
 //! * `SHA256SUMS` — `sha256sum -c` format over every other file.
 //!
-//! Root-only host files (`/etc/ssh`, crontabs, `/root/.ssh`, ...) have no PVE
-//! API, so every node slot is `partial` with a warning naming them.
-//!
-//! A failed core read fails the slot; a failed other read makes the result
+//! A failed core read fails the slot. A failed other read makes the result
 //! `partial` with a `warnings` entry.
 //!
 //! Restore is capture-only: it verifies `SHA256SUMS` and refuses.
@@ -25,9 +22,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use plugin_toolkit::serde_json::{Value, json};
 
-const HOST_UNSUPPORTED: &str = "host files not captured: unsupported: needs in-guest orca member \
-     (no PVE API exposes /etc/ssh, /etc/cron.d, /etc/fstab, /usr/local/{bin,sbin}, /root/.ssh, \
-     /var/spool/cron/crontabs)";
+const HOST_SKIPPED: &str = "host files (/etc/ssh, /etc/cron.d, /etc/fstab, /usr/local/{bin,sbin}, \
+     /root/.ssh, /var/spool/cron/crontabs): unsupported: needs in-guest orca member\n";
 
 const SUMS: &str = "SHA256SUMS";
 const API_DIR: &str = "api";
@@ -347,28 +343,17 @@ pub async fn backup(dir: &str, instance: &str) -> Result<Value> {
             http: cfg.build_reqwest_client()?,
             base_url: cfg.base_url.clone(),
         };
-        return capture(&api, &Scope::Cluster, Path::new(dir), None).await;
+        return capture(&api, &Scope::Cluster, Path::new(dir)).await;
     }
     let (cfg, _) = crate::backup::resolve_endpoint_for_node(instance).await?;
     let api = Endpoint {
         http: cfg.build_reqwest_client()?,
         base_url: cfg.base_url.clone(),
     };
-    capture(
-        &api,
-        &Scope::Node(instance.to_string()),
-        Path::new(dir),
-        Some(Err(HOST_UNSUPPORTED.to_string())),
-    )
-    .await
+    capture(&api, &Scope::Node(instance.to_string()), Path::new(dir)).await
 }
 
-pub(crate) async fn capture<A: ApiRead>(
-    api: &A,
-    scope: &Scope,
-    dest: &Path,
-    host: Option<Result<String, String>>,
-) -> Result<Value> {
+pub(crate) async fn capture<A: ApiRead>(api: &A, scope: &Scope, dest: &Path) -> Result<Value> {
     let dir = dest.join(API_DIR);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let (label, reads) = match scope {
@@ -453,22 +438,17 @@ pub(crate) async fn capture<A: ApiRead>(
         .with_context(|| format!("write {file}"))?;
         captured += 1;
     }
-    if *scope == Scope::Cluster {
-        for (path, why) in NOT_CAPTURABLE {
-            skipped.push_str(&format!("{path}: {why}\n"));
+    match scope {
+        Scope::Cluster => {
+            for (path, why) in NOT_CAPTURABLE {
+                skipped.push_str(&format!("{path}: {why}\n"));
+            }
         }
+        Scope::Node(_) => skipped.push_str(HOST_SKIPPED),
     }
     if !skipped.is_empty() {
         std::fs::write(dir.join(SKIPPED), &skipped).context("write SKIPPED")?;
     }
-    let host_note = match host {
-        Some(Ok(detail)) => detail,
-        Some(Err(w)) => {
-            warnings.push(w.clone());
-            w
-        }
-        None => "no host files in the cluster slot".to_string(),
-    };
     write_sums(dest)?;
     let (files, digest) = verify_sums(dest)?;
     let prefix = if warnings.is_empty() {
@@ -481,7 +461,7 @@ pub(crate) async fn capture<A: ApiRead>(
         "partial": !warnings.is_empty(),
         "warnings": warnings,
         "note": format!(
-            "{prefix}{label}: {host_note}; {captured} API read(s); {} SKIPPED line(s); \
+            "{prefix}{label}: {captured} API read(s); {} SKIPPED line(s); \
              {files} file(s) in SHA256SUMS",
             skipped.lines().count()
         ),
@@ -691,14 +671,7 @@ mod tests {
     fn node_slot_reads_only_node_scoped_paths() {
         let dest = scratch("node");
         let api = fake(vec![], vec![]);
-        let out = rt()
-            .block_on(capture(
-                &api,
-                &node(),
-                &dest,
-                Some(Ok("5 host file(s)".into())),
-            ))
-            .unwrap();
+        let out = rt().block_on(capture(&api, &node(), &dest)).unwrap();
         let calls = api.calls.lock().unwrap().clone();
         assert_eq!(calls.len(), NODE_READS.len());
         assert!(
@@ -707,8 +680,7 @@ mod tests {
         );
         assert_eq!(out["partial"], false);
         assert_eq!(out["warnings"], json!([]));
-        assert!(!dest.join("api").join(SKIPPED).exists());
-        assert_eq!(verify_sums(&dest).unwrap().0, NODE_READS.len());
+        assert_eq!(verify_sums(&dest).unwrap().0, NODE_READS.len() + 1);
         std::fs::remove_dir_all(&dest).unwrap();
     }
 
@@ -716,7 +688,7 @@ mod tests {
     fn cluster_slot_reads_cluster_paths_once_and_skips_acl() {
         let dest = scratch("cluster");
         let api = fake(vec![], vec![]);
-        rt().block_on(capture(&api, &Scope::Cluster, &dest, None))
+        rt().block_on(capture(&api, &Scope::Cluster, &dest))
             .unwrap();
         let calls = api.calls.lock().unwrap().clone();
         assert_eq!(calls.len(), CLUSTER_READS.len());
@@ -746,7 +718,7 @@ mod tests {
             ],
         );
         let out = rt()
-            .block_on(capture(&api, &Scope::Cluster, &dest, None))
+            .block_on(capture(&api, &Scope::Cluster, &dest))
             .unwrap();
         let skipped = std::fs::read_to_string(dest.join("api").join(SKIPPED)).unwrap();
         assert!(
@@ -768,11 +740,9 @@ mod tests {
     fn refused_reads_are_scrubbed_warnings_and_partial() {
         let dest = scratch("skip");
         let api = fake(vec!["nodes/n1/dns", "nodes/n1/time"], vec![]);
-        let out = rt()
-            .block_on(capture(&api, &node(), &dest, Some(Ok("ok".into()))))
-            .unwrap();
+        let out = rt().block_on(capture(&api, &node(), &dest)).unwrap();
         let skipped = std::fs::read_to_string(dest.join("api").join(SKIPPED)).unwrap();
-        assert_eq!(skipped.lines().count(), 2);
+        assert_eq!(skipped.lines().count(), 3);
         assert!(
             !skipped.contains("pw@") && !skipped.contains("token=abc"),
             "{skipped}"
@@ -788,9 +758,7 @@ mod tests {
         for (scope, core) in [(node(), "nodes/n1/network"), (Scope::Cluster, "storage")] {
             let dest = scratch("core");
             let api = fake(vec![core], vec![]);
-            let err = rt()
-                .block_on(capture(&api, &scope, &dest, None))
-                .unwrap_err();
+            let err = rt().block_on(capture(&api, &scope, &dest)).unwrap_err();
             assert!(err.to_string().contains("core read failed"), "{err}");
             assert!(!dest.join(SUMS).exists());
             std::fs::remove_dir_all(&dest).unwrap();
@@ -803,7 +771,7 @@ mod tests {
         let mut api = fake(vec!["cluster/config/nodes", "cluster/config/totem"], vec![]);
         api.clustered = false;
         let out = rt()
-            .block_on(capture(&api, &Scope::Cluster, &dest, None))
+            .block_on(capture(&api, &Scope::Cluster, &dest))
             .unwrap();
         assert!(dest.join("api/nodes.json").exists());
         assert!(!dest.join("api/cluster-nodes.json").exists());
@@ -821,7 +789,7 @@ mod tests {
         let mut api = fake(vec!["cluster/config/nodes", "nodes"], vec![]);
         api.clustered = false;
         let err = rt()
-            .block_on(capture(&api, &Scope::Cluster, &dest, None))
+            .block_on(capture(&api, &Scope::Cluster, &dest))
             .unwrap_err();
         assert!(err.to_string().contains("standalone fallback"), "{err}");
         std::fs::remove_dir_all(&dest).unwrap();
@@ -832,7 +800,7 @@ mod tests {
         let dest = scratch("clustered-403");
         let api = fake(vec!["cluster/config/nodes"], vec![]);
         let err = rt()
-            .block_on(capture(&api, &Scope::Cluster, &dest, None))
+            .block_on(capture(&api, &Scope::Cluster, &dest))
             .unwrap_err();
         assert!(err.to_string().contains("core read failed"), "{err}");
         assert!(!api.calls.lock().unwrap().contains(&"nodes".to_string()));
@@ -844,7 +812,7 @@ mod tests {
         let dest = scratch("nousers");
         let api = fake(vec![], vec!["access/users"]);
         let out = rt()
-            .block_on(capture(&api, &Scope::Cluster, &dest, None))
+            .block_on(capture(&api, &Scope::Cluster, &dest))
             .unwrap();
         assert_eq!(out["partial"], true);
         assert!(
@@ -894,7 +862,7 @@ mod tests {
         api.clustered = false;
         api.nodes = vec!["n1", "n2"];
         let err = rt()
-            .block_on(capture(&api, &Scope::Cluster, &dest, None))
+            .block_on(capture(&api, &Scope::Cluster, &dest))
             .unwrap_err();
         assert!(err.to_string().contains("not provably standalone"), "{err}");
         std::fs::remove_dir_all(&dest).unwrap();
@@ -940,23 +908,14 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_host_files_make_the_node_slot_partial() {
-        let dest = scratch("partial");
+    fn host_files_are_skipped_without_making_the_node_slot_partial() {
+        let dest = scratch("host");
         let out = rt()
-            .block_on(capture(
-                &fake(vec![], vec![]),
-                &node(),
-                &dest,
-                Some(Err(HOST_UNSUPPORTED.to_string())),
-            ))
+            .block_on(capture(&fake(vec![], vec![]), &node(), &dest))
             .unwrap();
-        assert_eq!(out["partial"], true);
-        assert!(
-            out["warnings"][0]
-                .as_str()
-                .unwrap()
-                .starts_with("host files not captured: unsupported")
-        );
+        assert_eq!(out["partial"], false);
+        let skipped = std::fs::read_to_string(dest.join("api").join(SKIPPED)).unwrap();
+        assert_eq!(skipped, HOST_SKIPPED);
         std::fs::remove_dir_all(&dest).unwrap();
     }
 

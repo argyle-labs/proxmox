@@ -121,10 +121,7 @@ fn table_def() -> TableDef {
 /// The `schema_json` this plugin hands `serve_tool_plugin! { schemas: … }` so
 /// core materializes `proxmox_deploy_target` at load.
 pub fn schemas_json() -> String {
-    build_schemas_json(
-        NAMESPACE,
-        vec![table_def(), crate::guest_mount::raw_drop_table_def()],
-    )
+    build_schemas_json(NAMESPACE, vec![table_def()])
 }
 
 // ── Table access (mirrors the generated `endpoint_db` over `db_op`) ─────────

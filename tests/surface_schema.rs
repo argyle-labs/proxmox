@@ -390,3 +390,48 @@ fn every_admin_handler_refuses_a_non_admin_caller_itself() {
         assert!(err.contains("requires role 'admin'"), "{err}");
     }
 }
+
+#[test]
+fn in_guest_verbs_are_unsupported_before_any_capability() {
+    let admin = plugin_toolkit::contract::CallerIdentity {
+        user_id: "u".into(),
+        username: "op".into(),
+        role: "admin".into(),
+        can_mutate: true,
+    };
+    for (name, args) in [
+        (
+            "proxmox.guest.standard.audit",
+            serde_json::json!({"endpoint": "pve", "ctid": 116}),
+        ),
+        (
+            "proxmox.guest.pxarexclude",
+            serde_json::json!({"endpoint": "pve", "ctid": 116, "patterns": ["/data"]}),
+        ),
+        (
+            "proxmox.guest.standard.apply",
+            serde_json::json!({"endpoint": "pve", "ctid": 116}),
+        ),
+        (
+            "proxmox.guest.update",
+            serde_json::json!({"endpoint": "pve", "ctid": 116}),
+        ),
+    ] {
+        let ctx = test_ctx().with_auth(admin.clone());
+        let err = plugin_toolkit::capsink::with_cap_sink(
+            Box::new(move |cap: &str, raw: &str| panic!("{name} reached capability {cap}: {raw}")),
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(plugin_toolkit::dispatch::dispatch(name, args, &ctx))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unsupported: needs in-guest orca member"),
+            "{name}: {err:#}"
+        );
+    }
+}

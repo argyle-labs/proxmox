@@ -19,8 +19,7 @@
 //!   the repair (`guest-install::…`) returns honest manual guidance rather than
 //!   pretending to act. This is the VM104 / gha-runner case.
 //!
-//! LXC guests need no agent (orca uses `pct exec` on the node), so they are not
-//! diagnosed here.
+//! LXC guests have no guest agent, so they are not diagnosed here.
 
 use crate::generated::{self, types as gtypes};
 use crate::tools::{for_each_enabled_endpoint, resolve_config};

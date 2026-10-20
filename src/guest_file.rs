@@ -1,21 +1,15 @@
 //! Copy a file out of a guest to a host directory (`proxmox.guest.file_pull`).
 //!
-//! LXC: the PVE REST API has no call that reads a container file, so a pull is
-//! refused as unsupported until an in-guest orca member serves it.
-//!
 //! VM: the PVE guest-agent `file-read` returns at most 16 MiB in one JSON
 //! string with no offset parameter, so it can neither be chunked nor carry
 //! binary data intact; VMs are refused.
 
 use anyhow::ensure;
-use plugin_toolkit::contract::CallerIdentity;
-use plugin_toolkit::contract::plan::PlannedChange;
 use plugin_toolkit::prelude::*;
 
 use crate::execute::{self, Change};
 
 const TOOL: &str = "proxmox.guest.file_pull";
-/// Guest directories a pull may read.
 const ALLOWED_GUEST_DIRS: &[&str] = &["/var/lib/gitea/backups"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -25,7 +19,6 @@ pub enum GuestKind {
     Vm,
 }
 
-/// One pull request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilePullOp {
     pub vmid: u64,
@@ -33,10 +26,8 @@ pub struct FilePullOp {
     pub guest_path: String,
     pub dest_dir: String,
     pub dest_name: String,
-    pub dry_run: bool,
 }
 
-/// The dry-run sizing, or the pulled file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct FilePulled {
     pub path: String,
@@ -130,57 +121,25 @@ fn parse_kind(s: &str) -> Result<GuestKind, String> {
 }
 
 impl FilePullArgs {
-    fn op(&self, dry_run: bool) -> FilePullOp {
+    fn op(&self) -> FilePullOp {
         FilePullOp {
             vmid: self.vmid,
             kind: self.kind,
             guest_path: self.guest_path.clone(),
             dest_dir: self.dest_dir.clone(),
             dest_name: self.dest_name.clone(),
-            dry_run,
         }
     }
 }
 
-pub async fn file_pull(
-    args: &FilePullArgs,
-    caller: Option<&CallerIdentity>,
-) -> Result<Change<FilePulled>> {
-    let op = args.op(!args.execute);
+pub fn file_pull(args: &FilePullArgs) -> Result<Change<FilePulled>> {
+    let op = args.op();
     op.validate()?;
-    if !args.execute {
-        let sized = privileged(&op).await?;
-        let summary = format!(
-            "copy {} from CT {} to {} ({} bytes; {} bytes free)",
-            op.guest_path,
-            op.vmid,
-            sized.path,
-            sized.size,
-            sized.free_bytes.unwrap_or_default()
-        );
-        let change = PlannedChange::new(&sized.path, "create")
-            .with_detail(format!("{} bytes from CT {}", sized.size, op.vmid));
-        return Ok(Change::Plan(execute::plan(
-            TOOL,
-            args,
-            summary,
-            vec![change],
-        )?));
-    }
-    execute::authorize_execute(TOOL, caller)?;
-    Ok(Change::Applied(privileged(&op).await?))
+    bail!("CT {}: {TOOL}: {}", op.vmid, crate::lxc_guest::UNSUPPORTED)
 }
 
-async fn privileged(op: &FilePullOp) -> Result<FilePulled> {
-    bail!(
-        "CT {}: {TOOL}: unsupported: needs in-guest orca member (the PVE REST API cannot read a file out of an LXC)",
-        op.vmid
-    )
-}
-
-/// [MUTATES STATE] Copy one file out of an LXC guest on this node into a host
-/// directory, returning its size and sha256. Without `execute` reports the
-/// file size and destination free space, and refuses if it would not fit.
+/// [MUTATES STATE] Copy one file out of a guest into a host directory.
+/// Unsupported for LXC (no PVE API reads a container file) and refused for VMs.
 #[orca_tool(
     domain = "proxmox",
     verb = "guest.file_pull",
@@ -189,7 +148,7 @@ async fn privileged(op: &FilePullOp) -> Result<FilePulled> {
 )]
 async fn proxmox_guest_file_pull(args: FilePullArgs, ctx: &ToolCtx) -> Result<Change<FilePulled>> {
     execute::require_admin(TOOL, ctx.caller().as_ref())?;
-    file_pull(&args, ctx.caller().as_ref()).await
+    file_pull(&args)
 }
 
 #[cfg(test)]
@@ -204,7 +163,6 @@ mod tests {
             guest_path: "/var/lib/gitea/backups/dump.zip".into(),
             dest_dir: "/srv/dest".into(),
             dest_name: "dump.zip".into(),
-            dry_run: false,
         };
         let bad = |f: &dyn Fn(&mut FilePullOp)| {
             let mut op = base.clone();

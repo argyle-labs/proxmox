@@ -1,14 +1,5 @@
 //! LXC adapter for Proxmox VE via the HTTPS API.
 //!
-//! Per [[project-adapter-backends-api-first]]: the legacy `LxcProxmoxAdapter`
-//! shells `pct list` and reads `/etc/pve/lxc/<vmid>.conf` directly, which
-//! only works when orca runs ON a Proxmox host and bypasses Proxmox auth
-//! entirely. This adapter talks the documented API
-//! (`https://<node>:8006/api2/json`) through the progenitor-generated
-//! `proxmox::generated::Client`, with PVE API-token auth. Works
-//! remotely, respects Proxmox permissions, and gives cluster-aware
-//! enumeration via `/cluster/resources?type=vm`.
-//!
 //! The `Container.host` field is the Proxmox node name for every
 //! container this adapter returns. The breaker keys on
 //! `(host, runtime, container_id)`, so multi-node enumeration flows
@@ -120,18 +111,6 @@ impl RuntimeAdapter for LxcProxmoxApiAdapter {
         ))
     }
 
-    /// Liveness probe.
-    ///
-    /// For recognized media guests (Plex, Jellyfin) the probe hits the real
-    /// service surface over HTTP — the API status only proves the CT is running,
-    /// not that the media server is actually serving. A guest whose mount came
-    /// back but whose service is still hung would read "Live" under the status
-    /// probe and never get recovered; the service probe closes that gap (per
-    /// [[feedback-self-healing-is-mandatory]]: probes do real I/O against the
-    /// surface that matters).
-    ///
-    /// For everything else it reads `status/current` through the PVE API with a
-    /// tight timeout; a hung status read is reported as wedged.
     async fn probe_liveness(&self, container: &Container) -> Liveness {
         if container.runtime != RuntimeKind::Lxc {
             return Liveness::NotApplicable;
@@ -148,8 +127,10 @@ impl RuntimeAdapter for LxcProxmoxApiAdapter {
             .client
             .get_vm_status_nodes_node_lxc_vmid_status_current(&container.host, vmid);
         match tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), status).await {
-            Ok(Ok(st)) => match st.into_inner().status.to_string().as_str() {
-                "running" => Liveness::Live,
+            Ok(Ok(st)) => match st.into_inner().status {
+                gtypes::GetVmStatusNodesNodeLxcVmidStatusCurrentResponseStatus::Running => {
+                    Liveness::Live
+                }
                 _ => Liveness::Unknown,
             },
             Ok(Err(_)) => Liveness::Unknown,
