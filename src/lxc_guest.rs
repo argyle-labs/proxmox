@@ -7,7 +7,6 @@
 
 use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::prelude::*;
-use tokio::io::AsyncWriteExt;
 
 use crate::generated::{self, types as gtypes};
 
@@ -121,69 +120,9 @@ impl GuestIo for SeamIo {
     }
 }
 
-/// `{ok, error}` from `orca admin lxc-push`; mirrors `system::lxc_exec::LxcPushResult`.
-#[derive(Deserialize)]
-struct PushResult {
-    ok: bool,
-    #[serde(default)]
-    error: String,
-}
-
-/// `sudo -n <orca> admin lxc-push` with the op on stdin. The plugin toolkit has
-/// no push helper, so this mirrors its `lxc_exec` bridge; the wire shape is
-/// `system::lxc_exec::LxcPushOp`.
 async fn push(vmid: u32, path: &str, contents: &[u8], mode: Option<&str>) -> Result<()> {
-    let orca_bin = std::env::var(plugin_toolkit::lxc_exec::ORCA_BIN_ENV)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            anyhow!("writing into CT {vmid} needs orca's lxc-push seam, but ORCA_BIN is unset (not launched by the orca daemon)")
-        })?;
-    let payload = serde_json::json!({
-        "vmid": vmid,
-        "path": path,
-        "contents": contents,
-        "mode": mode,
-        "owner": "root:root",
-    })
-    .to_string();
-    let mut child = tokio::process::Command::new("sudo")
-        .arg("-n")
-        .arg(&orca_bin)
-        .args(["admin", "lxc-push"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| anyhow!("spawn `sudo {orca_bin} admin lxc-push`: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(payload.as_bytes())
-            .await
-            .map_err(|e| anyhow!("lxc-push: write op: {e}"))?;
-        stdin
-            .shutdown()
-            .await
-            .map_err(|e| anyhow!("lxc-push: close stdin: {e}"))?;
-    }
-    let out = child
-        .wait_with_output()
-        .await
-        .map_err(|e| anyhow!("wait lxc-push helper: {e}"))?;
-    if !out.status.success() {
-        bail!(
-            "lxc-push privileged helper failed (exit {}): {}. Is the `orca admin lxc-push` sudoers grant installed on this node?",
-            out.status.code().map_or("signal".into(), |c| c.to_string()),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let r: PushResult = serde_json::from_slice(&out.stdout).map_err(|e| {
-        anyhow!(
-            "parse lxc-push result: {e}: {}",
-            String::from_utf8_lossy(&out.stdout).trim()
-        )
-    })?;
+    let r =
+        plugin_toolkit::lxc_push::lxc_push(vmid, path, contents, mode, Some("root:root")).await?;
     if !r.ok {
         bail!("write {path} into CT {vmid}: {}", r.error);
     }

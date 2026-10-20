@@ -218,7 +218,8 @@ async fn privileged(op: &FilePullOp) -> Result<FilePulled> {
     domain = "proxmox",
     verb = "guest.file_pull",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    reaches = ["privileged.apply"]
 )]
 async fn proxmox_guest_file_pull(args: FilePullArgs, ctx: &ToolCtx) -> Result<Change<FilePulled>> {
     execute::require_admin(TOOL, ctx.caller().as_ref())?;

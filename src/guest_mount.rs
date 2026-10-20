@@ -1198,6 +1198,7 @@ pub fn raw_drop_table_def() -> TableDef {
                 not_null: true,
                 primary_key: true,
                 default: None,
+                secret: false,
             },
             ColumnDef {
                 name: "dropped_at".to_string(),
@@ -1205,6 +1206,7 @@ pub fn raw_drop_table_def() -> TableDef {
                 not_null: true,
                 primary_key: false,
                 default: Some("0".to_string()),
+                secret: false,
             },
         ],
         indexes: vec![],
