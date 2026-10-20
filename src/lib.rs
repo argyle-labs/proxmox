@@ -58,16 +58,8 @@ pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/proxmox_codegen.rs"));
 }
 
-/// Auto-generated orca tool surface — `#[orca_tool]` wrappers emitted by
-/// `build/surface.rs` from the codegen'd client per the ruleset there. Each
-/// wrapper registers a `proxmox.<verb>` tool that calls a generated method.
-#[allow(non_camel_case_types, non_snake_case, clippy::all)]
-pub mod surface {
-    include!(concat!(env!("OUT_DIR"), "/proxmox_surface.rs"));
-}
-
-#[doc(hidden)]
-pub const SURFACE_SOURCE: &str = include!(concat!(env!("OUT_DIR"), "/proxmox_surface_source.rs"));
+pub const API_SURFACE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/proxmox.api-surface.json"));
 
 /// How Proxmox VE wraps every response body: `{"data": <payload>}`.
 ///

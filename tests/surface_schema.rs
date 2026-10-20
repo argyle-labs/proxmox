@@ -1,14 +1,7 @@
-//! Offline validation of the entire auto-generated proxmox tool surface.
-//!
-//! Walks the dispatch registry (populated by the `#[orca_tool]` inventory
-//! submissions in `proxmox::surface`) and asserts every emitted tool is
-//! well-formed: unique name, an `input_schema` that takes an `endpoint`, and an
-//! `output_schema` that is a *concrete* JSON Schema — never an opaque
-//! `Map<String,Value>` (`additionalProperties: true` with no properties), which
-//! would violate the no-opaque-JSON rule the generator is built to honor.
-//!
-//! This covers all ~327 surfaced endpoints without a live cluster — the live
-//! read-sweep (typed deserialization vs wire) is a separate, network-gated test.
+//! Offline validation of the hand-written proxmox `#[orca_tool]` surface:
+//! unique names, a plain-string `endpoint` input, and a concrete (never opaque)
+//! output schema. The spec-derived ops ride the embedded api-surface table and
+//! are checked in `get_classification.rs`.
 
 use plugin_toolkit::serde_json::{self, Value};
 
@@ -70,21 +63,8 @@ fn every_tool_has_unique_name() {
 /// omitted. Any other tool advertising an optional endpoint is a mistake.
 const OPTIONAL_ENDPOINT: &[&str] = &["proxmox.thin.audit"];
 
-/// Hand-written tools whose names collide with the generated verb prefixes.
-const HAND_WRITTEN_PREFIXED: &[&str] = &["proxmox.get_facts"];
-
-fn is_generated_verb(name: &str) -> bool {
-    !HAND_WRITTEN_PREFIXED.contains(&name)
-        && name.strip_prefix("proxmox.").is_some_and(|v| {
-            ["get_", "post_", "put_", "delete_"]
-                .iter()
-                .any(|p| v.starts_with(p))
-        })
-}
-
 #[test]
 fn every_tool_input_schema_takes_endpoint() {
-    let mut generated = 0;
     for t in proxmox_tools() {
         let name = t["name"].as_str().unwrap();
         let input = &t["input_schema"];
@@ -94,10 +74,6 @@ fn every_tool_input_schema_takes_endpoint() {
             .get("required")
             .and_then(|r| r.as_array())
             .is_some_and(|r| r.iter().any(|v| v == "endpoint"));
-        if is_generated_verb(name) {
-            generated += 1;
-            assert!(required, "{name}: generated verb does not require endpoint");
-        }
         if let Some(ep) = props.and_then(|p| p.get("endpoint")) {
             let ty = &ep["type"];
             let nullable = ty.as_array().is_some_and(|a| {
@@ -116,7 +92,6 @@ fn every_tool_input_schema_takes_endpoint() {
             }
         }
     }
-    assert!(generated > 0, "no generated verbs matched");
 }
 
 #[test]
@@ -414,82 +389,4 @@ fn every_admin_handler_refuses_a_non_admin_caller_itself() {
         let err = run(args.clone(), Some(reader.clone()));
         assert!(err.contains("requires role 'admin'"), "{err}");
     }
-}
-
-fn dispatch_recording_caps(name: &str, args: Value) -> (anyhow::Result<Value>, Vec<String>) {
-    let caps = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let seen = caps.clone();
-    let out = plugin_toolkit::capsink::with_cap_sink(
-        Box::new(move |cap: &str, _raw: &str| {
-            seen.borrow_mut().push(cap.to_string());
-            Err("offline".to_string())
-        }),
-        || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(plugin_toolkit::dispatch::dispatch(name, args, &test_ctx()))
-        },
-    );
-    let caps = caps.borrow().clone();
-    (out, caps)
-}
-
-#[test]
-fn generated_tools_are_no_mutation_and_writes_stay_admin_gated() {
-    let mut reads = 0;
-    let mut writes = 0;
-    for t in proxmox_tools() {
-        let name = t["name"].as_str().unwrap();
-        if !is_generated_verb(name) {
-            continue;
-        }
-        if name.starts_with("proxmox.get_") {
-            reads += 1;
-            assert!(t["role"] == "read" || t["role"] == "admin", "{name}");
-            assert!(
-                t["execute_gated"] == false || t["role"] == "admin",
-                "{name}"
-            );
-            assert_eq!(t["data_mutation"], false, "{name}");
-        } else {
-            writes += 1;
-            assert_eq!(t["role"], "admin", "{name}");
-            assert_eq!(t["execute_gated"], true, "{name}");
-            assert_eq!(t["data_mutation"], false, "{name}");
-        }
-    }
-    assert!(reads > 0 && writes > 0, "reads={reads} writes={writes}");
-}
-
-#[test]
-fn generated_get_runs_without_execute() {
-    let (out, caps) = dispatch_recording_caps(
-        "proxmox.get_vm_config_nodes_node_lxc_vmid_config",
-        serde_json::json!({"endpoint": "pve", "node": "hyp1", "vmid": 101}),
-    );
-    assert_eq!(
-        plugin_toolkit::dispatch::required_role("proxmox.get_vm_config_nodes_node_lxc_vmid_config"),
-        Some("admin")
-    );
-    assert!(
-        out.is_err(),
-        "offline sink cannot satisfy the call: {out:?}"
-    );
-    assert!(
-        !caps.is_empty(),
-        "GET body never ran: no capability reached"
-    );
-}
-
-#[test]
-fn generated_put_with_dry_run_reaches_no_capability() {
-    let (out, caps) = dispatch_recording_caps(
-        "proxmox.put_update_vm_nodes_node_qemu_vmid_config",
-        serde_json::json!({"dryRun": true, "endpoint": "pve", "node": "hyp1", "vmid": 101, "body": {}}),
-    );
-    let out = out.expect("a dry run is not an error");
-    assert_eq!(out["dryRun"], serde_json::json!(true), "{out}");
-    assert!(caps.is_empty(), "dry run reached {caps:?}");
 }
