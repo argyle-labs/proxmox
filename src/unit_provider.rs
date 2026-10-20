@@ -844,7 +844,7 @@ impl ProxmoxUnitProvider {
         const TOOL: &str = "unit.update action=update";
         crate::execute::require_admin(TOOL, args.caller.as_ref())?;
         let id = &args.id;
-        let endpoint = endpoint_of(id)?;
+        endpoint_of(id)?;
         if kind_from_str(&id.kind)? != GuestKind::Lxc {
             return Err(anyhow!("the update action is LXC-only"));
         }
@@ -862,16 +862,7 @@ impl ProxmoxUnitProvider {
             )?)
         } else {
             crate::execute::authorize_execute(TOOL, args.caller.as_ref())?;
-            crate::lxc_guest::unsupported(ctid)?;
-            Change::Applied(
-                crate::guest_standard::run_update(
-                    &crate::lxc_guest::SeamIo,
-                    &crate::guest_standard::UnitBackup { endpoint },
-                    ctid,
-                    &p,
-                )
-                .await?,
-            )
+            return Err(crate::lxc_guest::unsupported(ctid));
         };
         Ok(VerbOutcome::Item(ItemOutcome::new(
             id.clone(),
@@ -1745,6 +1736,22 @@ mod tests {
         };
         let plan: serde_json::Value = serde_json::from_str(&item.payload).unwrap();
         assert_eq!(plan["dryRun"], json!(true), "{plan}");
+    }
+
+    #[test]
+    fn update_action_with_execute_is_unsupported_before_any_capability() {
+        let admin = CallerIdentity {
+            user_id: "u".into(),
+            username: "op".into(),
+            role: "admin".into(),
+            can_mutate: true,
+        };
+        let err = guest_update(json!({"execute": true}), Some(admin)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported: needs in-guest orca member"),
+            "{err}"
+        );
     }
 
     #[test]

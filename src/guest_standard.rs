@@ -29,8 +29,7 @@ use plugin_toolkit::contract::{BackupRef, BoxFuture, CallerIdentity, UnitFacts, 
 use plugin_toolkit::prelude::*;
 
 use crate::execute::{self, Change};
-use crate::lxc_guest::{self, CtRef, GuestIo};
-use crate::tools::resolve_config;
+use crate::lxc_guest::{self, GuestIo};
 
 pub const DEBIAN_AUTOLOGIN: &str = "/etc/systemd/system/container-getty@.service.d/autologin.conf";
 /// The unit PVE starts for the first console. Its effective `ExecStart`, after
@@ -423,9 +422,6 @@ pub enum Step {
     Exec {
         argv: Vec<String>,
         why: &'static str,
-        /// Activates config already written; when the seam refuses it, the
-        /// change takes effect at the container's next start instead.
-        deferrable: bool,
     },
     /// Require that systemd loaded [`UPDATE_UNIT`] from orca's file alone.
     VerifyUnit,
@@ -440,43 +436,13 @@ impl Step {
         Step::Exec {
             argv: argv.iter().map(|s| s.to_string()).collect(),
             why,
-            deferrable: false,
-        }
-    }
-
-    fn reload(argv: &[&str], why: &'static str) -> Self {
-        Step::Exec {
-            argv: argv.iter().map(|s| s.to_string()).collect(),
-            why,
-            deferrable: true,
-        }
-    }
-
-    fn refused(&self) -> Option<String> {
-        match self {
-            Step::Refuse { target, reason } => Some(format!("{target}: {reason}")),
-            _ => None,
         }
     }
 
     /// A refused step that stops the run.
     fn blocker(&self) -> Option<String> {
         match self {
-            Step::Exec {
-                deferrable: true, ..
-            } => None,
-            _ => self.refused(),
-        }
-    }
-
-    /// A refused step left to the container's next start.
-    fn deferred(&self) -> Option<String> {
-        match self {
-            Step::Exec {
-                deferrable: true, ..
-            } => self
-                .refused()
-                .map(|r| format!("deferred to the container's next start: {r}")),
+            Step::Refuse { target, reason } => Some(format!("{target}: {reason}")),
             _ => None,
         }
     }
@@ -497,14 +463,9 @@ impl Step {
                 None => PlannedChange::new(format!("ct/{ctid}:{path}"), "create")
                     .with_detail(format!("mode {mode}")),
             },
-            Step::Exec { argv, why, .. } => {
-                let (action, detail) = match (self.blocker(), self.deferred()) {
-                    (Some(b), _) => ("exec", format!("{why}; {b}")),
-                    (None, Some(d)) => ("deferred", d),
-                    (None, None) => ("exec", why.to_string()),
-                };
-                PlannedChange::new(format!("ct/{ctid}: {}", argv.join(" ")), action)
-                    .with_detail(detail)
+            Step::Exec { argv, why } => {
+                PlannedChange::new(format!("ct/{ctid}: {}", argv.join(" ")), "exec")
+                    .with_detail(why.to_string())
             }
             Step::VerifyUnit => PlannedChange::new(format!("ct/{ctid}: {UPDATE_UNIT}"), "verify")
                 .with_detail(format!(
@@ -603,7 +564,7 @@ pub async fn plan_apply(
                     write_if_changed(INITTAB, alpine_inittab(&inittab), "0644", Some(inittab))
                 {
                     steps.push(s);
-                    steps.push(Step::reload(
+                    steps.push(Step::exec(
                         &["kill", "-HUP", "1"],
                         "busybox init re-reads /etc/inittab on SIGHUP",
                     ));
@@ -688,14 +649,6 @@ async fn plan_gate(
 
 fn blockers(steps: &[Step]) -> Vec<String> {
     steps.iter().filter_map(Step::blocker).collect()
-}
-
-/// Blockers then deferrals, for a dry-run summary.
-fn plan_notes(steps: &[Step]) -> Vec<String> {
-    blockers(steps)
-        .into_iter()
-        .chain(steps.iter().filter_map(Step::deferred))
-        .collect()
 }
 
 /// Refuse up front so a plan never half-applies.
@@ -975,11 +928,6 @@ pub async fn run_steps(io: &dyn GuestIo, ctid: u64, steps: &[Step]) -> Result<Ve
                     action: "write".into(),
                     output: None,
                 }),
-            Step::Exec { argv, .. } if s.deferred().is_some() => Ok(StepOutcome {
-                target: argv.join(" "),
-                action: "deferred".into(),
-                output: s.deferred(),
-            }),
             Step::Exec { argv, .. } => {
                 let args: Vec<&str> = argv.iter().map(String::as_str).collect();
                 run_exec(io, vmid, &args).await.map(|out| StepOutcome {
@@ -1001,7 +949,7 @@ pub async fn run_steps(io: &dyn GuestIo, ctid: u64, steps: &[Step]) -> Result<Ve
                 action: "run".into(),
                 output: (!out.is_empty()).then_some(out),
             }),
-            Step::Refuse { .. } => Err(anyhow!("{}", s.refused().unwrap_or_default())),
+            Step::Refuse { .. } => Err(anyhow!("{}", s.blocker().unwrap_or_default())),
         };
         match outcome {
             Ok(o) => done.push(o),
@@ -1309,12 +1257,6 @@ impl PreUpdateBackup for UnitBackup {
 
 // ── verbs ───────────────────────────────────────────────────────────────────
 
-async fn local_ct(endpoint: &str, ctid: u64) -> Result<CtRef> {
-    lxc_guest::unsupported(ctid)?;
-    let client = resolve_config(endpoint).await?.build_generated_client()?;
-    lxc_guest::find_ct(&client, ctid).await
-}
-
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
 pub struct StandardAuditArgs {
     #[arg(long)]
@@ -1350,46 +1292,7 @@ async fn proxmox_guest_standard_audit(
     args: StandardAuditArgs,
     _ctx: &ToolCtx,
 ) -> Result<StandardAudit> {
-    let ct = local_ct(&args.endpoint, args.ctid).await?;
-    let facts = probe(&lxc_guest::SeamIo, ct.vmid as u32).await?;
-    // Resource floors are checked from the cluster row by `unit.detail`; this
-    // reports only what the probe reads.
-    let guard = UnitGuard {
-        kind: "lxc".into(),
-        require_root_console: true,
-        require_update_command: true,
-        ..Default::default()
-    };
-    let violations = guard
-        .check(&unit_facts(None, None, Some(&facts)))
-        .iter()
-        .map(|v| v.reason())
-        .collect();
-    let drift = audit_drift(&facts);
-    Ok(StandardAudit {
-        ctid: args.ctid,
-        facts,
-        violations,
-        drift,
-    })
-}
-
-fn audit_drift(f: &StandardFacts) -> Vec<String> {
-    let mut drift = f.console_drift.clone();
-    if f.foreign_gate {
-        drift.push(format!(
-            "{UPDATE_GATE} is not orca's gate; `apply` replaces it only with replace_gate \
-             (kept as {REPLACED_GATE})"
-        ));
-    }
-    if f.legacy_backup_key {
-        drift.push(format!(
-            "{LEGACY_BACKUP_KEY} is still present: the forced-command key the orca \
-             backup replaces; remove it and its `orca-guest-backup` line in the host's \
-             /etc/pve/priv/authorized_keys"
-        ));
-    }
-    drift
+    Err(lxc_guest::unsupported(args.ctid))
 }
 
 fn default_true() -> bool {
@@ -1431,7 +1334,7 @@ pub async fn apply(
     let (steps, drift) = plan_apply(io, args).await?;
     if !args.execute {
         let mut summary = format!("apply the guest standard to CT {}", args.ctid);
-        for n in plan_notes(&steps).into_iter().chain(drift) {
+        for n in blockers(&steps).into_iter().chain(drift) {
             summary.push_str("; ");
             summary.push_str(&n);
         }
@@ -1466,8 +1369,7 @@ async fn proxmox_guest_standard_apply(
     ctx: &ToolCtx,
 ) -> Result<Change<GuestApplied>> {
     execute::require_admin("proxmox.guest.standard.apply", ctx.caller().as_ref())?;
-    local_ct(&args.endpoint, args.ctid).await?;
-    apply(&lxc_guest::SeamIo, &args, ctx.caller().as_ref()).await
+    Err(lxc_guest::unsupported(args.ctid))
 }
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
@@ -1507,30 +1409,7 @@ async fn proxmox_guest_update(
 ) -> Result<Change<GuestApplied>> {
     const TOOL: &str = "proxmox.guest.update";
     execute::require_admin(TOOL, ctx.caller().as_ref())?;
-    local_ct(&args.endpoint, args.ctid).await?;
-    let io = lxc_guest::SeamIo;
-    let payload = GuestUpdatePayload {
-        updater: args.updater,
-        storage: args.storage.clone(),
-        execute: args.execute,
-    };
-    if !args.execute {
-        let facts = probe(&io, args.ctid as u32).await?;
-        return Ok(Change::Plan(plan_update(
-            TOOL,
-            &args,
-            args.ctid,
-            &payload,
-            Some(&facts),
-        )?));
-    }
-    execute::authorize_execute(TOOL, ctx.caller().as_ref())?;
-    let backup = UnitBackup {
-        endpoint: args.endpoint.clone(),
-    };
-    Ok(Change::Applied(
-        run_update(&io, &backup, args.ctid, &payload).await?,
-    ))
+    Err(lxc_guest::unsupported(args.ctid))
 }
 
 #[cfg(test)]
@@ -1814,15 +1693,6 @@ ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,3840
             "PVE would regenerate tty1 on next start"
         );
         assert!(f.foreign_gate && f.legacy_backup_key && !f.has_update_command);
-        let drift = audit_drift(&f);
-        assert!(
-            drift.iter().any(|d| d.contains("replace_gate")),
-            "{drift:?}"
-        );
-        assert!(
-            drift.iter().any(|d| d.contains("authorized_keys")),
-            "{drift:?}"
-        );
 
         let f = rt()
             .block_on(probe(&io_of(alpine_probe(&rewritten, true)), 120))

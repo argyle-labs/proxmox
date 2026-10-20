@@ -926,12 +926,7 @@ async fn proxmox_guest_pxarexclude(
     ctx: &ToolCtx,
 ) -> Result<Change<PxarExcludeApplied>> {
     execute::require_admin("proxmox.guest.pxarexclude", ctx.caller().as_ref())?;
-    lxc_guest::unsupported(args.ctid)?;
-    let client = resolve_config(&args.endpoint)
-        .await?
-        .build_generated_client()?;
-    let ct = lxc_guest::find_ct(&client, args.ctid).await?;
-    pxarexclude(&lxc_guest::SeamIo, &ct, &args, ctx.caller().as_ref()).await
+    Err(lxc_guest::unsupported(args.ctid))
 }
 
 // ── schedules ───────────────────────────────────────────────────────────────

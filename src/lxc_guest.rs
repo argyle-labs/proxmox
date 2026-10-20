@@ -24,8 +24,8 @@ pub trait GuestIo: Sync {
 
 pub struct SeamIo;
 
-pub fn unsupported(vmid: u64) -> Result<()> {
-    bail!("CT {vmid}: {UNSUPPORTED}")
+pub fn unsupported(vmid: u64) -> anyhow::Error {
+    anyhow!("CT {vmid}: {UNSUPPORTED}")
 }
 
 pub const UNSUPPORTED: &str = "unsupported: needs in-guest orca member (the PVE REST API cannot exec in or write files into an LXC)";
