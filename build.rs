@@ -1,11 +1,12 @@
-//! Generate the typed Proxmox VE client from the vendored OpenAPI spec.
+//! Generate the typed Proxmox VE client and the `orca.api-surface/v1` table
+//! from the vendored OpenAPI spec.
 //!
 //! Refresh the vendored spec from a fresh `apidoc.js` pulled from a cluster
 //! node (Proxmox ships `apidoc.js`, not OpenAPI):
 //!   cargo run --example pve_to_openapi -- apidoc.js > specs/proxmox.openapi.json
 
-#[path = "build/ungate.rs"]
-mod ungate;
+use openapi::surface::{Auth, AuthScheme, EndpointBinding, ResponseRules};
+use plugin_toolkit_build::surface_table;
 
 fn main() {
     let specs_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("specs");
@@ -30,48 +31,29 @@ fn main() {
     )
     .expect("proxmox openapi codegen");
 
-    plugin_toolkit_build::surface::openapi::generate(&specs_dir, &out_dir, "proxmox")
-        .expect("proxmox surface codegen");
-
-    let allowlist_path = specs_dir.join("read_allowlist.txt");
-    println!("cargo:rerun-if-changed={}", allowlist_path.display());
-    println!("cargo:rerun-if-changed=build/ungate.rs");
-    let gated_path = specs_dir.join("gated_gets.txt");
-    println!("cargo:rerun-if-changed={}", gated_path.display());
-    let allow = ungate::parse_allowlist(
-        &std::fs::read_to_string(&allowlist_path).expect("read read_allowlist.txt"),
-    );
-    let gated = ungate::parse_allowlist(
-        &std::fs::read_to_string(&gated_path).expect("read gated_gets.txt"),
-    );
-    let surface = out_dir.join("proxmox_surface.rs");
-    let out = ungate::classify_gets(
-        &std::fs::read_to_string(&surface).expect("read proxmox surface"),
-        &allow,
-        &gated,
-    );
-    let spec: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(specs_dir.join("proxmox.openapi.json")).expect("read spec"),
+    surface_table::openapi::generate(
+        &specs_dir.join("proxmox.openapi.json"),
+        &out_dir,
+        "proxmox",
+        &surface_table::openapi::Options {
+            api_root: "/api2/json".to_string(),
+            auth: Some(Auth {
+                scheme: AuthScheme::Header,
+                header: "Authorization".to_string(),
+                template: "PVEAPIToken={endpoint.token_id}={secret}".to_string(),
+                secret: "proxmox.{endpoint}.token_secret".to_string(),
+            }),
+            response: ResponseRules {
+                envelope: Some("/data".to_string()),
+                null_as: None,
+                lenient_bool: true,
+                lenient_number: true,
+            },
+            endpoint: EndpointBinding::default(),
+            read_allowlist: Some(specs_dir.join("read_allowlist.txt")),
+            gated_gets: Some(specs_dir.join("gated_gets.txt")),
+            renames: Default::default(),
+        },
     )
-    .expect("parse spec");
-    let no_tool = spec["paths"]
-        .as_object()
-        .expect("spec paths")
-        .iter()
-        .filter(|(_, ops)| ops["get"]["x-orca-no-tool"] == true)
-        .map(|(path, _)| path.clone())
-        .collect();
-    for warning in ungate::check_unused(&out.unused, &gated, &no_tool) {
-        println!("cargo:warning={warning}");
-    }
-    assert_eq!(
-        out.rewritten, out.gets,
-        "every surfaced GET must be classified"
-    );
-    std::fs::write(
-        out_dir.join("proxmox_surface_source.rs"),
-        format!("{:?}", out.source),
-    )
-    .expect("write proxmox surface source");
-    std::fs::write(&surface, out.source).expect("write proxmox surface");
+    .expect("proxmox api surface table");
 }
