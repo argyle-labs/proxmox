@@ -1211,8 +1211,67 @@ fn task_target(t: &Value) -> String {
         .unwrap_or_else(|| "all".to_string())
 }
 
-pub fn vzdump_failures(tasks: &Value) -> Vec<TaskFailure> {
+fn is_ok_status(status: &str) -> bool {
+    status == "OK" || status.starts_with("WARNINGS")
+}
+
+fn task_failure(target: String, endtime: i64, t: &Value) -> Option<TaskFailure> {
+    let status = t.get("status").and_then(Value::as_str).unwrap_or("");
+    if is_ok_status(status) {
+        return None;
+    }
+    Some(TaskFailure {
+        target,
+        upid: t
+            .get("upid")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        endtime,
+        status: if status.is_empty() {
+            "unknown".into()
+        } else {
+            status.to_string()
+        },
+    })
+}
+
+pub fn minute_of_week(local_secs: i64) -> u32 {
+    let dow = (local_secs.div_euclid(86_400) + 3).rem_euclid(7);
+    (dow * 1440 + local_secs.rem_euclid(86_400) / 60) as u32
+}
+
+pub fn slot_job<'a>(
+    jobs: &'a [BackupJob],
+    node: &str,
+    start_local: i64,
+    window: u32,
+) -> Option<&'a str> {
+    let m = minute_of_week(start_local);
+    jobs.iter()
+        .filter(|j| j.enabled && j.node.as_deref().is_none_or(|n| n == node))
+        .filter_map(|j| {
+            let starts = schedule_starts(j.schedule.as_deref()?)?;
+            let d = starts
+                .iter()
+                .map(|s| (m + WEEK_MIN - s) % WEEK_MIN)
+                .filter(|d| *d <= window)
+                .min()?;
+            Some((d, j.id.as_str()))
+        })
+        .min()
+        .map(|(_, id)| id)
+}
+
+pub fn vzdump_failures(
+    tasks: &Value,
+    jobs: &[BackupJob],
+    node: &str,
+    tz_offset: i64,
+    window: u32,
+) -> Vec<TaskFailure> {
     let mut newest: BTreeMap<String, (i64, &Value)> = BTreeMap::new();
+    let mut out = Vec::new();
     for t in tasks.as_array().into_iter().flatten() {
         if t.get("type").and_then(Value::as_str) != Some("vzdump") {
             continue;
@@ -1220,34 +1279,31 @@ pub fn vzdump_failures(tasks: &Value) -> Vec<TaskFailure> {
         let Some(end) = t.get("endtime").and_then(Value::as_i64) else {
             continue;
         };
-        let e = newest.entry(task_target(t)).or_insert((end, t));
+        let target = task_target(t);
+        let key = if target == "all" {
+            let start = t.get("starttime").and_then(Value::as_i64).unwrap_or(end);
+            match slot_job(jobs, node, start + tz_offset, window) {
+                Some(job) => format!("job-{job}"),
+                None => {
+                    out.extend(task_failure(format!("start-{start}"), end, t));
+                    continue;
+                }
+            }
+        } else {
+            target
+        };
+        let e = newest.entry(key).or_insert((end, t));
         if end > e.0 {
             *e = (end, t);
         }
     }
-    newest
-        .into_iter()
-        .filter_map(|(target, (endtime, t))| {
-            let status = t.get("status").and_then(Value::as_str).unwrap_or("");
-            if status == "OK" || status.starts_with("WARNINGS") {
-                return None;
-            }
-            Some(TaskFailure {
-                target,
-                upid: t
-                    .get("upid")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                endtime,
-                status: if status.is_empty() {
-                    "unknown".into()
-                } else {
-                    status.to_string()
-                },
-            })
-        })
-        .collect()
+    out.extend(
+        newest
+            .into_iter()
+            .filter_map(|(target, (endtime, t))| task_failure(target, endtime, t)),
+    );
+    out.sort_by(|a, b| a.target.cmp(&b.target));
+    out
 }
 
 pub fn has_sys_audit(perms: &Value, node: &str) -> bool {
@@ -1257,7 +1313,13 @@ pub fn has_sys_audit(perms: &Value, node: &str) -> bool {
         format!("/nodes/{node}"),
     ]
     .iter()
-    .any(|p| perms.get(p).and_then(|v| v.get("Sys.Audit")).is_some())
+    .enumerate()
+    .any(|(i, p)| {
+        perms
+            .get(p)
+            .and_then(|v| v.get("Sys.Audit"))
+            .is_some_and(|flag| i == 2 || flag.as_i64() == Some(1) || flag.as_bool() == Some(true))
+    })
 }
 
 pub fn job_storage(
@@ -1475,7 +1537,9 @@ pub fn finding_stale(scope: &str, s: &StaleBackup, now: i64) -> Finding {
         detail: format!(
             "Job '{}' backs {} {} up to storage '{}' and should have produced one within {} h, \
              but {age}. The job is firing into an unavailable storage or failing; check the \
-             node's vzdump task log and the storage's status.",
+             node's vzdump task log and the storage's status. A guest with no backup is only \
+             flagged once its uptime exceeds that limit, so one rebooting more often than the \
+             job interval is missed.",
             s.job,
             g.kind,
             g.vmid,
@@ -1584,16 +1648,28 @@ async fn diagnose_endpoint(cfg: &Config, endpoint: &str) -> Result<Vec<Finding>>
                 defaults.insert(n.to_string(), storage.to_string());
             }
         }
+        let tz_offset = raw_get_data(&http, &cfg.base_url, &format!("nodes/{}/time", enc(n)))
+            .await
+            .ok()
+            .and_then(|t| Some(t.get("localtime")?.as_i64()? - t.get("time")?.as_i64()?))
+            .unwrap_or(0);
         let path = format!("nodes/{}/tasks?typefilter=vzdump&limit=100", enc(n));
         match raw_get_data(&http, &cfg.base_url, &path).await {
             Ok(tasks) => {
-                if let Some(w) = longest_vzdump_min(&tasks) {
+                let w = longest_vzdump_min(&tasks);
+                if let Some(w) = w {
                     windows.insert(n.to_string(), w);
                 }
                 failures.extend(
-                    vzdump_failures(&tasks)
-                        .iter()
-                        .map(|f| finding_task_failed(&scope, n, f)),
+                    vzdump_failures(
+                        &tasks,
+                        &jobs,
+                        n,
+                        tz_offset,
+                        w.unwrap_or(DEFAULT_QUEUE_WINDOW_MIN),
+                    )
+                    .iter()
+                    .map(|f| finding_task_failed(&scope, n, f)),
                 );
             }
             Err(e) => {
@@ -1603,16 +1679,24 @@ async fn diagnose_endpoint(cfg: &Config, endpoint: &str) -> Result<Vec<Finding>>
     }
 
     let mut listings = std::collections::BTreeSet::new();
+    let mut unresolved = std::collections::BTreeSet::new();
     for g in guests.iter().filter(|g| g.running && !g.template) {
         for j in jobs.iter().filter(|j| j.enabled && selects(j, g)) {
             match job_storage(j, &g.node, &defaults) {
                 Some(s) => {
                     listings.insert((g.node.clone(), s));
                 }
-                None => failures.push(finding_storage_unresolved(&scope, &j.id, &g.node)),
+                None => {
+                    unresolved.insert((j.id.as_str(), g.node.as_str()));
+                }
             }
         }
     }
+    failures.extend(
+        unresolved
+            .into_iter()
+            .map(|(job, node)| finding_storage_unresolved(&scope, job, node)),
+    );
     let mut newest = HashMap::new();
     for (node, storage) in listings {
         let path = format!(
@@ -1964,7 +2048,7 @@ mod tests {
             {"type": "vzdump", "id": "117", "starttime": 50},
             {"type": "qmstart", "endtime": 99, "status": "boom"},
         ]);
-        let got: Vec<(String, String)> = vzdump_failures(&tasks)
+        let got: Vec<(String, String)> = vzdump_failures(&tasks, &[], "n", 0, 60)
             .into_iter()
             .map(|f| (f.target, f.upid))
             .collect();
@@ -1973,7 +2057,7 @@ mod tests {
             vec![
                 ("110".to_string(), "u1".to_string()),
                 (
-                    "all".to_string(),
+                    "start-40".to_string(),
                     "UPID:n:1:2:3:vzdump::root@pam:".to_string()
                 ),
             ]
@@ -1981,8 +2065,44 @@ mod tests {
     }
 
     #[test]
+    fn multi_guest_failures_are_matched_to_their_job_slot() {
+        let jobs = parse_jobs(&json!([
+            {"id": "a", "enabled": 1, "schedule": "02:00", "vmid": "1,2"},
+            {"id": "b", "enabled": 1, "schedule": "03:00", "vmid": "3,4"},
+        ]));
+        let monday = 4 * 86_400;
+        let a = monday + 2 * 3_600;
+        let b = monday + 3 * 3_600;
+        let stray = monday + 12 * 3_600;
+        let tasks = json!([
+            {"type": "vzdump", "starttime": a, "endtime": a + 600, "status": "job errors", "upid": "ua"},
+            {"type": "vzdump", "starttime": b, "endtime": b + 600, "status": "OK", "upid": "ub"},
+            {"type": "vzdump", "starttime": stray, "endtime": stray + 60, "status": "boom", "upid": "us"},
+        ]);
+        let got: Vec<(String, String)> = vzdump_failures(&tasks, &jobs, "n", 0, 60)
+            .into_iter()
+            .map(|f| (f.target, f.upid))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("job-a".to_string(), "ua".to_string()),
+                (format!("start-{stray}"), "us".to_string()),
+            ]
+        );
+        let shifted = vzdump_failures(&tasks, &jobs, "n", 3_600, 30);
+        assert!(
+            shifted
+                .iter()
+                .any(|f| f.target == "job-b" && f.upid == "ua")
+        );
+    }
+
+    #[test]
     fn sys_audit_is_read_from_root_nodes_or_the_node() {
         assert!(has_sys_audit(&json!({"/": {"Sys.Audit": 1}}), "n"));
+        assert!(!has_sys_audit(&json!({"/": {"Sys.Audit": 0}}), "n"));
+        assert!(!has_sys_audit(&json!({"/nodes": {"Sys.Audit": 0}}), "n"));
         assert!(has_sys_audit(&json!({"/nodes/n": {"Sys.Audit": 0}}), "n"));
         assert!(!has_sys_audit(
             &json!({"/nodes/m": {"Sys.Audit": 1}, "/vms": {"VM.Audit": 1}}),
@@ -2320,6 +2440,14 @@ mod tests {
             ),
             (
                 "GET",
+                "/nodes/hyp1/time",
+                vec![reply(
+                    200,
+                    json!({"time": 0, "localtime": 0, "timezone": "UTC"}),
+                )],
+            ),
+            (
+                "GET",
                 "/nodes/hyp1/vzdump/defaults",
                 vec![reply(200, json!({"storage": "local"}))],
             ),
@@ -2354,7 +2482,7 @@ mod tests {
                     json!([
                         {"id": "a", "enabled": 1, "schedule": "03:35", "vmid": "110", "storage": "pbs"},
                         {"id": "b", "enabled": 1, "schedule": "12:00", "vmid": "111", "storage": "gone"},
-                        {"id": "c", "enabled": 1, "schedule": "13:00", "vmid": "110"},
+                        {"id": "c", "enabled": 1, "schedule": "13:00", "vmid": "110,111"},
                     ]),
                 )],
             ),
@@ -2405,6 +2533,14 @@ mod tests {
             ),
             (
                 "GET",
+                "/nodes/hyp1/time",
+                vec![reply(
+                    200,
+                    json!({"time": 0, "localtime": 0, "timezone": "UTC"}),
+                )],
+            ),
+            (
+                "GET",
                 "/nodes/hyp1/vzdump/defaults",
                 vec![reply(500, json!(null))],
             ),
@@ -2428,8 +2564,11 @@ mod tests {
             ids.contains(&"backup-tasks-unaudited::lab::hyp1"),
             "{ids:?}"
         );
-        assert!(
-            ids.contains(&"backup-storage-unresolved::lab::c::hyp1"),
+        assert_eq!(
+            ids.iter()
+                .filter(|i| **i == "backup-storage-unresolved::lab::c::hyp1")
+                .count(),
+            1,
             "{ids:?}"
         );
         assert!(
