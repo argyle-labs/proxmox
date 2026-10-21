@@ -1245,20 +1245,38 @@ const DST_SLACK_MIN: u32 = 60;
 
 pub fn slot_job(jobs: &[BackupJob], node: &str, start_local: i64, window: u32) -> Option<String> {
     let m = minute_of_week(start_local);
-    let scored: Vec<(u32, &str)> = jobs
+    let offsets: Vec<(&str, Vec<u32>)> = jobs
         .iter()
         .filter(|j| j.enabled && j.node.as_deref().is_none_or(|n| n == node))
         .filter_map(|j| {
             let starts = schedule_starts(j.schedule.as_deref()?)?;
-            let d = starts
-                .iter()
-                .map(|s| (m + WEEK_MIN - s) % WEEK_MIN)
-                .filter(|d| *d <= window + DST_SLACK_MIN || *d >= WEEK_MIN - DST_SLACK_MIN)
-                .map(|d| d.min(WEEK_MIN - d))
-                .min()?;
-            Some((d, j.id.as_str()))
+            Some((
+                j.id.as_str(),
+                starts
+                    .iter()
+                    .map(|s| (m + WEEK_MIN - s) % WEEK_MIN)
+                    .collect(),
+            ))
         })
         .collect();
+    let pick = |accept: &dyn Fn(u32) -> bool| -> Vec<(u32, &str)> {
+        offsets
+            .iter()
+            .filter_map(|(id, ds)| {
+                let d = ds
+                    .iter()
+                    .copied()
+                    .filter(|d| accept(*d))
+                    .map(|d| d.min(WEEK_MIN - d))
+                    .min()?;
+                Some((d, *id))
+            })
+            .collect()
+    };
+    let mut scored = pick(&|d| d <= window);
+    if scored.is_empty() {
+        scored = pick(&|d| d <= window + DST_SLACK_MIN || d >= WEEK_MIN - DST_SLACK_MIN);
+    }
     let best = scored.iter().map(|(d, _)| *d).min()?;
     let mut ids: Vec<&str> = scored
         .iter()
@@ -1290,7 +1308,7 @@ pub fn vzdump_failures(
             let start = t.get("starttime").and_then(Value::as_i64).unwrap_or(end);
             match slot_job(jobs, node, start + tz_offset, window) {
                 Some(job) => format!("job-{job}"),
-                None => format!("unscheduled::{node}"),
+                None => "unscheduled".to_string(),
             }
         } else {
             target
@@ -2060,7 +2078,7 @@ mod tests {
             vec![
                 ("110".to_string(), "u1".to_string()),
                 (
-                    "unscheduled::n".to_string(),
+                    "unscheduled".to_string(),
                     "UPID:n:1:2:3:vzdump::root@pam:".to_string()
                 ),
             ]
@@ -2090,9 +2108,61 @@ mod tests {
             got,
             vec![
                 ("job-a".to_string(), "ua".to_string()),
-                ("unscheduled::n".to_string(), "us".to_string()),
+                ("unscheduled".to_string(), "us".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn task_starts_are_shifted_into_node_local_time() {
+        let jobs = parse_jobs(&json!([
+            {"id": "a", "enabled": 1, "schedule": "02:00", "vmid": "1,2"},
+            {"id": "b", "enabled": 1, "schedule": "03:00", "vmid": "3,4"},
+        ]));
+        let monday = 4 * 86_400;
+        let a = monday + 2 * 3_600 - 3_600;
+        let b = monday + 3 * 3_600 - 3_600;
+        let tasks = json!([
+            {"type": "vzdump", "starttime": a, "endtime": a + 600, "status": "job errors", "upid": "ua"},
+            {"type": "vzdump", "starttime": b, "endtime": b + 600, "status": "OK", "upid": "ub"},
+        ]);
+        let got = vzdump_failures(&tasks, &jobs, "n", 3_600, 30);
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            (got[0].target.as_str(), got[0].upid.as_str()),
+            ("job-a", "ua")
+        );
+    }
+
+    #[test]
+    fn a_dst_shifted_failure_is_not_hidden_by_the_next_jobs_success() {
+        let jobs = parse_jobs(&json!([
+            {"id": "a", "enabled": 1, "schedule": "02:00", "vmid": "1,2"},
+            {"id": "b", "enabled": 1, "schedule": "03:00", "vmid": "3,4"},
+        ]));
+        let monday = 4 * 86_400;
+        let a = monday + 3_600;
+        let b = monday + 3 * 3_600;
+        let tasks = json!([
+            {"type": "vzdump", "starttime": a, "endtime": a + 600, "status": "job errors", "upid": "ua"},
+            {"type": "vzdump", "starttime": b, "endtime": b + 600, "status": "OK", "upid": "ub"},
+        ]);
+        let got = vzdump_failures(&tasks, &jobs, "n", 0, 30);
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            (got[0].target.as_str(), got[0].upid.as_str()),
+            ("job-a", "ua")
+        );
+    }
+
+    #[test]
+    fn an_in_window_job_beats_a_closer_dst_slack_match() {
+        let jobs = parse_jobs(&json!([
+            {"id": "a", "enabled": 1, "schedule": "02:00", "vmid": "1"},
+            {"id": "b", "enabled": 1, "schedule": "02:50", "vmid": "2"},
+        ]));
+        let start = 4 * 86_400 + 2 * 3_600 + 40 * 60;
+        assert_eq!(slot_job(&jobs, "n", start, 60).as_deref(), Some("a"));
     }
 
     #[test]
@@ -2139,7 +2209,7 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(
             (got[0].target.as_str(), got[0].upid.as_str()),
-            ("unscheduled::n", "u2")
+            ("unscheduled", "u2")
         );
     }
 
