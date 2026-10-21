@@ -49,7 +49,10 @@ fn main() {
                 lenient_bool: true,
                 lenient_number: true,
             },
-            endpoint: EndpointBinding::default(),
+            endpoint: EndpointBinding {
+                columns: vec!["token_id".to_string()],
+                ..EndpointBinding::default()
+            },
             read_allowlist: Some(specs_dir.join("read_allowlist.txt")),
             gated_gets: Some(specs_dir.join("gated_gets.txt")),
             renames: Default::default(),
