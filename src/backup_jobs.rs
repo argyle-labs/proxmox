@@ -12,7 +12,8 @@
 //!
 //! Diagnostics ([`diagnose_backup_jobs`]): a running guest no enabled job
 //! covers, guests with no backup within their job's schedule, a failed latest
-//! vzdump run, unreadable backup storage, and jobs that queue behind each
+//! vzdump run per target, unreadable or unresolvable backup storage, a token
+//! that cannot see node task history, and jobs that queue behind each
 //! other on one node. vzdump holds a per-node lock, so a node's jobs run one at a time: a job scheduled while an
 //! earlier one is still running waits, and a long queue overruns its window.
 
@@ -1047,6 +1048,7 @@ pub struct GuestRow {
     pub running: bool,
     pub template: bool,
     pub pool: Option<String>,
+    pub uptime: Option<i64>,
 }
 
 /// Whether `job` selects `g`, ignoring `enabled`.
@@ -1188,36 +1190,81 @@ pub fn max_interval_min(starts: &[u32]) -> Option<u32> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskFailure {
+    pub target: String,
     pub upid: String,
     pub endtime: i64,
     pub status: String,
 }
 
-pub fn latest_vzdump_failure(tasks: &Value) -> Option<TaskFailure> {
-    let t = tasks
-        .as_array()?
-        .iter()
-        .filter(|t| t.get("type").and_then(Value::as_str) == Some("vzdump"))
-        .filter_map(|t| Some((t.get("endtime")?.as_i64()?, t)))
-        .max_by_key(|(end, _)| *end)?;
-    let status = t.1.get("status").and_then(Value::as_str).unwrap_or("");
-    if status == "OK" || status.starts_with("WARNINGS") {
-        return None;
+fn task_target(t: &Value) -> String {
+    t.get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            t.get("upid")
+                .and_then(Value::as_str)
+                .and_then(|u| u.split(':').nth(6))
+                .map(str::to_string)
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "all".to_string())
+}
+
+pub fn vzdump_failures(tasks: &Value) -> Vec<TaskFailure> {
+    let mut newest: BTreeMap<String, (i64, &Value)> = BTreeMap::new();
+    for t in tasks.as_array().into_iter().flatten() {
+        if t.get("type").and_then(Value::as_str) != Some("vzdump") {
+            continue;
+        }
+        let Some(end) = t.get("endtime").and_then(Value::as_i64) else {
+            continue;
+        };
+        let e = newest.entry(task_target(t)).or_insert((end, t));
+        if end > e.0 {
+            *e = (end, t);
+        }
     }
-    Some(TaskFailure {
-        upid: t
-            .1
-            .get("upid")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        endtime: t.0,
-        status: if status.is_empty() {
-            "unknown".into()
-        } else {
-            status.to_string()
-        },
-    })
+    newest
+        .into_iter()
+        .filter_map(|(target, (endtime, t))| {
+            let status = t.get("status").and_then(Value::as_str).unwrap_or("");
+            if status == "OK" || status.starts_with("WARNINGS") {
+                return None;
+            }
+            Some(TaskFailure {
+                target,
+                upid: t
+                    .get("upid")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                endtime,
+                status: if status.is_empty() {
+                    "unknown".into()
+                } else {
+                    status.to_string()
+                },
+            })
+        })
+        .collect()
+}
+
+pub fn has_sys_audit(perms: &Value, node: &str) -> bool {
+    [
+        "/".to_string(),
+        "/nodes".to_string(),
+        format!("/nodes/{node}"),
+    ]
+    .iter()
+    .any(|p| perms.get(p).and_then(|v| v.get("Sys.Audit")).is_some())
+}
+
+pub fn job_storage(
+    job: &BackupJob,
+    node: &str,
+    defaults: &HashMap<String, String>,
+) -> Option<String> {
+    job.storage.clone().or_else(|| defaults.get(node).cloned())
 }
 
 pub fn newest_backups(content: &Value) -> HashMap<u64, i64> {
@@ -1248,6 +1295,7 @@ pub fn stale_backups<'a>(
     jobs: &[BackupJob],
     guests: &'a [GuestRow],
     newest: &HashMap<(String, String), HashMap<u64, i64>>,
+    defaults: &HashMap<String, String>,
     windows: &HashMap<String, u32>,
     now: i64,
 ) -> Vec<StaleBackup<'a>> {
@@ -1257,23 +1305,31 @@ pub fn stale_backups<'a>(
             .get(&g.node)
             .copied()
             .unwrap_or(DEFAULT_QUEUE_WINDOW_MIN);
-        let tightest = jobs
+        let mut covering: Vec<(u32, String, String)> = jobs
             .iter()
             .filter(|j| j.enabled && selects(j, g))
             .filter_map(|j| {
-                let storage = j.storage.clone()?;
+                let storage = job_storage(j, &g.node, defaults)?;
                 let interval = max_interval_min(&schedule_starts(j.schedule.as_deref()?)?)?;
                 Some((interval + window, j.id.clone(), storage))
             })
-            .min();
-        let Some((limit_min, job, storage)) = tightest else {
+            .collect();
+        covering.sort();
+        let Some((limit_min, job, storage, listing)) =
+            covering.into_iter().find_map(|(limit, job, storage)| {
+                let l = newest.get(&(g.node.clone(), storage.clone()))?;
+                Some((limit, job, storage, l))
+            })
+        else {
             continue;
         };
-        let Some(listing) = newest.get(&(g.node.clone(), storage.clone())) else {
-            continue;
-        };
+        let limit_secs = i64::from(limit_min) * 60;
         let latest = listing.get(&g.vmid).copied();
-        if latest.is_none_or(|t| now - t > i64::from(limit_min) * 60) {
+        let stale = match latest {
+            Some(t) => now - t > limit_secs,
+            None => g.uptime.is_some_and(|u| u > limit_secs),
+        };
+        if stale {
             out.push(StaleBackup {
                 guest: g,
                 job,
@@ -1305,6 +1361,7 @@ fn guest_rows(items: Vec<gtypes::GetResourcesClusterResourcesResponseItem>) -> V
                 running: i.status.as_deref() == Some("running"),
                 template: i.template.unwrap_or(false),
                 pool: i.pool,
+                uptime: i.uptime,
             })
         })
         .collect()
@@ -1430,17 +1487,46 @@ pub fn finding_stale(scope: &str, s: &StaleBackup, now: i64) -> Finding {
 
 pub fn finding_task_failed(scope: &str, node: &str, f: &TaskFailure) -> Finding {
     Finding {
-        id: format!("backup-task-failed::{scope}::{node}"),
+        id: format!("backup-task-failed::{scope}::{node}::{}", f.target),
         provider: PROVIDER.to_string(),
         severity: Severity::Warn,
         title: format!(
-            "The latest vzdump run on node '{node}' failed: {}",
-            f.status
+            "The latest vzdump run for '{}' on node '{node}' failed: {}",
+            f.target, f.status
         ),
         detail: format!(
-            "vzdump task {} on node '{node}' ended at {} (unix) with status '{}'. Read its log \
-             with `/nodes/{node}/tasks/{}/log`.",
-            f.upid, f.endtime, f.status, f.upid
+            "vzdump task {} for '{}' on node '{node}' ended at {} (unix) with status '{}'. Read \
+             its log with `/nodes/{node}/tasks/{}/log`.",
+            f.upid, f.target, f.endtime, f.status, f.upid
+        ),
+        repair: None,
+    }
+}
+
+pub fn finding_tasks_unaudited(scope: &str, node: &str) -> Finding {
+    Finding {
+        id: format!("backup-tasks-unaudited::{scope}::{node}"),
+        provider: PROVIDER.to_string(),
+        severity: Severity::Warn,
+        title: format!("vzdump task history on node '{node}' is not visible to orca"),
+        detail: format!(
+            "The API token lacks Sys.Audit on /nodes/{node}, so the task list returns only the \
+             token's own tasks and failed scheduled backups there go unseen. Grant Sys.Audit on \
+             /nodes to the token's role."
+        ),
+        repair: None,
+    }
+}
+
+pub fn finding_storage_unresolved(scope: &str, job: &str, node: &str) -> Finding {
+    Finding {
+        id: format!("backup-storage-unresolved::{scope}::{job}::{node}"),
+        provider: PROVIDER.to_string(),
+        severity: Severity::Warn,
+        title: format!("Backup job '{job}' has no storage that can be resolved on node '{node}'"),
+        detail: format!(
+            "Job '{job}' sets no storage and node '{node}' vzdump defaults could not be read, so \
+             the freshness of its backups there was not checked."
         ),
         repair: None,
     }
@@ -1480,18 +1566,34 @@ async fn diagnose_endpoint(cfg: &Config, endpoint: &str) -> Result<Vec<Finding>>
     let mut nodes: Vec<&str> = guests.iter().map(|g| g.node.as_str()).collect();
     nodes.sort_unstable();
     nodes.dedup();
+    let perms = raw_get_data(&http, &cfg.base_url, "access/permissions")
+        .await
+        .ok();
     let mut windows = HashMap::new();
+    let mut defaults = HashMap::new();
     let mut failures = Vec::new();
     for n in nodes {
+        if perms.as_ref().is_some_and(|p| !has_sys_audit(p, n)) {
+            failures.push(finding_tasks_unaudited(&scope, n));
+        }
+        if jobs.iter().any(|j| j.enabled && j.storage.is_none()) {
+            let path = format!("nodes/{}/vzdump/defaults", enc(n));
+            if let Ok(d) = raw_get_data(&http, &cfg.base_url, &path).await {
+                let storage = d.get("storage").and_then(Value::as_str).unwrap_or("local");
+                defaults.insert(n.to_string(), storage.to_string());
+            }
+        }
         let path = format!("nodes/{}/tasks?typefilter=vzdump&limit=100", enc(n));
         match raw_get_data(&http, &cfg.base_url, &path).await {
             Ok(tasks) => {
                 if let Some(w) = longest_vzdump_min(&tasks) {
                     windows.insert(n.to_string(), w);
                 }
-                if let Some(f) = latest_vzdump_failure(&tasks) {
-                    failures.push(finding_task_failed(&scope, n, &f));
-                }
+                failures.extend(
+                    vzdump_failures(&tasks)
+                        .iter()
+                        .map(|f| finding_task_failed(&scope, n, f)),
+                );
             }
             Err(e) => {
                 tracing::debug!(endpoint, node = n, error = %e, "backup queue: task history unreadable; using default window");
@@ -1502,8 +1604,11 @@ async fn diagnose_endpoint(cfg: &Config, endpoint: &str) -> Result<Vec<Finding>>
     let mut listings = std::collections::BTreeSet::new();
     for g in guests.iter().filter(|g| g.running && !g.template) {
         for j in jobs.iter().filter(|j| j.enabled && selects(j, g)) {
-            if let Some(s) = &j.storage {
-                listings.insert((g.node.clone(), s.clone()));
+            match job_storage(j, &g.node, &defaults) {
+                Some(s) => {
+                    listings.insert((g.node.clone(), s));
+                }
+                None => failures.push(finding_storage_unresolved(&scope, &j.id, &g.node)),
             }
         }
     }
@@ -1533,7 +1638,7 @@ async fn diagnose_endpoint(cfg: &Config, endpoint: &str) -> Result<Vec<Finding>>
         .map(|g| finding_uncovered(&scope, endpoint, g, &jobs))
         .collect();
     findings.extend(
-        stale_backups(&jobs, &guests, &newest, &windows, now)
+        stale_backups(&jobs, &guests, &newest, &defaults, &windows, now)
             .iter()
             .map(|s| finding_stale(&scope, s, now)),
     );
@@ -1591,6 +1696,7 @@ mod tests {
             running,
             template: false,
             pool: None,
+            uptime: None,
         }
     }
 
@@ -1847,47 +1953,65 @@ mod tests {
     }
 
     #[test]
-    fn latest_vzdump_failure_reads_only_the_newest_finished_run() {
-        let ok_last = json!([
-            {"type": "vzdump", "endtime": 10, "status": "storage 'pbs' is not online", "upid": "u1"},
-            {"type": "vzdump", "endtime": 20, "status": "WARNINGS: 1", "upid": "u2"},
-            {"type": "vzdump", "starttime": 30},
-        ]);
-        assert_eq!(latest_vzdump_failure(&ok_last), None);
-        let failed_last = json!([
-            {"type": "vzdump", "endtime": 10, "status": "OK", "upid": "u1"},
-            {"type": "vzdump", "endtime": 20, "status": "job errors", "upid": "u2"},
+    fn vzdump_failures_are_per_target_and_not_hidden_by_other_successes() {
+        let tasks = json!([
+            {"type": "vzdump", "id": "110", "endtime": 10, "status": "job errors", "upid": "u1"},
+            {"type": "vzdump", "id": "115", "endtime": 20, "status": "OK", "upid": "u2"},
+            {"type": "vzdump", "id": "116", "endtime": 5, "status": "storage 'pbs' is not online", "upid": "u3"},
+            {"type": "vzdump", "id": "116", "endtime": 30, "status": "WARNINGS: 1", "upid": "u4"},
+            {"type": "vzdump", "endtime": 40, "status": "boom", "upid": "UPID:n:1:2:3:vzdump::root@pam:"},
+            {"type": "vzdump", "id": "117", "starttime": 50},
             {"type": "qmstart", "endtime": 99, "status": "boom"},
         ]);
+        let got: Vec<(String, String)> = vzdump_failures(&tasks)
+            .into_iter()
+            .map(|f| (f.target, f.upid))
+            .collect();
         assert_eq!(
-            latest_vzdump_failure(&failed_last),
-            Some(TaskFailure {
-                upid: "u2".into(),
-                endtime: 20,
-                status: "job errors".into()
-            })
+            got,
+            vec![
+                ("110".to_string(), "u1".to_string()),
+                (
+                    "all".to_string(),
+                    "UPID:n:1:2:3:vzdump::root@pam:".to_string()
+                ),
+            ]
         );
+    }
+
+    #[test]
+    fn sys_audit_is_read_from_root_nodes_or_the_node() {
+        assert!(has_sys_audit(&json!({"/": {"Sys.Audit": 1}}), "n"));
+        assert!(has_sys_audit(&json!({"/nodes/n": {"Sys.Audit": 0}}), "n"));
+        assert!(!has_sys_audit(
+            &json!({"/nodes/m": {"Sys.Audit": 1}, "/vms": {"VM.Audit": 1}}),
+            "n"
+        ));
     }
 
     #[test]
     fn stale_backups_uses_the_tightest_covering_job() {
         let jobs = parse_jobs(&json!([
-            {"id": "daily", "enabled": 1, "schedule": "03:35", "vmid": "1,2,3", "storage": "pbs"},
-            {"id": "weekly", "enabled": 1, "schedule": "sun 01:00", "vmid": "1", "storage": "pbs"},
+            {"id": "daily", "enabled": 1, "schedule": "03:35", "vmid": "1,2,3,4", "storage": "pbs"},
+            {"id": "weekly", "enabled": 1, "schedule": "sun 01:00", "vmid": "1"},
         ]));
-        let guests = vec![
+        let now = 10 * 86_400;
+        let mut guests = vec![
             guest(1, "n", true),
             guest(2, "n", true),
             guest(3, "n", true),
+            guest(4, "n", true),
         ];
-        let now = 10 * 86_400;
+        guests[2].uptime = Some(3 * 86_400);
+        guests[3].uptime = Some(3_600);
         let listing = newest_backups(&json!([
             {"vmid": 1, "ctime": now - 2 * 86_400},
             {"vmid": 2, "ctime": now - 3_600},
             {"vmid": 2, "ctime": now - 5 * 86_400},
         ]));
         let newest = HashMap::from([(("n".to_string(), "pbs".to_string()), listing)]);
-        let stale = stale_backups(&jobs, &guests, &newest, &HashMap::new(), now);
+        let defaults = HashMap::from([("n".to_string(), "local".to_string())]);
+        let stale = stale_backups(&jobs, &guests, &newest, &defaults, &HashMap::new(), now);
         let got: Vec<(u64, &str, Option<i64>)> = stale
             .iter()
             .map(|s| (s.guest.vmid, s.job.as_str(), s.newest))
@@ -1897,7 +2021,37 @@ mod tests {
             vec![(1, "daily", Some(now - 2 * 86_400)), (3, "daily", None)]
         );
         assert_eq!(stale[0].limit_min, 24 * 60 + DEFAULT_QUEUE_WINDOW_MIN);
-        assert!(stale_backups(&jobs, &guests, &HashMap::new(), &HashMap::new(), now).is_empty());
+        assert!(
+            stale_backups(
+                &jobs,
+                &guests,
+                &HashMap::new(),
+                &defaults,
+                &HashMap::new(),
+                now
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn stale_backups_falls_back_to_another_covering_jobs_storage() {
+        let jobs = parse_jobs(&json!([
+            {"id": "daily", "enabled": 1, "schedule": "03:35", "vmid": "1", "storage": "gone"},
+            {"id": "weekly", "enabled": 1, "schedule": "sun 01:00", "vmid": "1"},
+        ]));
+        let guests = vec![guest(1, "n", true)];
+        let now = 30 * 86_400;
+        let listing = newest_backups(&json!([{"vmid": 1, "ctime": now - 9 * 86_400}]));
+        let newest = HashMap::from([(("n".to_string(), "local".to_string()), listing)]);
+        let defaults = HashMap::from([("n".to_string(), "local".to_string())]);
+        let stale = stale_backups(&jobs, &guests, &newest, &defaults, &HashMap::new(), now);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(
+            (stale[0].job.as_str(), stale[0].storage.as_str()),
+            ("weekly", "local")
+        );
+        assert_eq!(stale[0].limit_min, WEEK_MIN + DEFAULT_QUEUE_WINDOW_MIN);
     }
 
     // ── HTTP-level tests against recorded PVE responses ───────────────────
@@ -2158,6 +2312,21 @@ mod tests {
                     json!([{"type": "vzdump", "starttime": 0, "endtime": 40 * 60}]),
                 )],
             ),
+            (
+                "GET",
+                "/access/permissions",
+                vec![reply(200, json!({"/": {"Sys.Audit": 1}}))],
+            ),
+            (
+                "GET",
+                "/nodes/hyp1/vzdump/defaults",
+                vec![reply(200, json!({"storage": "local"}))],
+            ),
+            (
+                "GET",
+                "/nodes/hyp1/storage/local/content",
+                vec![reply(200, json!([]))],
+            ),
         ];
         let (res, seen) = run_against(routes, async || {
             diagnose_endpoint(&test_config(), "pve").await
@@ -2166,6 +2335,10 @@ mod tests {
         let ids: Vec<&str> = findings.iter().map(|f| f.id.as_str()).collect();
         assert!(ids.contains(&"backup-uncovered::lab::116"), "{ids:?}");
         assert!(ids.contains(&"backup-queue::lab::hyp1::a::b"), "{ids:?}");
+        assert!(
+            !ids.iter().any(|i| i.starts_with("backup-tasks-unaudited")),
+            "{ids:?}"
+        );
         assert!(seen.iter().all(|r| r["method"] == "GET"));
     }
 
@@ -2180,6 +2353,7 @@ mod tests {
                     json!([
                         {"id": "a", "enabled": 1, "schedule": "03:35", "vmid": "110", "storage": "pbs"},
                         {"id": "b", "enabled": 1, "schedule": "12:00", "vmid": "111", "storage": "gone"},
+                        {"id": "c", "enabled": 1, "schedule": "13:00", "vmid": "110"},
                     ]),
                 )],
             ),
@@ -2207,7 +2381,10 @@ mod tests {
                 "/nodes/hyp1/tasks",
                 vec![reply(
                     200,
-                    json!([{"type": "vzdump", "starttime": 0, "endtime": 60, "status": "job errors", "upid": "UPID:hyp1:1"}]),
+                    json!([
+                        {"type": "vzdump", "id": "110", "starttime": 0, "endtime": 60, "status": "job errors", "upid": "UPID:hyp1:1"},
+                        {"type": "vzdump", "id": "111", "starttime": 100, "endtime": 160, "status": "OK", "upid": "UPID:hyp1:2"},
+                    ]),
                 )],
             ),
             (
@@ -2220,6 +2397,16 @@ mod tests {
                 "/nodes/hyp1/storage/gone/content",
                 vec![reply(500, json!(null))],
             ),
+            (
+                "GET",
+                "/access/permissions",
+                vec![reply(200, json!({"/vms": {"VM.Audit": 1}}))],
+            ),
+            (
+                "GET",
+                "/nodes/hyp1/vzdump/defaults",
+                vec![reply(500, json!(null))],
+            ),
         ];
         let (res, _) = run_against(routes, async || {
             diagnose_endpoint(&test_config(), "pve").await
@@ -2228,7 +2415,22 @@ mod tests {
         let ids: Vec<&str> = findings.iter().map(|f| f.id.as_str()).collect();
         assert!(ids.contains(&"backup-stale::lab::110"), "{ids:?}");
         assert!(!ids.contains(&"backup-stale::lab::111"), "{ids:?}");
-        assert!(ids.contains(&"backup-task-failed::lab::hyp1"), "{ids:?}");
+        assert!(
+            ids.contains(&"backup-task-failed::lab::hyp1::110"),
+            "{ids:?}"
+        );
+        assert!(
+            !ids.contains(&"backup-task-failed::lab::hyp1::111"),
+            "{ids:?}"
+        );
+        assert!(
+            ids.contains(&"backup-tasks-unaudited::lab::hyp1"),
+            "{ids:?}"
+        );
+        assert!(
+            ids.contains(&"backup-storage-unresolved::lab::c::hyp1"),
+            "{ids:?}"
+        );
         assert!(
             ids.contains(&"backup-storage-unreadable::lab::hyp1::gone"),
             "{ids:?}"
