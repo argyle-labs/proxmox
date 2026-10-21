@@ -13,9 +13,10 @@
 //! Diagnostics ([`diagnose_backup_jobs`]): a running guest no enabled job
 //! covers, guests with no backup within their job's schedule, a failed latest
 //! vzdump run per target, unreadable or unresolvable backup storage, a token
-//! that cannot see node task history, and jobs that queue behind each
-//! other on one node. vzdump holds a per-node lock, so a node's jobs run one at a time: a job scheduled while an
-//! earlier one is still running waits, and a long queue overruns its window.
+//! that cannot see node task history, and jobs that queue behind each other on
+//! one node. vzdump holds a per-node lock, so a node's jobs run one at a time:
+//! a job scheduled while an earlier one is still running waits, and a long
+//! queue overruns its window.
 
 use std::collections::{BTreeMap, HashMap};
 
