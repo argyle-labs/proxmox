@@ -20,7 +20,7 @@ use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json::Value;
 
 use crate::backup::{enc, raw_get_data};
-use crate::generated::{self, types as gtypes};
+use crate::responses::{ClusterResource, ResourceType, cluster_resources};
 use crate::tools::for_each_enabled_endpoint;
 
 /// Share of the pool kept free of provisioned volumes.
@@ -208,10 +208,8 @@ pub fn finding_over_committed(scope: &str, p: &PoolCommit) -> Finding {
 
 /// `(node, storage) → (size, used)` for every lvmthin storage in a
 /// `/cluster/resources` payload.
-fn thin_pools(
-    items: Vec<gtypes::GetResourcesClusterResourcesResponseItem>,
-) -> HashMap<(String, String), (u64, u64)> {
-    use gtypes::GetResourcesClusterResourcesResponseItemType as Kind;
+fn thin_pools(items: Vec<ClusterResource>) -> HashMap<(String, String), (u64, u64)> {
+    use ResourceType as Kind;
     items
         .into_iter()
         .filter(|i| i.type_ == Kind::Storage && i.plugintype.as_deref() == Some(THIN_PLUGIN))
@@ -224,16 +222,8 @@ fn thin_pools(
 
 async fn diagnose_endpoint(cfg: &crate::Config, endpoint: &str) -> Result<Vec<Finding>> {
     let http = cfg.build_reqwest_client()?;
-    let client = generated::Client::new_with_client(&cfg.base_url, http.clone());
-    let pools = thin_pools(
-        client
-            .get_resources_cluster_resources(None)
-            .await
-            .map_err(|e| anyhow::anyhow!("cluster resources: {e}"))?
-            .into_inner(),
-    );
-    let scope = crate::cluster::fetch_cluster_status(&client)
-        .await
+    let pools = thin_pools(cluster_resources(&cfg.endpoint, None)?);
+    let scope = crate::cluster::fetch_cluster_status(&cfg.endpoint)
         .ok()
         .and_then(|s| s.name)
         .unwrap_or_else(|| endpoint.to_string());

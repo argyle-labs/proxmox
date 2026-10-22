@@ -13,7 +13,7 @@ use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json::Value;
 
 use crate::backup::{enc, raw_get_data};
-use crate::generated::{self, types as gtypes};
+use crate::responses::{ResourceType, cluster_resources};
 use crate::tools::for_each_enabled_endpoint;
 
 /// Snapshots older than this are flagged.
@@ -88,16 +88,10 @@ pub(crate) fn now_secs() -> u64 {
 }
 
 async fn diagnose_endpoint(cfg: &crate::Config, endpoint: &str) -> Result<Vec<Finding>> {
-    use gtypes::GetResourcesClusterResourcesResponseItemType as Kind;
+    use ResourceType as Kind;
     let http = cfg.build_reqwest_client()?;
-    let client = generated::Client::new_with_client(&cfg.base_url, http.clone());
-    let items = client
-        .get_resources_cluster_resources(None)
-        .await
-        .map_err(|e| anyhow::anyhow!("cluster resources: {e}"))?
-        .into_inner();
-    let scope = crate::cluster::fetch_cluster_status(&client)
-        .await
+    let items = cluster_resources(&cfg.endpoint, None)?;
+    let scope = crate::cluster::fetch_cluster_status(&cfg.endpoint)
         .ok()
         .and_then(|s| s.name)
         .unwrap_or_else(|| endpoint.to_string());

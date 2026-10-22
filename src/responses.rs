@@ -140,6 +140,59 @@ impl ClusterResourcesResponse {
     }
 }
 
+/// One `/cluster/resources` row, as read through `api::call`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ClusterResource {
+    #[serde(default)]
+    pub id: String,
+    #[serde(rename = "type")]
+    pub type_: ResourceType,
+    pub node: Option<String>,
+    pub vmid: Option<i64>,
+    pub name: Option<String>,
+    pub status: Option<String>,
+    pub template: Option<bool>,
+    pub plugintype: Option<String>,
+    pub storage: Option<String>,
+    pub pool: Option<String>,
+    pub cpu: Option<f64>,
+    pub maxcpu: Option<f64>,
+    pub mem: Option<u64>,
+    pub maxmem: Option<i64>,
+    pub disk: Option<u64>,
+    pub maxdisk: Option<u64>,
+    pub uptime: Option<i64>,
+    pub tags: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResourceType {
+    Node,
+    Storage,
+    Pool,
+    Qemu,
+    Lxc,
+    Sdn,
+    #[default]
+    #[serde(other)]
+    Other,
+}
+
+/// `GET /cluster/resources`, optionally filtered by PVE's `type` (`vm`,
+/// `storage`, `node`, `sdn`).
+pub fn cluster_resources(
+    endpoint: &str,
+    type_filter: Option<&str>,
+) -> anyhow::Result<Vec<ClusterResource>> {
+    plugin_toolkit::api::call(
+        "proxmox.get_resources_cluster_resources",
+        endpoint,
+        crate::args(serde_json::json!({ "type_": type_filter })),
+    )
+    .map_err(|e| e.context("cluster resources"))
+}
+
 // ── /nodes/{node}/qemu | /nodes/{node}/lxc ──────────────────────────────────
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]

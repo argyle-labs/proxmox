@@ -27,8 +27,8 @@ use plugin_toolkit::serde_json::Value;
 use crate::Config;
 use crate::backup::{enc, post_form, put_form, raw_get_data};
 use crate::execute::{self, Change};
-use crate::generated::{self, types as gtypes};
 use crate::lxc_guest::{self, GuestIo};
+use crate::responses::{ClusterResource, ResourceType, cluster_resources};
 use crate::tools::{for_each_enabled_endpoint, resolve_config};
 
 /// Fleet retention policy for scheduled backups.
@@ -1286,8 +1286,8 @@ pub fn stale_backups<'a>(
     out
 }
 
-fn guest_rows(items: Vec<gtypes::GetResourcesClusterResourcesResponseItem>) -> Vec<GuestRow> {
-    use gtypes::GetResourcesClusterResourcesResponseItemType as Kind;
+fn guest_rows(items: Vec<ClusterResource>) -> Vec<GuestRow> {
+    use ResourceType as Kind;
     items
         .into_iter()
         .filter_map(|i| {
@@ -1462,17 +1462,9 @@ pub fn finding_storage_unreadable(scope: &str, node: &str, storage: &str, err: &
 
 async fn diagnose_endpoint(cfg: &Config, endpoint: &str) -> Result<Vec<Finding>> {
     let http = cfg.build_reqwest_client()?;
-    let client = generated::Client::new_with_client(&cfg.base_url, http.clone());
     let jobs = parse_jobs(&raw_get_data(&http, &cfg.base_url, "cluster/backup").await?);
-    let guests = guest_rows(
-        client
-            .get_resources_cluster_resources(Some(gtypes::GetResourcesClusterResourcesType::Vm))
-            .await
-            .map_err(|e| anyhow!("cluster resources: {e}"))?
-            .into_inner(),
-    );
-    let scope = crate::cluster::fetch_cluster_status(&client)
-        .await
+    let guests = guest_rows(cluster_resources(&cfg.endpoint, Some("vm"))?);
+    let scope = crate::cluster::fetch_cluster_status(&cfg.endpoint)
         .ok()
         .and_then(|s| s.name)
         .unwrap_or_else(|| endpoint.to_string());
@@ -1931,20 +1923,32 @@ mod tests {
         let routes = Arc::new(Mutex::new(routes));
         let out = plugin_toolkit::capsink::with_cap_sink(
             Box::new(move |cap: &str, raw: &str| {
-                assert_eq!(cap, "http.request");
-                let req: Value = serde_json::from_str(raw).unwrap();
-                log.lock().unwrap().push(req.clone());
-                let method = req["method"].as_str().unwrap().to_string();
-                let url = req["url"].as_str().unwrap().to_string();
+                let api = cap == "api.call";
+                let (method, url) = if api {
+                    crate::test_support::api_call_route(raw)
+                } else {
+                    assert_eq!(cap, "http.request");
+                    let req: Value = serde_json::from_str(raw).unwrap();
+                    log.lock().unwrap().push(req.clone());
+                    (
+                        req["method"].as_str().unwrap().to_string(),
+                        req["url"].as_str().unwrap().to_string(),
+                    )
+                };
                 let path = url.split('?').next().unwrap().to_string();
                 let mut routes = routes.lock().unwrap();
                 for (m, suffix, bodies) in routes.iter_mut() {
                     if *m == method && path.ends_with(*suffix) {
-                        return Ok(if bodies.len() > 1 {
+                        let body = if bodies.len() > 1 {
                             bodies.remove(0)
                         } else {
                             bodies[0].clone()
-                        });
+                        };
+                        return if api {
+                            crate::test_support::api_call_reply(&body)
+                        } else {
+                            Ok(body)
+                        };
                     }
                 }
                 panic!("unexpected request {method} {url}");

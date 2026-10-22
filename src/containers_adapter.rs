@@ -13,7 +13,7 @@ use plugin_toolkit::orca_async;
 use plugin_toolkit::reqwest;
 use std::time::Duration;
 
-use crate::generated::{self, types as gtypes};
+use crate::responses::{ResourceType, cluster_resources};
 use crate::{GuestKind, ProxmoxAction, fetch_guest_config};
 
 /// Budget for the liveness probe. Tight on purpose — the reconciler
@@ -33,23 +33,20 @@ const RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// at the reconciler-entry level: one adapter per endpoint, both
 /// registered.
 pub struct LxcProxmoxApiAdapter {
-    client: generated::Client,
     http: reqwest::Client,
     base_url: String,
-    /// Display name for the endpoint — surfaced in tracing / error
-    /// context, not in the typed surface.
+    /// Registered endpoint name: the `api::call` key, also surfaced in
+    /// tracing / error context.
     endpoint_name: String,
 }
 
 impl LxcProxmoxApiAdapter {
     pub fn new(
-        client: generated::Client,
         http: reqwest::Client,
         base_url: impl Into<String>,
         endpoint_name: impl Into<String>,
     ) -> Self {
         Self {
-            client,
             http,
             base_url: base_url.into(),
             endpoint_name: endpoint_name.into(),
@@ -120,21 +117,12 @@ impl RuntimeAdapter for LxcProxmoxApiAdapter {
             return probe_http_service(&self.http, &host, port).await;
         }
 
-        let Ok(vmid) = container.id.parse::<i64>() else {
+        let Ok(vmid) = container.id.parse::<u64>() else {
             return Liveness::Unknown;
         };
-        let status = self
-            .client
-            .get_vm_status_nodes_node_lxc_vmid_status_current(&container.host, vmid);
-        match tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), status).await {
-            Ok(Ok(st)) => match st.into_inner().status {
-                gtypes::GetVmStatusNodesNodeLxcVmidStatusCurrentResponseStatus::Running => {
-                    Liveness::Live
-                }
-                _ => Liveness::Unknown,
-            },
-            Ok(Err(_)) => Liveness::Unknown,
-            Err(_) => Liveness::Wedged,
+        match lxc_status(&self.endpoint_name, &container.host, vmid) {
+            Ok(st) if st == "running" => Liveness::Live,
+            _ => Liveness::Unknown,
         }
     }
 
@@ -215,10 +203,10 @@ impl WedgeRecoverer for LxcProxmoxApiAdapter {
         }
 
         self.do_lifecycle(&node, vmid, ProxmoxAction::Stop).await?;
-        wait_for_status(&self.client, &node, vmid, "stopped").await?;
+        wait_for_status(&self.endpoint_name, &node, vmid, "stopped").await?;
 
         self.do_lifecycle(&node, vmid, ProxmoxAction::Start).await?;
-        wait_for_status(&self.client, &node, vmid, "running").await?;
+        wait_for_status(&self.endpoint_name, &node, vmid, "running").await?;
 
         Ok(())
     }
@@ -227,19 +215,16 @@ impl WedgeRecoverer for LxcProxmoxApiAdapter {
 /// Poll the LXC current-status endpoint until `data.status` matches
 /// `expected`, up to [`RECOVERY_POLL_BUDGET_SECS`].
 async fn wait_for_status(
-    client: &generated::Client,
+    endpoint: &str,
     node: &str,
     vmid: u64,
     expected: &str,
 ) -> Result<(), AdapterError> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(RECOVERY_POLL_BUDGET_SECS);
     loop {
-        let st = client
-            .get_vm_status_nodes_node_lxc_vmid_status_current(node, vmid as i64)
-            .await
-            .map_err(|e| AdapterError::Transport(format!("status {vmid}: {e}")))?
-            .into_inner();
-        if st.status.to_string() == expected {
+        let st = lxc_status(endpoint, node, vmid)
+            .map_err(|e| AdapterError::Transport(format!("status {vmid}: {e}")))?;
+        if st == expected {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -251,22 +236,28 @@ async fn wait_for_status(
     }
 }
 
+fn lxc_status(endpoint: &str, node: &str, vmid: u64) -> anyhow::Result<String> {
+    #[derive(serde::Deserialize)]
+    struct Current {
+        status: String,
+    }
+    let st: Current = plugin_toolkit::api::call(
+        "proxmox.get_vm_status_nodes_node_lxc_vmid_status_current",
+        endpoint,
+        plugin_toolkit::serde_json::json!({ "node": node, "vmid": vmid }),
+    )?;
+    Ok(st.status)
+}
+
 impl LxcProxmoxApiAdapter {
     /// Fetch the cluster resource list and return only LXC rows.
     async fn fetch_lxc_rows(&self) -> Result<Vec<LxcRow>, AdapterError> {
-        let items = self
-            .client
-            .get_resources_cluster_resources(Some(gtypes::GetResourcesClusterResourcesType::Vm))
-            .await
-            .map_err(|e| AdapterError::Transport(format!("cluster resources: {e}")))?
-            .into_inner();
+        let items = cluster_resources(&self.endpoint_name, Some("vm"))
+            .map_err(|e| AdapterError::Transport(format!("{e:#}")))?;
         Ok(items
             .into_iter()
             .filter_map(|r| {
-                if !matches!(
-                    r.type_,
-                    gtypes::GetResourcesClusterResourcesResponseItemType::Lxc
-                ) {
+                if r.type_ != ResourceType::Lxc {
                     return None;
                 }
                 let node = r.node?;
@@ -286,7 +277,7 @@ impl LxcProxmoxApiAdapter {
 
     async fn build_container(&self, row: &LxcRow) -> Result<Container, AdapterError> {
         // Per-container config fetch populates restart_policy from
-        // `onboot`. Raw URL because progenitor can't model indexed
+        // `onboot`. Raw URL because the schema can't model indexed
         // keys; see `fetch_guest_config` rationale.
         let cfg = fetch_guest_config(
             &self.http,
@@ -354,34 +345,9 @@ impl LxcProxmoxApiAdapter {
         vmid: u64,
         action: ProxmoxAction,
     ) -> Result<(), AdapterError> {
-        let vmid_i = vmid as i64;
-        let res = match action {
-            ProxmoxAction::Start => self
-                .client
-                .post_vm_start_nodes_node_lxc_vmid_status_start(node, vmid_i, &Default::default())
-                .await
-                .map(|_| ()),
-            ProxmoxAction::Stop => self
-                .client
-                .post_vm_stop_nodes_node_lxc_vmid_status_stop(node, vmid_i, &Default::default())
-                .await
-                .map(|_| ()),
-            ProxmoxAction::Shutdown => self
-                .client
-                .post_vm_shutdown_nodes_node_lxc_vmid_status_shutdown(
-                    node,
-                    vmid_i,
-                    &Default::default(),
-                )
-                .await
-                .map(|_| ()),
-            ProxmoxAction::Reboot => self
-                .client
-                .post_vm_reboot_nodes_node_lxc_vmid_status_reboot(node, vmid_i, &Default::default())
-                .await
-                .map(|_| ()),
-        };
-        res.map_err(|e| AdapterError::Transport(format!("{} {vmid}: {e}", action.as_str())))
+        crate::run_lifecycle(&self.endpoint_name, node, GuestKind::Lxc, vmid, action)
+            .map(|_| ())
+            .map_err(|e| AdapterError::Transport(format!("{e:#}")))
     }
 }
 

@@ -534,7 +534,7 @@ fn pve_to_schema(s: &PveSchema) -> Schema {
                 for (name, schema) in props {
                     // Narrow, growable override: PVE documents these response
                     // fields as required but omits or `null`s them on the wire
-                    // (verified live via tests/live_read_sweep.rs). Mark them
+                    // (verified live). Mark them
                     // optional AND nullable so progenitor emits `Option<T>` —
                     // which absorbs both absence and an explicit `null` (a plain
                     // non-required array otherwise becomes `Vec<T>` + default,

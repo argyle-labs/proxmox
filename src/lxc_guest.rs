@@ -1,7 +1,7 @@
 use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::prelude::*;
 
-use crate::generated::{self, types as gtypes};
+use crate::responses::{ResourceType, cluster_resources};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExecResult {
@@ -229,33 +229,27 @@ pub struct CtRef {
 }
 
 /// Find LXC `vmid` in the cluster; an id that is a VM is an error.
-pub async fn find_ct(client: &generated::Client, vmid: u64) -> Result<CtRef> {
-    find_ct_opt(client, vmid)
-        .await?
-        .ok_or_else(|| anyhow!("no guest {vmid} in the cluster"))
+pub fn find_ct(endpoint: &str, vmid: u64) -> Result<CtRef> {
+    find_ct_opt(endpoint, vmid)?.ok_or_else(|| anyhow!("no guest {vmid} in the cluster"))
 }
 
 /// [`find_ct`], with `None` when the cluster has no guest `vmid`; errors if the
 /// token cannot audit that path.
-pub async fn find_ct_opt(client: &generated::Client, vmid: u64) -> Result<Option<CtRef>> {
-    use gtypes::GetResourcesClusterResourcesResponseItemType as Kind;
-    let items = client
-        .get_resources_cluster_resources(Some(gtypes::GetResourcesClusterResourcesType::Vm))
-        .await
-        .map_err(|e| anyhow!("cluster resources: {e}"))?
-        .into_inner();
+pub fn find_ct_opt(endpoint: &str, vmid: u64) -> Result<Option<CtRef>> {
+    let items = cluster_resources(endpoint, Some("vm"))?;
     let Some(item) = items.into_iter().find(|i| i.vmid == Some(vmid as i64)) else {
         // /cluster/resources silently omits guests the token cannot audit.
         let path = format!("/vms/{vmid}");
-        let perms = client
-            .get_permissions_access_permissions(Some(&path), None)
-            .await
-            .map_err(|e| anyhow!("access permissions {path}: {e}"))?
-            .into_inner();
+        let perms: serde_json::Map<String, serde_json::Value> = plugin_toolkit::api::call(
+            "proxmox.get_permissions_access_permissions",
+            endpoint,
+            json!({ "path": path }),
+        )
+        .map_err(|e| e.context(format!("access permissions {path}")))?;
         require_audit(vmid, &perms)?;
         return Ok(None);
     };
-    if item.type_ != Kind::Lxc {
+    if item.type_ != ResourceType::Lxc {
         bail!("guest {vmid} is not an LXC container; this operation is LXC-only");
     }
     Ok(Some(CtRef {

@@ -589,7 +589,10 @@ pub fn backend_defs() -> Vec<BackendDef> {
     };
     rows.into_iter()
         .filter_map(|row| match ProxmoxDeployTarget::from_row(row.clone()) {
-            Ok(target) => Some(deploy_backend_def(&target, &invoke_prefix(&row))),
+            Ok(target) => Some(BackendDef {
+                reaches: crate::unit_provider::reaches(),
+                ..deploy_backend_def(&target, &invoke_prefix(&row))
+            }),
             Err(e) => {
                 tracing::warn!(target = %row.id(), error = %e, "proxmox deploy: skipping malformed target");
                 None

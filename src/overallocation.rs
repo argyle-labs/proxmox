@@ -4,7 +4,7 @@
 //! earns an `Info` nudge. Memory commitment is judged in [`crate::memory`].
 
 use crate::GuestKind;
-use crate::generated::{self, types as gtypes};
+use crate::responses::{ClusterResource, ResourceType, cluster_resources};
 use crate::tools::for_each_enabled_endpoint;
 use plugin_toolkit::contract::diagnostics::{Finding, Severity};
 use std::collections::HashMap;
@@ -148,13 +148,7 @@ fn finding_vcpu(c: &Commitment) -> Finding {
 /// round trip.
 pub async fn diagnose_overallocation() -> Vec<Finding> {
     for_each_enabled_endpoint("diagnostics.capacity", |cfg, _ep| async move {
-        let http = cfg.build_reqwest_client()?;
-        let client = generated::Client::new_with_client(&cfg.base_url, http);
-        let items = client
-            .get_resources_cluster_resources(None)
-            .await
-            .map_err(|e| anyhow::anyhow!("cluster resources: {e}"))?
-            .into_inner();
+        let items = cluster_resources(&cfg.endpoint, None)?;
 
         let (nodes, by_node) = partition_resources(items);
         Ok(nodes
@@ -172,9 +166,9 @@ pub async fn diagnose_overallocation() -> Vec<Finding> {
 /// guests on each. Stopped guests and templates reserve nothing, so they are
 /// dropped here rather than being weighed and discounted later.
 fn partition_resources(
-    items: Vec<gtypes::GetResourcesClusterResourcesResponseItem>,
+    items: Vec<ClusterResource>,
 ) -> (Vec<NodeCapacity>, HashMap<String, Vec<GuestAlloc>>) {
-    use gtypes::GetResourcesClusterResourcesResponseItemType as Kind;
+    use ResourceType as Kind;
 
     let mut nodes = Vec::new();
     let mut by_node: HashMap<String, Vec<GuestAlloc>> = HashMap::new();

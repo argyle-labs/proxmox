@@ -24,8 +24,8 @@ use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json::Value;
 
 use crate::backup::{enc, put_form, raw_get_data};
-use crate::generated::{self, types as gtypes};
 use crate::responses::{ConfigField, GuestConfigData};
+use crate::responses::{ResourceType, cluster_resources};
 use crate::tools::{EndpointFailure, fan_out_enabled_endpoints, resolve_config};
 use crate::{Config, GuestKind, fetch_guest_config};
 
@@ -344,15 +344,10 @@ pub async fn audit_endpoint(
     endpoint: &str,
     node: Option<&str>,
 ) -> Result<ThinAuditReport> {
-    use gtypes::GetResourcesClusterResourcesResponseItemType as Kind;
+    use ResourceType as Kind;
 
     let http = cfg.build_reqwest_client()?;
-    let client = generated::Client::new_with_client(&cfg.base_url, http.clone());
-    let items = client
-        .get_resources_cluster_resources(None)
-        .await
-        .map_err(|e| anyhow::anyhow!("cluster resources: {e}"))?
-        .into_inner();
+    let items = cluster_resources(&cfg.endpoint, None)?;
 
     let mut thin: HashMap<String, HashSet<String>> = HashMap::new();
     let mut guests = Vec::new();
@@ -997,6 +992,15 @@ mod tests {
         let log = seen.clone();
         let out = plugin_toolkit::capsink::with_cap_sink(
             Box::new(move |cap: &str, raw: &str| {
+                if cap == "api.call" {
+                    let (method, path) = crate::test_support::api_call_route(raw);
+                    for (m, suffix, body) in &routes {
+                        if *m == method && path.ends_with(suffix) {
+                            return crate::test_support::api_call_reply(body);
+                        }
+                    }
+                    panic!("unexpected api.call {method} {path}");
+                }
                 assert_eq!(cap, "http.request");
                 let req: Value = serde_json::from_str(raw).unwrap();
                 log.lock().unwrap().push(req.clone());
