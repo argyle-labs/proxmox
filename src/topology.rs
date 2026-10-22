@@ -1,26 +1,3 @@
-//! Proxmox → TopologyClaim collector (API path).
-//!
-//! Replaces the file-reading collector in `system::topology::proxmox` for
-//! every host with a registered Proxmox endpoint. Architectural rationale
-//! per [[project-adapter-backends-api-first]]: runtime adapters speak the
-//! native API, not host-local CLI / pmxcfs files.
-//!
-//! Two-step fetch per endpoint:
-//!   1. `GET /cluster/resources?type=vm` — every VM + LXC in the cluster
-//!      via `api::call`.
-//!   2. `GET /nodes/{node}/{kind}/{vmid}/config` per guest — via
-//!      `fetch_guest_config` (raw URL: the schema can't model the
-//!      indexed `netN` keys we depend on). Calls fan out concurrently.
-//!
-//! Live guest IPs ride the raw path too: the interface listings are
-//! admin-role in the api surface, and this collector runs as a read caller.
-//!
-//! Errors are scoped per endpoint and per guest: a broken endpoint blanks
-//! that endpoint's contribution but doesn't kill claims from others; a
-//! guest whose config 404s is skipped silently (it may have been deleted
-//! between the cluster-list and the config fetch).
-
-use crate::backup::{enc, raw_get_data};
 use crate::responses::{ResourceType, cluster_resources};
 use crate::tools::for_each_enabled_endpoint;
 use crate::{GuestKind, fetch_guest_config};
@@ -109,7 +86,7 @@ async fn collect_for_endpoint(
         // Best-effort live IPs. A guest with no agent (QEMU) or no running
         // interfaces reports nothing — that's an expected gap, not an error,
         // so failures are swallowed and `routes` is simply left empty.
-        let routes = fetch_guest_routes(http, base_url, g.kind, &g.node, g.vmid).await;
+        let routes = fetch_guest_routes(provider_instance, g.kind, &g.node, g.vmid);
         let state = normalize_state(g.status.as_deref());
         Some(TopologyClaim {
             kind: kind_to_claim_kind(g.kind).to_string(),
@@ -164,21 +141,19 @@ fn normalize_state(status: Option<&str>) -> Option<String> {
 /// any transport/agent error (e.g. QEMU guest-agent not installed, LXC not
 /// running) is logged at debug and yields an empty vec — a noted gap, not a
 /// hard error, so one guest can't break the whole collect.
-async fn fetch_guest_routes(
-    http: &reqwest::Client,
-    base_url: &str,
-    kind: GuestKind,
-    node: &str,
-    vmid: u64,
-) -> Vec<Route> {
-    let path = match kind {
-        GuestKind::Lxc => format!("nodes/{}/lxc/{vmid}/interfaces", enc(node)),
-        GuestKind::Qemu => format!(
-            "nodes/{}/qemu/{vmid}/agent/network-get-interfaces",
-            enc(node)
-        ),
+fn fetch_guest_routes(endpoint: &str, kind: GuestKind, node: &str, vmid: u64) -> Vec<Route> {
+    let op = match kind {
+        GuestKind::Lxc => "proxmox.get_ip_nodes_node_lxc_vmid_interfaces",
+        GuestKind::Qemu => {
+            "proxmox.get_network_get_interfaces_nodes_node_qemu_vmid_agent_network_get_interfaces"
+        }
     };
-    match (kind, raw_get_data(http, base_url, &path).await) {
+    let resp = plugin_toolkit::api::call::<plugin_toolkit::serde_json::Value>(
+        op,
+        endpoint,
+        plugin_toolkit::serde_json::json!({ "node": node, "vmid": vmid }),
+    );
+    match (kind, resp) {
         (GuestKind::Lxc, Ok(resp)) => routes_from_lxc_interfaces(&resp),
         (GuestKind::Qemu, Ok(resp)) => resp
             .as_object()
@@ -195,8 +170,6 @@ async fn fetch_guest_routes(
     }
 }
 
-/// Each LXC interface carries a typed `ip-addresses` list plus the legacy
-/// `inet`/`inet6` (CIDR) fields; fold both in and dedupe.
 fn routes_from_lxc_interfaces(resp: &plugin_toolkit::serde_json::Value) -> Vec<Route> {
     let ips = resp.as_array().into_iter().flatten().flat_map(|iface| {
         let typed = iface

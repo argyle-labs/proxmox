@@ -589,7 +589,6 @@ async fn wait_for_task(
             json!({ "node": node, "upid": upid }),
         )
         .with_context(|| format!("task status {upid} on {node}"))?;
-        // `status` is `running` until the task stops; then `exitstatus` is set.
         if status.status != "running" {
             let exit = status.exitstatus.unwrap_or_default();
             if exit == "OK" {
@@ -805,34 +804,6 @@ impl ProxmoxUnitProvider {
             id.clone(),
             serde_json::to_string(&backup).unwrap_or_default(),
         )))
-    }
-
-    /// The pre-update backup of one LXC, through the same path as the unit
-    /// `backup` action.
-    pub(crate) async fn backup_lxc(
-        &self,
-        endpoint: &str,
-        ctid: u64,
-        storage: Option<&str>,
-    ) -> Result<BackupRef> {
-        let id = UnitId {
-            manager: manager_for(endpoint),
-            kind: KIND_LXC.to_string(),
-            id: ctid.to_string(),
-            name: String::new(),
-        };
-        let payload = BackupPayload {
-            storage: storage.map(str::to_string),
-            ..Default::default()
-        };
-        match self
-            .do_backup(&id, Some(serde_json::to_string(&payload)?))
-            .await?
-        {
-            VerbOutcome::Item(item) => serde_json::from_str(&item.payload)
-                .map_err(|e| anyhow!("backup ref from vzdump: {e}")),
-            _ => Err(anyhow!("backup of lxc {ctid} returned no backup ref")),
-        }
     }
 
     /// `update` on an LXC: a plan unless the payload sets `execute`; then, for
@@ -1174,7 +1145,6 @@ pub const LIFECYCLE_OPS: [&str; 8] = [
     "proxmox.post_vm_reboot_nodes_node_lxc_vmid_status_reboot",
 ];
 
-/// Every gated api-surface op the unit backend calls; declared as its `reaches`.
 pub fn reaches() -> Vec<String> {
     [VZDUMP_OP, CREATE_LXC_OP, CREATE_QEMU_OP]
         .into_iter()
@@ -1184,7 +1154,6 @@ pub fn reaches() -> Vec<String> {
         .collect()
 }
 
-/// One lifecycle transition against a guest.
 fn lifecycle(endpoint: &str, node: &str, vmid: u64, kind: GuestKind, action: &str) -> Result<()> {
     let action: crate::ProxmoxAction = action.parse().map_err(|_| {
         anyhow!("unknown lifecycle action '{action}' (expected start | stop | shutdown | reboot)")
@@ -1194,10 +1163,7 @@ fn lifecycle(endpoint: &str, node: &str, vmid: u64, kind: GuestKind, action: &st
 
 fn destroy(endpoint: &str, node: &str, kind: GuestKind, vmid: u64) -> Result<()> {
     api::call::<serde_json::Value>(
-        &format!(
-            "proxmox.delete_destroy_vm_nodes_node_{}_vmid",
-            kind.as_str()
-        ),
+        &crate::destroy_op(kind),
         endpoint,
         json!({ "node": node, "vmid": vmid }),
     )
@@ -1209,7 +1175,6 @@ fn destroy(endpoint: &str, node: &str, kind: GuestKind, vmid: u64) -> Result<()>
 /// running VM, and without it the guest can't be exec'd into or fstrim its disks.
 const QEMU_AGENT_DEFAULT: &str = "enabled=1";
 
-/// The create body as JSON (only set fields).
 fn create_body(
     p: &ProvisionPayload,
     kind: GuestKind,

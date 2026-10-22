@@ -156,7 +156,6 @@ fn hand_written_reads_are_not_execute_gated() {
         "proxmox.nodes",
         "proxmox.node_detail",
         "proxmox.deploy_target_list",
-        "proxmox.host_logs",
         "proxmox.cluster_status",
         "proxmox.cluster_list",
         "proxmox.list_clusters",
@@ -171,6 +170,15 @@ fn hand_written_reads_are_not_execute_gated() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn host_logs_is_an_ungated_admin_read() {
+    assert!(!is_execute_gated("proxmox.host_logs"));
+    assert_eq!(
+        plugin_toolkit::dispatch::required_role("proxmox.host_logs"),
+        Some("admin")
+    );
 }
 
 fn test_ctx() -> plugin_toolkit::contract::ToolCtx {

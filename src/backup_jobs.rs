@@ -1925,7 +1925,8 @@ mod tests {
             Box::new(move |cap: &str, raw: &str| {
                 let api = cap == "api.call";
                 let (method, url) = if api {
-                    crate::test_support::api_call_route(raw)
+                    let (method, path, _) = crate::test_support::api_call_route(raw);
+                    (method, path)
                 } else {
                     assert_eq!(cap, "http.request");
                     let req: Value = serde_json::from_str(raw).unwrap();

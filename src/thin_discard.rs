@@ -993,7 +993,7 @@ mod tests {
         let out = plugin_toolkit::capsink::with_cap_sink(
             Box::new(move |cap: &str, raw: &str| {
                 if cap == "api.call" {
-                    let (method, path) = crate::test_support::api_call_route(raw);
+                    let (method, path, _) = crate::test_support::api_call_route(raw);
                     for (m, suffix, body) in &routes {
                         if *m == method && path.ends_with(suffix) {
                             return crate::test_support::api_call_reply(body);

@@ -57,6 +57,8 @@ impl DiagnosticsProvider for ProxmoxDiagnostics {
 pub const DIAG_PREFIX: &str = "proxmox.__diagnostics";
 const PROVIDER: &str = "proxmox";
 pub const ENABLE_AGENT_OP: &str = "proxmox.put_update_vm_nodes_node_qemu_vmid_config";
+const AGENT_PING_OP: &str = "proxmox.post_ping_nodes_node_qemu_vmid_agent_ping";
+pub const REACHES: [&str; 2] = [ENABLE_AGENT_OP, AGENT_PING_OP];
 
 /// The `diagnostics` backend descriptor this plugin advertises.
 pub fn diagnostics_backend_def() -> BackendDef {
@@ -337,12 +339,12 @@ async fn diagnose_qemu_agents(_args: DiagnoseArgs) -> Vec<Finding> {
             // Only ping when the config says the agent should be up; a ping to a
             // config-disabled agent always fails and would be noise.
             let ping_ok = if enabled {
-                let url = format!(
-                    "{}/nodes/{}/qemu/{vmid}/agent/ping",
-                    cfg.base_url.trim_end_matches('/'),
-                    crate::backup::enc(&node)
-                );
-                crate::backup::post_form(&http, &url, &[]).await.is_ok()
+                plugin_toolkit::api::call::<serde_json::Value>(
+                    AGENT_PING_OP,
+                    &ep.name,
+                    serde_json::json!({ "node": node, "vmid": vmid }),
+                )
+                .is_ok()
             } else {
                 false
             };

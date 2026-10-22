@@ -1,31 +1,8 @@
-//! Proxmox tool surface.
-//!
-//! Endpoint registry: `proxmox.{list, detail, create, update, delete}` —
-//! generated wholesale by `#[endpoint_resource]`. The macro emits the row
-//! struct, db helpers (`endpoint_db::*`), schema fragment, args/output
-//! types, and the five `#[orca_tool]`-annotated functions in one shot.
-//!
-//! Hand-written tools for cluster drill-in and lifecycle:
-//!   - `proxmox.nodes`            list nodes for an endpoint
-//!   - `proxmox.node_detail`      VMs + containers on one node
-//!   - `proxmox.action`           VM/container start/stop/shutdown/reboot
-//!   - `proxmox.host_logs`        systemd journal lines from one node
-//!
-//! Imports flow through `plugin_toolkit::prelude::*` only.
-
 use plugin_toolkit::prelude::*;
 
 use crate::Config;
 use plugin_toolkit::api;
 
-// ═══════════════════════════════════════════════════════════════════════════
-// proxmox.{list,detail,create,update,delete} — endpoint registry CRUD.
-// ═══════════════════════════════════════════════════════════════════════════
-
-// `routes` is a built-in column on every `#[endpoint_resource]` — an ordered
-// fallback list (`--route kind=url`, repeatable) resolved by
-// `route::resolve_reachable`. Each entry's free-form `kind` (`fqdn` / `lan` /
-// `tailscale`) doubles as the locality class the fewest-hop router consumes.
 #[endpoint_resource(plugin = "proxmox")]
 pub struct ProxmoxEndpoint {
     pub name: String,
@@ -35,8 +12,6 @@ pub struct ProxmoxEndpoint {
     pub insecure: bool,
     pub enabled: bool,
 }
-
-// ── Action result ──────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct ProxmoxActionResult {
@@ -60,21 +35,9 @@ impl From<crate::ProxmoxActionResult> for ProxmoxActionResult {
     }
 }
 
-// ── HTTP client helper ─────────────────────────────────────────────────────
-
-/// Resolve a registered endpoint into a ready [`Config`]: the first reachable
-/// base URL (`resolve_reachable` over the endpoint's `routes` fallback list)
-/// plus the secure-first token secret, tagged with the endpoint name
-/// `api::call` keys on. Single place the raw reqwest paths flow through.
 pub(crate) async fn resolve_config(name: &str) -> Result<Config> {
     let row = endpoint_db::require(name)?;
-    let secret = resolve_token_secret(name, &row)?;
-    // Endpoints are registered as the bare host root (e.g. `https://host:8006`),
-    // which is also what the reachability probe hits. The PVE REST API lives
-    // under `/api2/json`; the hand-rolled `fetch_guest_config`/topology
-    // paths join their `/nodes/...` routes onto
-    // `Config::base_url`, so promote the reachable root to the API root here.
-    // Idempotent: an address already ending in `/api2/json` is left as-is.
+    let secret = resolve_token_secret(name)?;
     let reachable = route::resolve_reachable(name, &row.routes, row.insecure).await?;
     let base_url = api_root(&reachable);
     Ok(Config::new(base_url, row.token_id, secret)
@@ -82,8 +45,6 @@ pub(crate) async fn resolve_config(name: &str) -> Result<Config> {
         .endpoint(name))
 }
 
-/// Promote a bare PVE host URL to its REST API root (`.../api2/json`),
-/// leaving a URL that already carries the suffix untouched.
 fn api_root(base: &str) -> String {
     let trimmed = base.trim_end_matches('/');
     if trimmed.ends_with("/api2/json") {
@@ -93,32 +54,19 @@ fn api_root(base: &str) -> String {
     }
 }
 
-/// An enabled endpoint the fan-out could not read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct EndpointFailure {
-    /// `None` when the endpoint registry itself could not be listed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     pub error: String,
 }
 
-/// Flattened results of a fan-out plus every endpoint that failed.
 pub(crate) struct FanOut<T> {
     pub items: Vec<T>,
     pub failures: Vec<EndpointFailure>,
-    /// Enabled endpoints the fan-out tried, failed or not.
     pub attempted: usize,
 }
 
-/// Fan an async operation out across every **enabled** endpoint, resolving each
-/// endpoint's [`Config`] through [`resolve_config`] (reachable address +
-/// secure-first token) and flattening the per-endpoint results. A failing
-/// endpoint — whether the resolve or `work` itself errors — is logged with
-/// `warn!`, recorded in [`FanOut::failures`], and skipped: one flaky host must
-/// never blank the fleet-wide view.
-///
-/// `work` receives a ready `Config` (`cfg.endpoint` for `api::call`, or
-/// `build_reqwest_client()` for the raw path) plus the endpoint row. `op` is a short label for the log lines.
 pub(crate) async fn fan_out_enabled_endpoints<T, F, Fut>(op: &str, work: F) -> FanOut<T>
 where
     F: Fn(Config, ProxmoxEndpoint) -> Fut,
@@ -168,8 +116,6 @@ where
     out
 }
 
-/// [`fan_out_enabled_endpoints`] for callers that only want the results; the
-/// failures are already logged.
 pub(crate) async fn for_each_enabled_endpoint<T, F, Fut>(op: &str, work: F) -> Vec<T>
 where
     F: Fn(Config, ProxmoxEndpoint) -> Fut,
@@ -178,18 +124,10 @@ where
     fan_out_enabled_endpoints(op, work).await.items
 }
 
-/// Resolve an endpoint's token secret secure-first: prefer the abstract secrets
-/// domain (`proxmox.<endpoint>.token_secret`), falling back to a legacy
-/// plaintext column value only if the domain has none. Once
-/// `proxmox.access_bootstrap` has run, the column is empty and the secret lives
-/// only in the secrets domain ([[runtime-least-privilege-not-root]]).
 pub(crate) fn token_secret_name(endpoint: &str) -> Result<String> {
     plugin_toolkit::secrets::scoped_name("proxmox", endpoint, "token_secret").map(|r| r.to_string())
 }
 
-/// Names of every **enabled** endpoint, for callers (e.g. the backup KINDs) that
-/// need to resolve a specific endpoint's [`Config`] by name via
-/// [`resolve_config`] rather than fan out over all of them at once.
 pub(crate) fn enabled_endpoint_names() -> Vec<String> {
     match endpoint_db::list() {
         Ok(eps) => eps
@@ -204,18 +142,16 @@ pub(crate) fn enabled_endpoint_names() -> Vec<String> {
     }
 }
 
-fn resolve_token_secret(name: &str, row: &ProxmoxEndpoint) -> Result<String> {
+fn resolve_token_secret(name: &str) -> Result<String> {
     let secret_name = token_secret_name(name)?;
     match plugin_toolkit::secrets::get(&secret_name)? {
         Some(s) => Ok(s.expose_secret().clone()),
-        None if !row.token_secret.is_empty() => Ok(row.token_secret.clone()),
-        None => Err(anyhow::anyhow!("no secret named '{secret_name}'")),
+        None => Err(anyhow::anyhow!(
+            "proxmox endpoint '{name}' has no token secret '{secret_name}'; set it with \
+             `proxmox.update --name {name} --token-secret <secret>`"
+        )),
     }
 }
-
-// ═══════════════════════════════════════════════════════════════════════════
-// proxmox.nodes — list cluster nodes for an endpoint
-// ═══════════════════════════════════════════════════════════════════════════
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
 pub struct ProxmoxNodesArgs {
@@ -247,10 +183,6 @@ async fn proxmox_nodes(args: ProxmoxNodesArgs, _ctx: &ToolCtx) -> Result<Vec<Pro
             .map_err(|e| anyhow::anyhow!("proxmox.nodes: {e}"))?;
     Ok(items)
 }
-
-// ═══════════════════════════════════════════════════════════════════════════
-// proxmox.node_detail — VMs + containers on one node
-// ═══════════════════════════════════════════════════════════════════════════
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
 pub struct ProxmoxNodeDetailArgs {
@@ -306,10 +238,6 @@ async fn proxmox_node_detail(
         containers,
     })
 }
-
-// ═══════════════════════════════════════════════════════════════════════════
-// proxmox.action — VM/container lifecycle action
-// ═══════════════════════════════════════════════════════════════════════════
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
 pub struct ProxmoxActionArgs {
@@ -371,10 +299,6 @@ async fn proxmox_action(args: ProxmoxActionArgs, ctx: &ToolCtx) -> Result<Proxmo
     })
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// proxmox.host_logs — view systemd journal lines for one Proxmox node
-// ═══════════════════════════════════════════════════════════════════════════
-
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
 pub struct ProxmoxHostLogsArgs {
     #[arg(long)]
@@ -405,7 +329,7 @@ pub struct ProxmoxHostLogsArgs {
     domain = "proxmox",
     verb = "host_logs",
     execute_gated = false,
-    role = "read"
+    role = "admin"
 )]
 async fn proxmox_host_logs(
     args: ProxmoxHostLogsArgs,
@@ -628,6 +552,38 @@ mod api_root_tests {
         assert_eq!(
             api_root("https://host:8006/api2/json"),
             "https://host:8006/api2/json"
+        );
+    }
+}
+
+#[cfg(test)]
+mod token_secret_tests {
+    use super::resolve_token_secret;
+
+    fn with_secret(value: Option<&'static str>) -> anyhow::Result<String> {
+        plugin_toolkit::capsink::with_cap_sink(
+            Box::new(move |cap: &str, raw: &str| {
+                assert_eq!(cap, "secret.op");
+                let op: serde_json::Value = serde_json::from_str(raw).unwrap();
+                assert_eq!(op["op"], "get");
+                assert_eq!(op["name"], "proxmox.pve.token_secret");
+                Ok(serde_json::json!({ "value": value }).to_string())
+            }),
+            || resolve_token_secret("pve"),
+        )
+    }
+
+    #[test]
+    fn resolves_from_the_name_core_auth_reads() {
+        assert_eq!(with_secret(Some("s3cret")).unwrap(), "s3cret");
+    }
+
+    #[test]
+    fn missing_secret_names_the_update_command() {
+        let err = with_secret(None).unwrap_err().to_string();
+        assert!(
+            err.contains("proxmox.update --name pve --token-secret"),
+            "{err}"
         );
     }
 }

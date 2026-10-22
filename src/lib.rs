@@ -1,21 +1,9 @@
-//! Proxmox VE API client. API-token auth only for the MVP — ticket/cookie
-//! flow can be added later when a password-based caller appears.
-//!
-//! Token format follows Proxmox's documented header:
-//!   Authorization: PVEAPIToken=USER@REALM!TOKENID=UUID
-//!
-//! Typed API ops route through orca core's executor via
-//! `plugin_toolkit::api::call`, keyed by the `proxmox.*` ops in the
-//! api-surface table. `fetch_guest_config` stays a raw-URL helper because the
-//! upstream schema models indexed keys (`netN`, `mpN`) as a single `[n]` field.
-
 pub mod access;
 pub mod backup;
 pub mod backup_jobs;
 pub mod bind_mounts;
 pub mod cluster;
 pub mod cluster_roster_impl;
-pub mod containers_adapter;
 pub mod deploy;
 pub mod diagnostics;
 pub mod disk_grow;
@@ -48,7 +36,6 @@ use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Registered endpoint name; the key `api::call` resolves routes and auth by.
     pub endpoint: String,
     pub base_url: String,
     /// `user@realm!tokenid` — the part before the `=` in the auth header.
@@ -183,15 +170,6 @@ pub struct ProxmoxActionResult {
     pub status: u16,
 }
 
-/// Pull a guest config (qemu or lxc) and parse it into the typed
-/// `responses::GuestConfigResponse` shape so callers can walk
-/// `netN` + `mpN` keys via the BTreeMap.
-///
-/// Why this exists outside `api::call`: the upstream OpenAPI schema models
-/// indexed config keys as `net[n]` / `mp[n]` placeholders, which don't
-/// describe `net0` / `net1` / ... etc. Hitting the raw endpoint
-/// preserves the indexed-key shape. The `reqwest::Client` carries the
-/// PVE auth header from `Config::build_reqwest_client`.
 pub async fn fetch_guest_config(
     http: &reqwest::Client,
     base_url: &str,
@@ -222,7 +200,6 @@ pub async fn fetch_guest_config(
         .map_err(|e| ProxmoxError::Malformed(format!("guest_config: typed parse: {e}")))
 }
 
-/// Run a lifecycle action against one guest; returns the task UPID.
 pub fn run_lifecycle(
     endpoint: &str,
     node: &str,
@@ -230,17 +207,26 @@ pub fn run_lifecycle(
     vmid: u64,
     action: ProxmoxAction,
 ) -> anyhow::Result<String> {
-    let (k, a) = (kind.as_str(), action.as_str());
     plugin_toolkit::api::call(
-        &format!("proxmox.post_vm_{a}_nodes_node_{k}_vmid_status_{a}"),
+        &lifecycle_op(kind, action),
         endpoint,
         serde_json::json!({ "node": node, "vmid": vmid }),
     )
-    .map_err(|e| e.context(format!("{k} {a} {vmid}")))
+    .map_err(|e| e.context(format!("{} {} {vmid}", kind.as_str(), action.as_str())))
 }
 
-/// Drop null object members, recursively: an absent optional is omitted on
-/// the wire, and the core executor's schema check rejects explicit nulls.
+pub fn lifecycle_op(kind: GuestKind, action: ProxmoxAction) -> String {
+    let (k, a) = (kind.as_str(), action.as_str());
+    format!("proxmox.post_vm_{a}_nodes_node_{k}_vmid_status_{a}")
+}
+
+pub fn destroy_op(kind: GuestKind) -> String {
+    format!(
+        "proxmox.delete_destroy_vm_nodes_node_{}_vmid",
+        kind.as_str()
+    )
+}
+
 pub fn args(value: serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
     match value {
@@ -254,8 +240,6 @@ pub fn args(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Pull the systemd journal for one node and wrap the `Vec<String>` payload
-/// into the `responses::JournalResponse` envelope the tool surface returns.
 pub fn fetch_journal(
     endpoint: &str,
     node: &str,
@@ -282,9 +266,7 @@ pub fn fetch_journal(
 pub(crate) mod test_support {
     use serde_json::Value;
 
-    /// The `(method, url-path)` an `api.call` payload resolves to under the
-    /// api-surface table, so HTTP-recorded fixtures can answer it.
-    pub fn api_call_route(raw: &str) -> (String, String) {
+    pub fn api_call_route(raw: &str) -> (String, String, Value) {
         let call: Value = serde_json::from_str(raw).unwrap();
         let surface: Value = serde_json::from_slice(crate::API_SURFACE).unwrap();
         let op = surface["ops"]
@@ -294,17 +276,45 @@ pub(crate) mod test_support {
             .find(|o| o["tool"] == call["op"])
             .unwrap_or_else(|| panic!("unknown api op {}", call["op"]));
         let mut path = op["path"].as_str().unwrap().to_string();
+        let mut rest = serde_json::Map::new();
         if let Some(args) = call["args"].as_object() {
             for (k, v) in args {
-                let v = v.as_str().map_or_else(|| v.to_string(), str::to_string);
-                path = path.replace(&format!("{{{k}}}"), &v);
+                let placeholder = format!("{{{k}}}");
+                if path.contains(&placeholder) {
+                    let v = v.as_str().map_or_else(|| v.to_string(), str::to_string);
+                    path = path.replace(&placeholder, &v);
+                } else {
+                    rest.insert(k.clone(), v.clone());
+                }
             }
         }
-        (op["method"].as_str().unwrap().to_ascii_uppercase(), path)
+        (
+            op["method"].as_str().unwrap().to_ascii_uppercase(),
+            path,
+            Value::Object(rest),
+        )
     }
 
-    /// Turn a recorded `http.request` reply into what core's executor hands
-    /// back over `api.call`: the peeled `data` on 2xx, an error otherwise.
+    pub fn record_api_calls<T>(
+        reply: impl Fn(&str, &str) -> String + 'static,
+        f: impl FnOnce() -> T,
+    ) -> (T, Vec<(String, String, Value)>) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let out = plugin_toolkit::capsink::with_cap_sink(
+            Box::new(move |cap: &str, raw: &str| {
+                assert_eq!(cap, "api.call");
+                let (method, path, rest) = api_call_route(raw);
+                let body = reply(&method, &path);
+                log.lock().unwrap().push((method, path, rest));
+                Ok(body)
+            }),
+            f,
+        );
+        let calls = seen.lock().unwrap().clone();
+        (out, calls)
+    }
+
     pub fn api_call_reply(http_reply: &str) -> Result<String, String> {
         let r: Value = serde_json::from_str(http_reply).unwrap();
         let status = r["status"].as_u64().unwrap();
@@ -333,10 +343,75 @@ mod tests {
         let declared = unit_provider::reaches()
             .into_iter()
             .chain(guest_exec::REACHES.map(String::from))
-            .chain([diagnostics::ENABLE_AGENT_OP.to_string()]);
+            .chain(diagnostics::REACHES.map(String::from))
+            .chain(deploy::reaches(GuestKind::Qemu))
+            .chain(deploy::reaches(GuestKind::Lxc))
+            .chain(tool_reaches(include_str!("tools.rs")))
+            .chain(tool_reaches(include_str!("access.rs")))
+            .chain(lifecycle_permutations())
+            .chain(KINDS.map(destroy_op));
         for op in declared {
             assert!(ops.contains(&op.as_str()), "{op} is not an api-surface op");
         }
+    }
+
+    const KINDS: [GuestKind; 2] = [GuestKind::Qemu, GuestKind::Lxc];
+
+    fn lifecycle_permutations() -> Vec<String> {
+        use ProxmoxAction::*;
+        KINDS
+            .iter()
+            .flat_map(|&k| [Start, Stop, Shutdown, Reboot].map(|a| lifecycle_op(k, a)))
+            .collect()
+    }
+
+    fn tool_reaches(src: &str) -> Vec<String> {
+        src.split("reaches = [")
+            .skip(1)
+            .flat_map(|rest| {
+                rest[..rest.find(']').unwrap()]
+                    .split(',')
+                    .map(|s| s.trim().trim_matches('"').to_string())
+                    .filter(|s| s.starts_with("proxmox."))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn declared_lifecycle_and_destroy_lists_cover_every_permutation() {
+        let mut lifecycle = lifecycle_permutations();
+        lifecycle.sort();
+        let mut declared: Vec<String> = unit_provider::LIFECYCLE_OPS.map(String::from).to_vec();
+        declared.sort();
+        assert_eq!(declared, lifecycle);
+        let mut action = tool_reaches(include_str!("tools.rs"));
+        action.retain(|op| op.contains("_status_"));
+        action.sort();
+        assert_eq!(action, lifecycle);
+        let mut destroy = KINDS.map(destroy_op).to_vec();
+        destroy.sort();
+        let mut declared = unit_provider::DESTROY_OPS.map(String::from).to_vec();
+        declared.sort();
+        assert_eq!(declared, destroy);
+        assert!(!tool_reaches(include_str!("access.rs")).is_empty());
+    }
+
+    #[test]
+    fn lifecycle_posts_to_the_guest_status_path_without_a_body() {
+        let (upid, calls) = test_support::record_api_calls(
+            |_, _| "\"UPID:n1:1\"".to_string(),
+            || run_lifecycle("pve", "n1", GuestKind::Lxc, 116, ProxmoxAction::Stop),
+        );
+        assert_eq!(upid.unwrap(), "UPID:n1:1");
+        assert_eq!(
+            calls,
+            vec![(
+                "POST".to_string(),
+                "/nodes/n1/lxc/116/status/stop".to_string(),
+                serde_json::json!({})
+            )]
+        );
     }
 
     #[test]

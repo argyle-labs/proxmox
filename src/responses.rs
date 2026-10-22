@@ -1,7 +1,7 @@
 //! Typed responses for every `proxmox::Client` method.
 //!
 //! Single source of truth for the upstream Proxmox API envelope shape.
-//! `topology.rs`, `containers_adapter.rs`, and `tools.rs` reach into this
+//! `topology.rs` and `tools.rs` reach into this
 //! module instead of redefining envelopes locally or doing the
 //! round-trip-through-a-JSON-string hack.
 //!
@@ -140,7 +140,6 @@ impl ClusterResourcesResponse {
     }
 }
 
-/// One `/cluster/resources` row, as read through `api::call`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ClusterResource {
     #[serde(default)]
@@ -179,8 +178,6 @@ pub enum ResourceType {
     Other,
 }
 
-/// `GET /cluster/resources`, optionally filtered by PVE's `type` (`vm`,
-/// `storage`, `node`, `sdn`).
 pub fn cluster_resources(
     endpoint: &str,
     type_filter: Option<&str>,
