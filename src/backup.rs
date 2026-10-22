@@ -1,40 +1,3 @@
-//! Backup KINDs contributed by the proxmox plugin (the WHAT axis that
-//! `orca backup --kind <kind>` fans out over).
-//!
-//! proxmox is an **API-remote** plugin — there is no local `/etc/pve` to read.
-//! Every KIND here captures *configuration* (not disk images) by pulling it from
-//! the PVE REST API and writing plain files into the host-local `payload_dir`
-//! that the generic backup engine hands us (a shared filesystem — the plugin
-//! runs on the same host as the engine, so we write bytes directly rather than
-//! streaming them over the socket).
-//!
-//! Five KINDs are registered, each with a distinct bridge invoke-prefix:
-//!
-//! - `pve-config` (`proxmox.__backup_pveconfig`) — one logical instance
-//!   (`default`). Captures cluster/host config the API exposes: storage config
-//!   (`/storage`), access users + ACL (`/access/users`, `/access/acl`), and
-//!   datacenter options (`/cluster/options`), each written as a JSON file.
-//!   Restore best-effort re-applies datacenter options (safe + idempotent) and
-//!   is **capture-only** for users/ACL/storage (re-applying those blind is
-//!   destructive), which the restore path documents inline.
-//! - `vm` (`proxmox.__backup_vm`) — every cluster VM as `"<node>/<vmid>"`.
-//!   Captures the guest's raw config object (preserving indexed keys like
-//!   `net0`/`mp0`); restore PUTs it back to
-//!   `/nodes/{node}/qemu/{vmid}/config`.
-//! - `lxc` (`proxmox.__backup_lxc`) — every cluster container as
-//!   `"<node>/<vmid>"`; same as `vm` against `/nodes/{node}/lxc/{vmid}/config`.
-//! - `lxc-bind` (`proxmox.__backup_lxcbind`) — containers on THIS node whose
-//!   app state lives in a bind mount, which vzdump never includes. Copies the
-//!   host side of those paths; see [`crate::bind_mounts`].
-//! - `pve-node-state` (`proxmox.__backup_pvenodestate`) — THIS node's pmxcfs
-//!   `config.db` and host config files; see [`crate::node_state`].
-//!
-//! The host calls, per kind, `{prefix}.{op}` for op in
-//! instances|layout|backup|restore over the subprocess socket with BARE JSON
-//! requests/responses (no envelope). [`dispatch`] matches every prefix and
-//! their four ops, decodes the arg shapes, and drives the async work to
-//! completion on the subprocess reactor.
-
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
@@ -43,7 +6,7 @@ use plugin_toolkit::backend_def::backup_kind_backend_def;
 use plugin_toolkit::reqwest;
 use plugin_toolkit::serde_json::{self, Value, json};
 
-use crate::{Config, GuestKind};
+use crate::GuestKind;
 
 pub const PVECONFIG_PREFIX: &str = "proxmox.__backup_pveconfig";
 pub const VM_PREFIX: &str = "proxmox.__backup_vm";
@@ -51,30 +14,42 @@ pub const LXC_PREFIX: &str = "proxmox.__backup_lxc";
 pub const LXC_BIND_PREFIX: &str = "proxmox.__backup_lxcbind";
 pub const NODE_STATE_PREFIX: &str = "proxmox.__backup_pvenodestate";
 
-/// The `backup_kind` backend descriptors this plugin advertises, one per
-/// KIND with its own invoke-prefix. `backup_kind_backend_def` enforces
-/// `name == kind`, so the host records and (on unload) deregisters each by the
-/// KIND name that the provider registry keys on.
+pub const PUT_CLUSTER_OPTIONS_OP: &str = "proxmox.put_set_options_cluster_options";
+
+fn reaching(def: BackendDef, ops: &[&str]) -> BackendDef {
+    BackendDef {
+        reaches: ops.iter().map(|o| o.to_string()).collect(),
+        ..def
+    }
+}
+
 pub fn backend_defs() -> Vec<BackendDef> {
     vec![
-        backup_kind_backend_def("pve-config", PVECONFIG_PREFIX),
-        backup_kind_backend_def("vm", VM_PREFIX),
-        backup_kind_backend_def("lxc", LXC_PREFIX),
+        reaching(
+            backup_kind_backend_def("pve-config", PVECONFIG_PREFIX),
+            &[PUT_CLUSTER_OPTIONS_OP],
+        ),
+        reaching(
+            backup_kind_backend_def("vm", VM_PREFIX),
+            &[config_op(GuestKind::Qemu, "put")],
+        ),
+        reaching(
+            backup_kind_backend_def("lxc", LXC_PREFIX),
+            &[config_op(GuestKind::Lxc, "put")],
+        ),
         backup_kind_backend_def("lxc-bind", LXC_BIND_PREFIX),
-        backup_kind_backend_def("pve-node-state", NODE_STATE_PREFIX),
+        reaching(
+            backup_kind_backend_def("pve-node-state", NODE_STATE_PREFIX),
+            &crate::node_state::REACHES,
+        ),
     ]
 }
 
-/// Handle a `proxmox.__backup_*` bridge call. Returns `None` for anything that
-/// isn't one of the backup prefixes so the composed `Plugin` dispatch
-/// falls through to the next handler (and ultimately the `#[orca_tool]` surface).
 pub fn dispatch(
     name: &str,
     args: plugin_toolkit::serde_json::Value,
 ) -> Option<Result<plugin_toolkit::serde_json::Value, plugin_toolkit::serde_json::Value>> {
     let (kind, op) = match_prefix(name)?;
-    // `run` still speaks JSON strings internally; the backend ABI now hands us a
-    // parsed `Value` and expects a `Value` back, so convert at this boundary.
     let args_json = args.to_string();
     Some(plugin_toolkit::reactor::block_on(async move {
         run(kind, op, &args_json)
@@ -87,7 +62,6 @@ pub fn dispatch(
     }))
 }
 
-/// Which KIND a `vm`/`lxc` prefix maps onto for the API path.
 #[derive(Clone, Copy)]
 enum Kind {
     PveConfig,
@@ -97,8 +71,6 @@ enum Kind {
     NodeState,
 }
 
-/// Split a bridge tool name into `(kind, op)` if it targets one of our backup
-/// prefixes; `None` otherwise.
 fn match_prefix(name: &str) -> Option<(Kind, &str)> {
     for (prefix, kind) in [
         (PVECONFIG_PREFIX, Kind::PveConfig),
@@ -116,7 +88,6 @@ fn match_prefix(name: &str) -> Option<(Kind, &str)> {
 
 async fn run(kind: Kind, op: &str, args_json: &str) -> Result<String> {
     match (kind, op) {
-        // ── pve-config ──────────────────────────────────────────────────────
         (Kind::PveConfig, "instances") => Ok(json!(["default"]).to_string()),
         (Kind::PveConfig, "layout") => Ok(json!(["cluster", "proxmox", "pve-config"]).to_string()),
         (Kind::PveConfig, "backup") => {
@@ -128,7 +99,6 @@ async fn run(kind: Kind, op: &str, args_json: &str) -> Result<String> {
             pveconfig_restore(&dir).await
         }
 
-        // ── vm / lxc ────────────────────────────────────────────────────────
         (Kind::Vm | Kind::Lxc, "instances") => guest_instances(guest_kind(kind)).await,
         (Kind::Vm | Kind::Lxc, "layout") => {
             let instance = decode_instance(args_json)?;
@@ -147,7 +117,6 @@ async fn run(kind: Kind, op: &str, args_json: &str) -> Result<String> {
             guest_restore(guest_kind(kind), &instance, &dir).await
         }
 
-        // ── lxc-bind ────────────────────────────────────────────────────────
         (Kind::LxcBind, "instances") => Ok(serde_json::to_string(
             &crate::bind_mounts::kind_instances(&crate::bind_mounts::local_plans()),
         )?),
@@ -180,7 +149,6 @@ async fn run(kind: Kind, op: &str, args_json: &str) -> Result<String> {
             Ok(Value::Null.to_string())
         }
 
-        // ── pve-node-state ──────────────────────────────────────────────────
         (Kind::NodeState, "instances") => Ok(serde_json::to_string(
             &crate::node_state::instances().await,
         )?),
@@ -210,9 +178,6 @@ fn guest_kind(kind: Kind) -> GuestKind {
     }
 }
 
-// ── request decoders ────────────────────────────────────────────────────────
-
-/// `{"instance":"<id>"}` → `<id>`.
 fn decode_instance(args_json: &str) -> Result<String> {
     let v: Value = serde_json::from_str(args_json).context("backup: parse instance args")?;
     Ok(v.get("instance")
@@ -221,7 +186,6 @@ fn decode_instance(args_json: &str) -> Result<String> {
         .to_string())
 }
 
-/// `{"payload_dir":"<path>","instance":"<id>"}` → `(dir, instance)`.
 fn decode_backup(args_json: &str) -> Result<(String, String)> {
     let v: Value = serde_json::from_str(args_json).context("backup: parse backup args")?;
     let dir = v
@@ -237,11 +201,6 @@ fn decode_backup(args_json: &str) -> Result<(String, String)> {
     Ok((dir, instance))
 }
 
-// ── guest (vm / lxc) KIND ───────────────────────────────────────────────────
-
-/// Every cluster guest of `kind`, as `"<node>/<vmid>"`, across every enabled
-/// endpoint. One `/cluster/resources` call per endpoint keeps this cheap enough
-/// for the bridge's synchronous `instances` call.
 async fn guest_instances(kind: GuestKind) -> Result<String> {
     use crate::responses::ResourceType;
     let want = match kind {
@@ -277,12 +236,13 @@ async fn guest_instances(kind: GuestKind) -> Result<String> {
 
 async fn guest_backup(kind: GuestKind, instance: &str, dir: &str) -> Result<String> {
     let (node, vmid) = parse_instance(instance)?;
-    let (cfg, _) = resolve_endpoint_for_node(&node).await?;
-    let http = cfg.build_reqwest_client()?;
-    let path = format!("nodes/{}/{}/{}/config", enc(&node), kind.as_str(), vmid);
-    let data = raw_get_data(&http, &cfg.base_url, &path)
-        .await
-        .with_context(|| format!("backup: fetch config for {instance}"))?;
+    let endpoint = resolve_endpoint_for_node(&node).await?;
+    let data = plugin_toolkit::api::call::<Value>(
+        config_op(kind, "get"),
+        &endpoint,
+        json!({ "node": node, "vmid": vmid }),
+    )
+    .with_context(|| format!("backup: fetch config for {instance}"))?;
     let keys = data.as_object().map(|m| m.len()).unwrap_or(0);
     write_json(dir, "config.json", &data)?;
     Ok(json!({
@@ -292,9 +252,6 @@ async fn guest_backup(kind: GuestKind, instance: &str, dir: &str) -> Result<Stri
     .to_string())
 }
 
-/// Restore a guest config by PUTting the captured keys back to
-/// `/nodes/{node}/{kind}/{vmid}/config`. Server-managed / read-only keys are
-/// dropped (`digest`, `meta`, `lock`) so the PUT does not reject the batch.
 async fn guest_restore(kind: GuestKind, instance: &str, dir: &str) -> Result<String> {
     let (node, vmid) = parse_instance(instance)?;
     let data = read_json(dir, "config.json")?;
@@ -302,27 +259,15 @@ async fn guest_restore(kind: GuestKind, instance: &str, dir: &str) -> Result<Str
         .as_object()
         .ok_or_else(|| anyhow!("restore: config.json is not an object"))?;
 
-    // Read-only / server-managed keys the config PUT rejects or ignores.
     const SKIP: &[&str] = &["digest", "meta", "lock"];
-    let pairs = form_pairs(obj, SKIP);
+    let args = json!({ "node": node, "vmid": vmid, "body": body_args(obj, SKIP) });
 
-    let (cfg, _) = resolve_endpoint_for_node(&node).await?;
-    let http = cfg.build_reqwest_client()?;
-    let url = format!(
-        "{}/nodes/{}/{}/{}/config",
-        cfg.base_url.trim_end_matches('/'),
-        enc(&node),
-        kind.as_str(),
-        vmid
-    );
-    put_form(&http, &url, &pairs).await?;
+    let endpoint = resolve_endpoint_for_node(&node).await?;
+    plugin_toolkit::api::call::<Value>(config_op(kind, "put"), &endpoint, args)
+        .with_context(|| format!("restore: put config for {instance}"))?;
     Ok(Value::Null.to_string())
 }
 
-// ── pve-config KIND ─────────────────────────────────────────────────────────
-
-/// One (path, filename) capture spec for the cluster/host config pull. Each is a
-/// GET whose `data` payload is written verbatim as a JSON file.
 const PVECONFIG_CAPTURES: &[(&str, &str)] = &[
     ("storage", "storage.json"),
     ("access/users", "users.json"),
@@ -330,18 +275,13 @@ const PVECONFIG_CAPTURES: &[(&str, &str)] = &[
     ("cluster/options", "datacenter.json"),
 ];
 
-/// Capture cluster/host config from the first reachable enabled endpoint —
-/// cluster-scoped config is identical across member nodes, so one endpoint
-/// suffices. A capture that the API refuses (e.g. token lacks the privilege) is
-/// logged and skipped rather than failing the whole run.
 async fn pveconfig_backup(dir: &str) -> Result<String> {
-    let cfg = first_enabled_config()
+    let endpoint = first_enabled_endpoint()
         .await
         .context("pve-config backup: no reachable endpoint")?;
-    let http = cfg.build_reqwest_client()?;
     let mut captured = Vec::new();
     for (path, file) in PVECONFIG_CAPTURES {
-        match raw_get_data(&http, &cfg.base_url, path).await {
+        match crate::api_path::get(&endpoint, path) {
             Ok(data) => {
                 write_json(dir, file, &data)?;
                 captured.push(*file);
@@ -358,44 +298,31 @@ async fn pveconfig_backup(dir: &str) -> Result<String> {
     .to_string())
 }
 
-/// Best-effort re-apply of captured cluster config.
-///
-/// Only datacenter options (`PUT /cluster/options`) are re-applied — that write
-/// is safe and idempotent. Users, ACL and storage are **capture-only**: blindly
-/// PUT/POSTing them back could delete live grants or clobber storage definitions
-/// other nodes depend on, so this path intentionally does not re-apply them. The
-/// captured JSON files remain in `payload_dir` for an operator to reconcile by
-/// hand.
 async fn pveconfig_restore(dir: &str) -> Result<String> {
-    // datacenter options: the one safe, idempotent re-apply. `digest` guards
-    // against concurrent edits — omit it so a stale digest can't reject the PUT.
     let datacenter = read_json(dir, "datacenter.json").ok();
-    let pairs = datacenter
+    let args = datacenter
         .as_ref()
         .and_then(Value::as_object)
-        .map(|obj| form_pairs(obj, &["digest"]))
+        .map(|obj| body_args(obj, &["digest"]))
         .unwrap_or_default();
-    if !pairs.is_empty() {
-        let cfg = first_enabled_config()
+    if !args.is_empty() {
+        let endpoint = first_enabled_endpoint()
             .await
             .context("pve-config restore: no reachable endpoint")?;
-        let http = cfg.build_reqwest_client()?;
-        let url = format!("{}/cluster/options", cfg.base_url.trim_end_matches('/'));
-        put_form(&http, &url, &pairs).await?;
+        plugin_toolkit::api::call::<Value>(
+            PUT_CLUSTER_OPTIONS_OP,
+            &endpoint,
+            json!({ "body": args }),
+        )
+        .context("pve-config restore: put cluster options")?;
     }
-    // users / acl / storage are capture-only by design (see fn doc).
     Ok(Value::Null.to_string())
 }
-
-// ── shared helpers ──────────────────────────────────────────────────────────
 
 pub(crate) fn enc(s: &str) -> String {
     plugin_toolkit::progenitor_client::encode_path(s)
 }
 
-/// Flatten a JSON object into `(key, value)` form pairs for a PVE config PUT,
-/// dropping `skip` keys and JSON nulls. Strings pass through verbatim; other
-/// scalars render via their JSON text.
 pub(crate) fn form_pairs(
     obj: &serde_json::Map<String, Value>,
     skip: &[&str],
@@ -415,24 +342,12 @@ pub(crate) fn form_pairs(
     pairs
 }
 
-/// PUT a form-urlencoded body of `pairs` and fail on a non-2xx status.
 pub(crate) async fn put_form(
     http: &reqwest::Client,
     url: &str,
     pairs: &[(String, String)],
 ) -> Result<()> {
     send_form(http.put(url), "PUT", url, pairs)
-        .await
-        .map(|_| ())
-}
-
-/// POST a form-urlencoded body of `pairs` and fail on a non-2xx status.
-pub(crate) async fn post_form(
-    http: &reqwest::Client,
-    url: &str,
-    pairs: &[(String, String)],
-) -> Result<()> {
-    send_form(http.post(url), "POST", url, pairs)
         .await
         .map(|_| ())
 }
@@ -451,8 +366,6 @@ pub(crate) async fn post_form_data(
     }
 }
 
-/// Uses the delegated-http shim's `form_urlencoded` (over `QueryParam`), which
-/// sets the `application/x-www-form-urlencoded` content-type.
 async fn send_form(
     req: reqwest::RequestBuilder,
     method: &str,
@@ -487,7 +400,6 @@ async fn send_form(
     Ok(body)
 }
 
-/// Parse a `"<node>/<vmid>"` instance id.
 fn parse_instance(instance: &str) -> Result<(String, u64)> {
     let (node, vmid) = instance
         .split_once('/')
@@ -498,52 +410,57 @@ fn parse_instance(instance: &str) -> Result<(String, u64)> {
     Ok((node.to_string(), vmid))
 }
 
-/// Resolve the enabled endpoint whose cluster hosts `node`, returning its ready
-/// [`Config`] and name. Probes each endpoint's `/nodes` listing and matches by
-/// node name (unique within a cluster/fleet).
-pub(crate) async fn resolve_endpoint_for_node(node: &str) -> Result<(Config, String)> {
+pub(crate) async fn resolve_endpoint_for_node(node: &str) -> Result<String> {
     for name in crate::tools::enabled_endpoint_names() {
-        let cfg = match crate::tools::resolve_config(&name).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(endpoint = %name, error = %e, "backup: resolve endpoint failed");
-                continue;
-            }
-        };
-        let http = cfg.build_reqwest_client()?;
-        if let Ok(nodes) = raw_get_data(&http, &cfg.base_url, "nodes").await {
-            let hit = nodes
-                .as_array()
-                .map(|arr| {
+        match crate::api_path::get(&name, "nodes") {
+            Ok(nodes) => {
+                let hit = nodes.as_array().is_some_and(|arr| {
                     arr.iter()
                         .any(|n| n.get("node").and_then(Value::as_str) == Some(node))
-                })
-                .unwrap_or(false);
-            if hit {
-                return Ok((cfg, name));
+                });
+                if hit {
+                    return Ok(name);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(endpoint = %name, error = %e, "backup: list nodes failed");
             }
         }
     }
     Err(anyhow!("backup: no enabled endpoint hosts node '{node}'"))
 }
 
-/// The first enabled endpoint that resolves — used for cluster-scoped config
-/// that is identical on every member.
-async fn first_enabled_config() -> Result<Config> {
+async fn first_enabled_endpoint() -> Result<String> {
     for name in crate::tools::enabled_endpoint_names() {
-        match crate::tools::resolve_config(&name).await {
-            Ok(c) => return Ok(c),
+        match crate::api_path::get(&name, "nodes") {
+            Ok(_) => return Ok(name),
             Err(e) => {
-                tracing::warn!(endpoint = %name, error = %e, "backup: resolve endpoint failed");
+                tracing::warn!(endpoint = %name, error = %e, "backup: endpoint unreachable");
             }
         }
     }
     Err(anyhow!("backup: no enabled endpoint resolved"))
 }
 
-/// Raw GET against the PVE REST API, peeling the `{"data": …}` envelope every
-/// endpoint wraps its payload in. `path` is joined onto the API root
-/// (`Config::base_url`, e.g. `https://host:8006/api2/json`).
+pub(crate) fn config_op(kind: GuestKind, method: &str) -> &'static str {
+    match (kind, method) {
+        (GuestKind::Qemu, "get") => "proxmox.get_vm_config_nodes_node_qemu_vmid_config",
+        (GuestKind::Lxc, "get") => "proxmox.get_vm_config_nodes_node_lxc_vmid_config",
+        (GuestKind::Qemu, _) => "proxmox.put_update_vm_nodes_node_qemu_vmid_config",
+        (GuestKind::Lxc, _) => "proxmox.put_update_vm_nodes_node_lxc_vmid_config",
+    }
+}
+
+pub(crate) fn body_args(
+    obj: &serde_json::Map<String, Value>,
+    skip: &[&str],
+) -> serde_json::Map<String, Value> {
+    obj.iter()
+        .filter(|(k, v)| !skip.contains(&k.as_str()) && !v.is_null())
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 pub(crate) async fn raw_get_data(
     http: &reqwest::Client,
     base_url: &str,

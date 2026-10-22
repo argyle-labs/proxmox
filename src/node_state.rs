@@ -1,21 +1,3 @@
-//! `pve-node-state` backup kind: one PVE node's own state, which neither
-//! vzdump nor the API-only `pve-config` kind covers.
-//!
-//! Instances are each PVE node plus one `cluster:<endpoint>` slot, so
-//! cluster-scoped reads are captured once. The payload is:
-//!
-//! * `api/*.json` — the [`NODE_READS`] or [`CLUSTER_READS`] for the slot,
-//!   fetched with the endpoint's API token; notification and metrics reads are
-//!   scrubbed of secrets, URL userinfo, query strings and header values;
-//! * `api/SKIPPED` — each read refused (scrubbed), each filtered list that came
-//!   back empty, and each read the token cannot make ([`NOT_CAPTURABLE`]);
-//! * `SHA256SUMS` — `sha256sum -c` format over every other file.
-//!
-//! A failed core read fails the slot. A failed other read makes the result
-//! `partial` with a `warnings` entry.
-//!
-//! Restore is capture-only: it verifies `SHA256SUMS` and refuses.
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -52,6 +34,8 @@ const fn read(path: &'static str, file: &'static str, rule: Rule, scrub: bool) -
         scrub,
     }
 }
+
+pub const REACHES: [&str; 1] = ["proxmox.get_server_index_cluster_metrics_server"];
 
 pub(crate) const NODE_READS: &[Read] = &[
     read("nodes/{node}/config", "node-config.json", Rule::Core, false),
@@ -208,28 +192,23 @@ pub(crate) trait ApiRead {
     async fn get(&self, path: &str) -> Result<Value>;
 }
 
-struct Endpoint {
-    http: plugin_toolkit::reqwest::Client,
-    base_url: String,
-}
+struct Endpoint(String);
 
 impl ApiRead for Endpoint {
     async fn get(&self, path: &str) -> Result<Value> {
-        crate::backup::raw_get_data(&self.http, &self.base_url, path).await
+        crate::api_path::get(&self.0, path)
     }
 }
 
 pub async fn instances() -> Vec<String> {
     let found =
-        crate::tools::for_each_enabled_endpoint("node_state.instances", |cfg, ep| async move {
-            let http = cfg.build_reqwest_client()?;
-            let status = crate::backup::raw_get_data(&http, &cfg.base_url, "cluster/status")
-                .await
+        crate::tools::for_each_enabled_endpoint("node_state.instances", |_, ep| async move {
+            let status = crate::api_path::get(&ep.name, "cluster/status")
                 .inspect_err(|e| {
                     tracing::warn!(endpoint = %ep.name, error = %e, "pve-node-state: cluster/status failed; skipping its cluster slot")
                 })
                 .ok();
-            let nodes = crate::backup::raw_get_data(&http, &cfg.base_url, "nodes").await?;
+            let nodes = crate::api_path::get(&ep.name, "nodes")?;
             Ok(slots(&ep.name, status.as_ref(), &nodes))
         })
         .await;
@@ -306,25 +285,16 @@ pub(crate) fn pick_cluster_slot(
     )
 }
 
-async fn resolve_cluster_slot(key: &str) -> Result<crate::Config> {
-    let mut candidates = Vec::new();
-    for name in crate::tools::enabled_endpoint_names() {
-        let status = async {
-            let cfg = crate::tools::resolve_config(&name)
-                .await
-                .map_err(|e| format!("resolve: {e:#}"))?;
-            let http = cfg
-                .build_reqwest_client()
-                .map_err(|e| format!("client: {e:#}"))?;
-            crate::backup::raw_get_data(&http, &cfg.base_url, "cluster/status")
-                .await
-                .map_err(|e| scrub_text(&format!("cluster/status: {e:#}")))
-        }
-        .await;
-        candidates.push((name, status));
-    }
-    let name = pick_cluster_slot(key, candidates)?;
-    crate::tools::resolve_config(&name).await
+fn resolve_cluster_slot(key: &str) -> Result<String> {
+    let candidates = crate::tools::enabled_endpoint_names()
+        .into_iter()
+        .map(|name| {
+            let status = crate::api_path::get(&name, "cluster/status")
+                .map_err(|e| scrub_text(&format!("cluster/status: {e:#}")));
+            (name, status)
+        })
+        .collect();
+    pick_cluster_slot(key, candidates)
 }
 
 fn node_names(nodes: &Value) -> Vec<String> {
@@ -338,18 +308,10 @@ fn node_names(nodes: &Value) -> Vec<String> {
 
 pub async fn backup(dir: &str, instance: &str) -> Result<Value> {
     if let Some(key) = instance.strip_prefix(CLUSTER_PREFIX) {
-        let cfg = resolve_cluster_slot(key).await?;
-        let api = Endpoint {
-            http: cfg.build_reqwest_client()?,
-            base_url: cfg.base_url.clone(),
-        };
+        let api = Endpoint(resolve_cluster_slot(key)?);
         return capture(&api, &Scope::Cluster, Path::new(dir)).await;
     }
-    let (cfg, _) = crate::backup::resolve_endpoint_for_node(instance).await?;
-    let api = Endpoint {
-        http: cfg.build_reqwest_client()?,
-        base_url: cfg.base_url.clone(),
-    };
+    let api = Endpoint(crate::backup::resolve_endpoint_for_node(instance).await?);
     capture(&api, &Scope::Node(instance.to_string()), Path::new(dir)).await
 }
 
@@ -366,7 +328,7 @@ pub(crate) async fn capture<A: ApiRead>(api: &A, scope: &Scope, dest: &Path) -> 
     let mut standalone = false;
     for r in reads {
         let path = match scope {
-            Scope::Node(n) => r.path.replace("{node}", &crate::backup::enc(n)),
+            Scope::Node(n) => r.path.replace("{node}", n),
             Scope::Cluster => r.path.to_string(),
         };
         let mut file = r.file;
@@ -537,9 +499,6 @@ fn scrub_strings(v: &mut Value, in_header: bool) {
     }
 }
 
-// ── SHA256SUMS ──────────────────────────────────────────────────────────────
-
-/// Every regular file under `dir` except `SHA256SUMS`, keyed by relative path.
 fn payload_files(dir: &Path) -> Result<BTreeMap<String, PathBuf>> {
     fn walk(dir: &Path, at: &Path, out: &mut BTreeMap<String, PathBuf>) -> Result<()> {
         for e in std::fs::read_dir(at).with_context(|| format!("list {}", at.display()))? {
@@ -569,8 +528,6 @@ fn write_sums(dir: &Path) -> Result<()> {
     std::fs::write(dir.join(SUMS), sums).context("write SHA256SUMS")
 }
 
-/// Check every file against `SHA256SUMS` and that no file is unlisted.
-/// Returns the file count and the SHA-256 of `SHA256SUMS` itself.
 pub fn verify_sums(dir: &Path) -> Result<(usize, String)> {
     let raw = std::fs::read(dir.join(SUMS))
         .with_context(|| format!("read {}", dir.join(SUMS).display()))?;
@@ -599,6 +556,16 @@ pub fn verify_sums(dir: &Path) -> Result<(usize, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_read_resolves_to_a_surface_op() {
+        for r in NODE_READS.iter().chain(CLUSTER_READS) {
+            let path = r.path.replace("{node}", "thor");
+            crate::api_path::resolve("GET", &path).unwrap_or_else(|e| panic!("{e:#}"));
+        }
+        let (op, _) = crate::api_path::resolve("GET", "cluster/metrics/server").unwrap();
+        assert_eq!(op, REACHES[0]);
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(

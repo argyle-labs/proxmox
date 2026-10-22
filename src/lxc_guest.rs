@@ -46,17 +46,12 @@ impl GuestIo for SeamIo {
     }
 }
 
-/// Largest file [`read_file`] returns. Paths are guest-controlled, so a read
-/// is bounded by the file's `stat` size before anything is read.
 pub const READ_CAP: usize = 64 * 1024;
 
 fn missing(r: &ExecResult) -> bool {
     !r.success && r.stderr.contains("No such file")
 }
 
-/// Contents (trimmed by the seam) and on-disk size of a regular file at most
-/// [`READ_CAP`] bytes, or `None` when it does not exist. Symlinks are followed:
-/// the read runs inside the container, as the container's root.
 async fn read_sized(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<Option<(String, usize)>> {
     let st = io
         .exec(vmid, &["stat", "-L", "-c", "%F|%s", "--", path])
@@ -99,24 +94,16 @@ async fn read_sized(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<Option<(S
             r.stderr
         );
     }
-    // The seam decodes lossily; a replacement character means the bytes were
-    // not UTF-8 and the text is not the file.
     if r.stdout.contains('\u{FFFD}') {
         bail!("read {path} in CT {vmid}: not valid UTF-8");
     }
     Ok(Some((r.stdout, size)))
 }
 
-/// A file's contents (trimmed, as the seam returns them), or `None` when it
-/// does not exist. Refused when larger than [`READ_CAP`], not a regular file,
-/// or not UTF-8.
 pub async fn read_file(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<Option<String>> {
     Ok(read_sized(io, vmid, path).await?.map(|(s, _)| s))
 }
 
-/// [`read_file`], byte for byte. The seam trims both ends, so any difference
-/// between the on-disk size and what was read means bytes were lost and the
-/// file is refused rather than guessed at.
 pub async fn read_exact(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<Option<String>> {
     match read_sized(io, vmid, path).await? {
         None => Ok(None),
@@ -129,8 +116,6 @@ pub async fn read_exact(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<Optio
     }
 }
 
-/// Refuse a push to `path` unless it is a regular file or absent and every
-/// existing parent is a real directory.
 pub async fn check_push_target(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<()> {
     let mut paths: Vec<String> = std::path::Path::new(path)
         .ancestors()
@@ -166,10 +151,6 @@ pub async fn check_push_target(io: &dyn GuestIo, vmid: u32, path: &str) -> Resul
             bail!("refusing to write {path} in CT {vmid}: parent {name} is a {kind}");
         }
     }
-    // stat answers each path on stdout or with one "No such file" line on
-    // stderr. Absent paths must be a suffix (a missing parent hides all below),
-    // and their count must match those lines, so a stat that failed for any
-    // other reason is never read as "absent".
     let present = paths
         .iter()
         .take_while(|p| found.iter().any(|(n, _)| n == p))
@@ -192,7 +173,6 @@ pub async fn check_push_target(io: &dyn GuestIo, vmid: u32, path: &str) -> Resul
     Ok(())
 }
 
-/// [`GuestIo::write`] after [`check_push_target`].
 pub async fn write_checked(
     io: &dyn GuestIo,
     vmid: u32,
@@ -219,7 +199,6 @@ pub async fn exists(io: &dyn GuestIo, vmid: u32, path: &str) -> Result<bool> {
     )
 }
 
-/// One container as `/cluster/resources` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CtRef {
     pub node: String,
@@ -228,7 +207,6 @@ pub struct CtRef {
     pub running: bool,
 }
 
-/// Find LXC `vmid` in the cluster; an id that is a VM is an error.
 pub fn find_ct(endpoint: &str, vmid: u64) -> Result<CtRef> {
     find_ct_opt(endpoint, vmid)?.ok_or_else(|| anyhow!("no guest {vmid} in the cluster"))
 }
@@ -258,16 +236,16 @@ pub fn find_ct_opt(endpoint: &str, vmid: u64) -> Result<Option<CtRef>> {
 }
 
 fn require_free(vmid: u64, nextid: Result<serde_json::Value>) -> Result<()> {
-    nextid.map(drop).map_err(|e| {
-        anyhow!(
+    let Err(e) = nextid else { return Ok(()) };
+    if format!("{e:#}").contains(&format!("VM {vmid} already exists")) {
+        bail!(
             "guest {vmid} not listed but its id is taken ({e:#}); the token lacks VM.Audit on \
              /vms/{vmid}"
-        )
-    })
+        );
+    }
+    Err(e.context(format!("checking whether guest id {vmid} is free")))
 }
 
-/// Recording fake for tests: answers `exec` from a table keyed by the joined
-/// argv, records every write.
 #[cfg(test)]
 pub mod fake {
     use super::*;
@@ -326,8 +304,6 @@ pub mod fake {
                         .find(|(rk, _)| rk == k)
                         .map(|(_, v)| v.clone())
                 };
-                // A key scripted more than once answers in order, then repeats
-                // its last reply.
                 let scripted: Vec<&ExecResult> = self
                     .replies
                     .iter()
@@ -341,8 +317,6 @@ pub mod fake {
                     *n += 1;
                     return Ok(r);
                 }
-                // Unscripted stats answer from the scripted reads: a file with a
-                // `head` reply is regular, and a push target's parents are dirs.
                 match argv {
                     ["stat", "-L", "-c", "%F|%s", "--", path] => {
                         if let Some(r) = reply(&format!("head -c {READ_CAP} -- {path}")) {
@@ -392,10 +366,30 @@ mod tests {
     #[test]
     fn an_unlisted_guest_is_absent_only_when_its_id_is_free() {
         assert!(require_free(110, Ok(serde_json::json!(110))).is_ok());
-        let err = require_free(110, Err(anyhow!("upstream HTTP 400")))
-            .unwrap_err()
-            .to_string();
+        let err = require_free(
+            110,
+            Err(anyhow!(
+                "upstream HTTP 400: VM 110 already exists on node 'a'"
+            )),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("lacks VM.Audit"), "{err}");
+    }
+
+    #[test]
+    fn other_nextid_errors_pass_through() {
+        for raw in [
+            "upstream HTTP 401",
+            "upstream HTTP 500",
+            "connection refused",
+            "upstream HTTP 400: bad param",
+        ] {
+            let err = format!("{:#}", require_free(110, Err(anyhow!(raw))).unwrap_err());
+            assert!(!err.contains("VM.Audit"), "{err}");
+            assert!(err.contains(raw), "{err}");
+            assert!(err.contains("guest id 110 is free"), "{err}");
+        }
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 pub mod access;
+mod api_path;
 pub mod backup;
 pub mod backup_jobs;
 pub mod bind_mounts;
@@ -38,11 +39,8 @@ use thiserror::Error;
 pub struct Config {
     pub endpoint: String,
     pub base_url: String,
-    /// `user@realm!tokenid` — the part before the `=` in the auth header.
     pub token_id: String,
-    /// The UUID secret — the part after the `=`.
     pub token_secret: String,
-    /// Skip TLS verification (homelab self-signed certs).
     pub insecure: bool,
 }
 
@@ -75,8 +73,6 @@ impl Config {
         format!("PVEAPIToken={}={}", self.token_id, self.token_secret)
     }
 
-    /// Build the underlying `reqwest::Client` with the PVE API-token
-    /// header pre-attached and TLS verification toggled per `insecure`.
     pub fn build_reqwest_client(&self) -> Result<reqwest::Client, ProxmoxError> {
         plugin_toolkit::api_client::ApiClientBuilder::new()
             .header("authorization", self.auth_header_value())
@@ -99,8 +95,6 @@ pub enum ProxmoxError {
     Transport(String),
 }
 
-/// Allowed lifecycle actions on VMs and containers. Constraining the set up
-/// front keeps callers from forwarding arbitrary strings to the Proxmox API.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ProxmoxAction {
     Start,
@@ -120,7 +114,6 @@ impl ProxmoxAction {
     }
 }
 
-/// Guest kind — used by snapshot ops that work for both VMs and containers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestKind {
     Qemu,
@@ -165,7 +158,6 @@ pub struct ProxmoxActionResult {
     pub node: String,
     pub vmid: u64,
     pub action: String,
-    /// Proxmox returns a UPID (Unique Process ID) for async tasks.
     pub upid: Option<String>,
     pub status: u16,
 }
@@ -344,6 +336,9 @@ mod tests {
             .into_iter()
             .chain(guest_exec::REACHES.map(String::from))
             .chain(diagnostics::REACHES.map(String::from))
+            .chain(backup::backend_defs().into_iter().flat_map(|d| d.reaches))
+            .chain(tool_reaches(include_str!("backup_jobs.rs")))
+            .chain(tool_reaches(include_str!("thin_discard.rs")))
             .chain(deploy::reaches(GuestKind::Qemu))
             .chain(deploy::reaches(GuestKind::Lxc))
             .chain(tool_reaches(include_str!("tools.rs")))
@@ -446,10 +441,6 @@ mod tests {
 
     #[test]
     fn reqwest_client_attaches_pve_auth_header() {
-        // The cap-backed client seeds default headers onto every request, so
-        // one call is enough to prove the PVE token header is attached. We
-        // capture the `http.request` JSON the shim routes through the sink and
-        // assert the auth header value is present.
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let cap = captured.clone();
         let reply = serde_json::json!({

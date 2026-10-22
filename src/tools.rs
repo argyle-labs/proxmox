@@ -344,10 +344,6 @@ async fn proxmox_host_logs(
     Ok(crate::fetch_journal(&args.endpoint, &args.node, q)?)
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// proxmox.cluster_status / cluster_list — cluster envelope + node membership
-// ═══════════════════════════════════════════════════════════════════════════
-
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct ProxmoxClusterNode {
     pub name: String,
@@ -448,15 +444,6 @@ async fn proxmox_cluster_list(
         .await,
     )
 }
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Cross-ABI domain backends. These two tools are how the plugin's
-// cluster-roster + topology contributions reach orca: the loader registers a
-// `cluster_roster` / `topology` backend whose proxy invokes these by name
-// (`contract::cluster_roster::ROSTER_OP` / `contract::topology::COLLECT_OP`,
-// under the `proxmox` invoke prefix declared in `abi_export::backends`). They
-// return the plugin-neutral `contract` shapes the registries deserialize.
-// ═══════════════════════════════════════════════════════════════════════════
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
 pub struct ProxmoxListClustersArgs {}
@@ -576,6 +563,45 @@ mod token_secret_tests {
     #[test]
     fn resolves_from_the_name_core_auth_reads() {
         assert_eq!(with_secret(Some("s3cret")).unwrap(), "s3cret");
+    }
+
+    #[test]
+    fn update_takes_token_secret_and_stores_it_in_the_secrets_domain() {
+        use plugin_toolkit::clap::{self, Args, FromArgMatches};
+        let m = super::ProxmoxUpdateArgs::augment_args(clap::Command::new("x"))
+            .try_get_matches_from(["x", "--name", "pve", "--token-secret", "s3cret"])
+            .unwrap();
+        let args = super::ProxmoxUpdateArgs::from_arg_matches(&m).unwrap();
+        assert_eq!(args.token_secret.as_deref(), Some("s3cret"));
+        let row = super::ProxmoxEndpoint {
+            name: "pve".into(),
+            token_id: "orca@pve!t".into(),
+            token_secret: "s3cret".into(),
+            insecure: false,
+            routes: Default::default(),
+            enabled: true,
+        };
+        let sets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = sets.clone();
+        plugin_toolkit::capsink::with_cap_sink(
+            Box::new(move |cap: &str, raw: &str| {
+                assert_eq!(cap, "secret.op");
+                let op: serde_json::Value = serde_json::from_str(raw).unwrap();
+                log.lock()
+                    .unwrap()
+                    .push((op["op"].clone(), op["name"].clone()));
+                Ok("{}".to_string())
+            }),
+            || super::endpoint_db::store_secrets(&row),
+        )
+        .unwrap();
+        assert_eq!(
+            *sets.lock().unwrap(),
+            vec![(
+                serde_json::json!("set"),
+                serde_json::json!("proxmox.pve.token_secret")
+            )]
+        );
     }
 
     #[test]
