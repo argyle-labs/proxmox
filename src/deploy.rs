@@ -590,7 +590,7 @@ pub fn backend_defs() -> Vec<BackendDef> {
     rows.into_iter()
         .filter_map(|row| match ProxmoxDeployTarget::from_row(row.clone()) {
             Ok(target) => Some(BackendDef {
-                reaches: crate::unit_provider::reaches(),
+                reaches: reaches(target.guest_kind()),
                 ..deploy_backend_def(&target, &invoke_prefix(&row))
             }),
             Err(e) => {
@@ -598,6 +598,21 @@ pub fn backend_defs() -> Vec<BackendDef> {
                 None
             }
         })
+        .collect()
+}
+
+pub fn reaches(kind: GuestKind) -> Vec<String> {
+    let create = match kind {
+        GuestKind::Qemu => Some(crate::unit_provider::CREATE_QEMU_OP.to_string()),
+        GuestKind::Lxc => None,
+    };
+    create
+        .into_iter()
+        .chain([crate::destroy_op(kind)])
+        .chain(
+            [crate::ProxmoxAction::Stop, crate::ProxmoxAction::Reboot]
+                .map(|a| crate::lifecycle_op(kind, a)),
+        )
         .collect()
 }
 

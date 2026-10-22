@@ -233,20 +233,15 @@ pub fn find_ct(endpoint: &str, vmid: u64) -> Result<CtRef> {
     find_ct_opt(endpoint, vmid)?.ok_or_else(|| anyhow!("no guest {vmid} in the cluster"))
 }
 
-/// [`find_ct`], with `None` when the cluster has no guest `vmid`; errors if the
-/// token cannot audit that path.
 pub fn find_ct_opt(endpoint: &str, vmid: u64) -> Result<Option<CtRef>> {
     let items = cluster_resources(endpoint, Some("vm"))?;
     let Some(item) = items.into_iter().find(|i| i.vmid == Some(vmid as i64)) else {
-        // /cluster/resources silently omits guests the token cannot audit.
-        let path = format!("/vms/{vmid}");
-        let perms: serde_json::Map<String, serde_json::Value> = plugin_toolkit::api::call(
-            "proxmox.get_permissions_access_permissions",
+        let free = plugin_toolkit::api::call::<serde_json::Value>(
+            "proxmox.get_nextid_cluster_nextid",
             endpoint,
-            json!({ "path": path }),
-        )
-        .map_err(|e| e.context(format!("access permissions {path}")))?;
-        require_audit(vmid, &perms)?;
+            json!({ "vmid": vmid }),
+        );
+        require_free(vmid, free)?;
         return Ok(None);
     };
     if item.type_ != ResourceType::Lxc {
@@ -262,18 +257,13 @@ pub fn find_ct_opt(endpoint: &str, vmid: u64) -> Result<Option<CtRef>> {
     }))
 }
 
-/// `perms` is the `/access/permissions?path=/vms/{vmid}` body. A listed
-/// privilege is held; its value is the propagate flag, not a grant.
-fn require_audit(vmid: u64, perms: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
-    let path = format!("/vms/{vmid}");
-    let audit = perms.get(&path).and_then(|p| p.get("VM.Audit")).is_some();
-    if !audit {
-        bail!(
-            "guest {vmid} not listed and the token lacks VM.Audit on {path}; cannot tell whether \
-             it exists"
-        );
-    }
-    Ok(())
+fn require_free(vmid: u64, nextid: Result<serde_json::Value>) -> Result<()> {
+    nextid.map(drop).map_err(|e| {
+        anyhow!(
+            "guest {vmid} not listed but its id is taken ({e:#}); the token lacks VM.Audit on \
+             /vms/{vmid}"
+        )
+    })
 }
 
 /// Recording fake for tests: answers `exec` from a table keyed by the joined
@@ -400,15 +390,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_empty_listing_is_absent_only_with_vm_audit() {
-        let check = |body: &str| require_audit(110, &serde_json::from_str(body).unwrap());
-        let err = check(r#"{"/vms/110":{"VM.Console":1}}"#)
+    fn an_unlisted_guest_is_absent_only_when_its_id_is_free() {
+        assert!(require_free(110, Ok(serde_json::json!(110))).is_ok());
+        let err = require_free(110, Err(anyhow!("upstream HTTP 400")))
             .unwrap_err()
             .to_string();
         assert!(err.contains("lacks VM.Audit"), "{err}");
-        assert!(check("{}").is_err());
-        assert!(check(r#"{"/vms/110":{"VM.Audit":0}}"#).is_ok());
-        assert!(check(r#"{"/vms/110":{"VM.Audit":1}}"#).is_ok());
     }
 
     #[tokio::test]

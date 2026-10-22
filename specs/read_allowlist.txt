@@ -19,3 +19,5 @@
 /nodes/{node}/lxc/{vmid}/status/current
 /nodes/{node}/storage
 /nodes/{node}/storage/{storage}/status
+/nodes/{node}/lxc/{vmid}/interfaces
+/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces

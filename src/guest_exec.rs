@@ -44,7 +44,6 @@ const EXEC_OP: &str = "proxmox.post_exec_nodes_node_qemu_vmid_agent_exec";
 const EXEC_STATUS_OP: &str = "proxmox.get_exec_status_nodes_node_qemu_vmid_agent_exec_status";
 const FILE_WRITE_OP: &str = "proxmox.post_file_write_nodes_node_qemu_vmid_agent_file_write";
 
-/// The api-surface ops this backend calls; declared as the facet's `reaches`.
 pub const REACHES: [&str; 3] = [EXEC_OP, EXEC_STATUS_OP, FILE_WRITE_OP];
 
 const INPUT_DATA_MAX: usize = 65536;
@@ -88,9 +87,6 @@ impl GuestExec for ProxmoxGuestExec {
     }
 }
 
-/// Resolve a [`GuestRef`] into the `(endpoint, node, vmid)` the guest-agent
-/// calls need. proxmox reads `scope` as the PVE endpoint, `node` as
-/// the PVE node, and `id` as the vmid.
 fn resolve_guest(guest: &GuestRef) -> Result<(String, String, i64)> {
     let scope = guest.scope.as_deref().ok_or_else(|| {
         anyhow!("guest_exec: `scope` (PVE endpoint) is required for the proxmox backend")
@@ -113,8 +109,6 @@ fn resolve_guest(guest: &GuestRef) -> Result<(String, String, i64)> {
 async fn exec(guest: GuestRef, req: ExecRequest) -> Result<ExecOutput> {
     let (endpoint, node, vmid) = resolve_guest(&guest)?;
 
-    // stdin: the sanctioned channel for sensitive input. The agent caps input-data
-    // at 65536 chars.
     let input_data = match req.input_data.as_ref() {
         Some(bytes) => {
             let s = String::from_utf8(bytes.clone()).map_err(|_| {
@@ -217,14 +211,6 @@ fn cap_str(s: String, cap: usize) -> (String, bool) {
     (s[..end].to_string(), true)
 }
 
-/// Write a file into the guest, then apply `mode`/`owner` via chained exec.
-///
-/// The guest agent's `file-write` sets **content only** — it has no mode/owner
-/// field (verified against the spec: the body is `{content, encode, file}`). So a
-/// requested `mode`/`owner` is applied with a follow-up `chmod`/`chown` exec. The
-/// content is sent raw with `encode` defaulted (PVE base64-encodes it QMP-side);
-/// the agent caps it at 61440 chars. Binary (non-UTF-8) or larger-than-cap writes are rejected here —
-/// chunked/base64 writes are a later slice.
 async fn write_file(guest: GuestRef, req: WriteFileRequest) -> Result<()> {
     let (endpoint, node, vmid) = resolve_guest(&guest)?;
 
@@ -235,7 +221,6 @@ async fn write_file(guest: GuestRef, req: WriteFileRequest) -> Result<()> {
         bail!("guest_exec: file contents rejected by guest agent (cap {FILE_CONTENT_MAX} chars)");
     }
 
-    // `encode` omitted → PVE default `encode=true`: it base64-encodes the content QMP-side.
     api::call::<plugin_toolkit::serde_json::Value>(
         FILE_WRITE_OP,
         &endpoint,
@@ -321,6 +306,45 @@ mod tests {
         let (s, trunc) = cap_str("hello".to_string(), 100);
         assert_eq!(s, "hello");
         assert!(!trunc);
+    }
+
+    #[test]
+    fn exec_sends_command_and_stdin_in_the_body_and_pid_in_the_query() {
+        let (pid, calls) = crate::test_support::record_api_calls(
+            |method, _| match method {
+                "POST" => r#"{"pid":7}"#.to_string(),
+                _ => r#"{"exited":true,"exitcode":0}"#.to_string(),
+            },
+            || {
+                let pid = start_exec("pve", "n1", 101, &["ls".to_string()], Some("x".into()))?;
+                exec_status("pve", "n1", 101, pid).map(|_| pid)
+            },
+        );
+        assert_eq!(pid.unwrap(), 7);
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "POST".to_string(),
+                    "/nodes/n1/qemu/101/agent/exec".to_string(),
+                    json!({ "body": { "command": ["ls"], "input-data": "x" } })
+                ),
+                (
+                    "GET".to_string(),
+                    "/nodes/n1/qemu/101/agent/exec-status".to_string(),
+                    json!({ "pid": 7 })
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_without_stdin_omits_input_data() {
+        let (_, calls) = crate::test_support::record_api_calls(
+            |_, _| r#"{"pid":1}"#.to_string(),
+            || start_exec("pve", "n1", 101, &["true".to_string()], None),
+        );
+        assert_eq!(calls[0].2, json!({ "body": { "command": ["true"] } }));
     }
 
     #[test]

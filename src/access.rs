@@ -183,25 +183,11 @@ pub fn delete_token(endpoint: &str, userid: &str, tokenid: &str) -> Result<()> {
 
 // ── Bootstrap orchestrator ──────────────────────────────────────────────────
 
-/// Mint the least-privilege runtime identity on a cluster reachable via
-/// `endpoint` (which must currently carry an elevated/admin credential).
-///
-/// Sequence: ensure `OrcaOps` role → ensure `orca@pve` user → grant the role to
-/// the user → generate a privsep token → grant the role to the token id. The
-/// returned [`ProvisionedIdentity`] carries the one-time secret; the caller
-/// persists it to the secrets domain and repoints the endpoint at the new
-/// `token_id`, after which the bootstrap (root) credential can be rotated away.
-///
-/// Re-running rotates the token (a fresh secret) while leaving role/user/ACL in
-/// place — the basis for scheduled rotation.
 pub fn bootstrap_orca_identity(endpoint: &str) -> Result<ProvisionedIdentity> {
     ensure_role(endpoint, ORCA_ROLE, ORCA_OPS_PRIVS)?;
     ensure_user(endpoint, ORCA_USER)?;
     grant_acl(endpoint, "/", ORCA_ROLE, Some(ORCA_USER), None)?;
 
-    // Regenerate cleanly: drop any stale token so the secret is fresh. A
-    // missing token (first bootstrap) is the expected non-error case, but a
-    // dry run must surface its plan rather than continue.
     if let Err(e) = delete_token(endpoint, ORCA_USER, ORCA_TOKEN) {
         if e.downcast_ref::<api::Planned>().is_some() {
             return Err(e);
@@ -300,7 +286,7 @@ async fn proxmox_access_bootstrap(
             .with_context(|| format!("proxmox endpoint '{}' not registered", args.endpoint))?;
         let updated = ProxmoxEndpoint {
             token_id: id.token_id.clone(),
-            token_secret: String::new(), // secret now lives in the secrets domain
+            token_secret: String::new(),
             ..row
         };
         endpoint_db::update(&updated)?;
@@ -314,4 +300,48 @@ async fn proxmox_access_bootstrap(
         secret_ref,
         repointed,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grant_acl_omits_absent_principals_from_the_body() {
+        let (r, calls) = crate::test_support::record_api_calls(
+            |_, _| "null".to_string(),
+            || grant_acl("pve", "/", ORCA_ROLE, Some(ORCA_USER), None),
+        );
+        r.unwrap();
+        assert_eq!(
+            calls,
+            vec![(
+                "PUT".to_string(),
+                "/access/acl".to_string(),
+                json!({ "body": {
+                    "path": "/",
+                    "roles": ORCA_ROLE,
+                    "propagate": true,
+                    "users": ORCA_USER,
+                } })
+            )]
+        );
+    }
+
+    #[test]
+    fn generate_token_sends_privsep_in_the_body() {
+        let (r, calls) = crate::test_support::record_api_calls(
+            |_, _| r#"{"full-tokenid":"orca@pve!orca","value":"s"}"#.to_string(),
+            || generate_token("pve", ORCA_USER, ORCA_TOKEN, true, None),
+        );
+        assert_eq!(r.unwrap(), ("orca@pve!orca".to_string(), "s".to_string()));
+        assert_eq!(
+            calls,
+            vec![(
+                "POST".to_string(),
+                "/access/users/orca@pve/token/orca".to_string(),
+                json!({ "body": { "privsep": true } })
+            )]
+        );
+    }
 }
