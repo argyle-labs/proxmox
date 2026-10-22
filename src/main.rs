@@ -1,29 +1,3 @@
-//! Dynamic (subprocess) entrypoint for the proxmox plugin.
-//!
-//! proxmox is a **hybrid** plugin: the `proxmox.` `#[orca_tool]` surface PLUS a
-//! spread of typed domain facets, all composed on the [`Plugin`] builder — which
-//! emits the combined `backends()` payload and the single wire dispatch, so the
-//! plugin hand-writes no op-string routing.
-//!
-//! Facets:
-//! * `unit` — the five-verb managed-unit surface (every cluster VM/LXC).
-//!
-//! `unit`, `diagnostics` and `guest_exec` reach execute-gated api-surface ops,
-//! which core refuses unless the backend declares them in `reaches`; the typed
-//! facet builders take no `reaches`, so those three ride `.backend` with the
-//! same prefix routing the facets emit.
-//! * `topology` — parent-host nesting by guest MACs.
-//! * `host_facts` — this host's corosync cluster membership.
-//! * `diagnostics` — QEMU guest-agent + LXC shm-trap + host-workload assurance.
-//! * `cluster_roster` — fleet cluster grouping. A **tool-backed** backend: its op
-//!   IS the `proxmox.list_clusters` `#[orca_tool]`, so it advertises a def only
-//!   and dispatch falls through to the tool surface.
-//! * `guest_mount` — network-share mounts inside LXCs, via the `.backend` hatch.
-//! * `backup` (3 KINDs) + `deploy_target` (one per configured row) — dynamic,
-//!   config-derived backend sets with no single-instance typed builder facet, so
-//!   they ride the builder's `.backend(def, dispatcher)` escape hatch, reusing the
-//!   existing `crate::backup::dispatch` / `crate::deploy::dispatch` routers.
-
 plugin_toolkit::instrument::bootstrap!();
 
 use plugin_toolkit::abi::BackendDef;
@@ -96,7 +70,7 @@ fn main() -> plugin_toolkit::anyhow::Result<()> {
                 domain: "diagnostics".to_string(),
                 name: diagnostics.name().to_string(),
                 invoke_prefix: prefix.clone(),
-                reaches: vec![proxmox::diagnostics::ENABLE_AGENT_OP.to_string()],
+                reaches: proxmox::diagnostics::REACHES.map(String::from).to_vec(),
                 ..Default::default()
             },
             route(prefix, move |op, args| {

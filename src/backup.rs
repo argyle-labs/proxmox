@@ -275,8 +275,6 @@ async fn guest_instances(kind: GuestKind) -> Result<String> {
     Ok(serde_json::to_string(&ids)?)
 }
 
-/// Capture one guest's raw config object to `payload_dir/config.json`. The raw
-/// endpoint preserves indexed keys (`net0`, `mp0`, …) the schema collapses.
 async fn guest_backup(kind: GuestKind, instance: &str, dir: &str) -> Result<String> {
     let (node, vmid) = parse_instance(instance)?;
     let (cfg, _) = resolve_endpoint_for_node(&node).await?;

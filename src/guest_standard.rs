@@ -1236,25 +1236,6 @@ pub fn plan_update<A: Serialize>(
     execute::plan(tool, inputs, summary, changes)
 }
 
-/// The unit provider's `backup` action for one LXC.
-pub struct UnitBackup {
-    pub endpoint: String,
-}
-
-impl PreUpdateBackup for UnitBackup {
-    fn backup<'a>(
-        &'a self,
-        ctid: u64,
-        storage: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<BackupRef>> {
-        Box::pin(async move {
-            crate::unit_provider::ProxmoxUnitProvider::new()
-                .backup_lxc(&self.endpoint, ctid, storage)
-                .await
-        })
-    }
-}
-
 // ── verbs ───────────────────────────────────────────────────────────────────
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]

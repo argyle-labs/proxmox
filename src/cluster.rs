@@ -1,15 +1,3 @@
-//! Proxmox cluster-status wrapper.
-//!
-//! Wraps the `GET /cluster/status` op into a typed shape that
-//! splits the single response array into the cluster envelope (name +
-//! quorate) and its member nodes. A standalone Proxmox host (no cluster
-//! configured) returns an array with only a node-typed item — we surface
-//! that as `name: None, quorate: None, nodes: [that single node]` instead
-//! of erroring, matching how the systems UI wants to render it.
-//!
-//! Consumed by `tools::proxmox_cluster_status` / `proxmox_cluster_list`
-//! and by the frontend systems map for grouping peers by cluster.
-
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
@@ -54,8 +42,6 @@ struct StatusItem {
     quorate: Option<bool>,
 }
 
-/// Hit `/cluster/status` on `endpoint` and partition the response into
-/// cluster envelope + node list.
 pub fn fetch_cluster_status(endpoint: &str) -> anyhow::Result<ClusterStatus> {
     let items: Vec<StatusItem> = plugin_toolkit::api::call(
         "proxmox.get_get_status_cluster_status",
