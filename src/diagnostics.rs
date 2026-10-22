@@ -1,29 +1,6 @@
-//! QEMU guest-agent assurance — a `diagnostics` domain provider.
-//!
-//! orca can only run in-guest exec / clean-shutdown / live-IP discovery against
-//! a QEMU VM when the VM has the guest agent **both** enabled in its PVE config
-//! (`agent: 1`) **and** the `qemu-guest-agent` package installed + running
-//! inside the guest. This provider diagnoses that, per running VM, and proposes
-//! repairs that flow — via orca's diagnostics→notification bridge — into
-//! dismissable notifications the user can act on, ignore, or ignore permanently.
-//!
-//! Two findings:
-//!
-//! * **disabled** — the VM is running but `agent` is off/absent in its config.
-//!   Repair (`enable::…`) is in-place: PUT `agent: 1` on the VM config. It needs
-//!   confirmation (not automatic) because it only takes effect after a
-//!   power-cycle and still requires the in-guest package.
-//! * **unresponsive** — `agent` is enabled in config but the guest agent does
-//!   not answer a ping: the package is almost certainly not installed/running
-//!   in the guest. There is no in-guest channel to fix this automatically, so
-//!   the repair (`guest-install::…`) returns honest manual guidance rather than
-//!   pretending to act. This is the VM104 / gha-runner case.
-//!
-//! LXC guests have no guest agent, so they are not diagnosed here.
-
 use crate::responses::{ResourceType, cluster_resources};
-use crate::tools::{for_each_enabled_endpoint, resolve_config};
-use crate::{GuestKind, fetch_guest_config, responses::GuestConfigData};
+use crate::tools::for_each_enabled_endpoint;
+use crate::{GuestKind, responses::GuestConfigData};
 use plugin_toolkit::abi::BackendDef;
 use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::contract::diagnostics::{
@@ -32,9 +9,6 @@ use plugin_toolkit::contract::diagnostics::{
 };
 use plugin_toolkit::serde_json;
 
-/// Typed `diagnostics` facet for the `Plugin` builder. Wraps the module's
-/// [`diagnose`]/[`repair`] free fns; the builder drives it over the wire via
-/// `contract::diagnostics::dispatch_op`.
 pub struct ProxmoxDiagnostics;
 
 impl DiagnosticsProvider for ProxmoxDiagnostics {
@@ -51,16 +25,13 @@ impl DiagnosticsProvider for ProxmoxDiagnostics {
     }
 }
 
-/// Backend invoke prefix used by the legacy [`dispatch`] router (still exercised
-/// by this module's tests). The live plugin routes diagnostics through the typed
-/// [`ProxmoxDiagnostics`] facet on the `Plugin` builder instead.
 pub const DIAG_PREFIX: &str = "proxmox.__diagnostics";
 const PROVIDER: &str = "proxmox";
 pub const ENABLE_AGENT_OP: &str = "proxmox.put_update_vm_nodes_node_qemu_vmid_config";
 const AGENT_PING_OP: &str = "proxmox.post_ping_nodes_node_qemu_vmid_agent_ping";
-pub const REACHES: [&str; 2] = [ENABLE_AGENT_OP, AGENT_PING_OP];
+const RAISE_CT_MEMORY_OP: &str = "proxmox.put_update_vm_nodes_node_lxc_vmid_config";
+pub const REACHES: [&str; 3] = [ENABLE_AGENT_OP, AGENT_PING_OP, RAISE_CT_MEMORY_OP];
 
-/// The `diagnostics` backend descriptor this plugin advertises.
 pub fn diagnostics_backend_def() -> BackendDef {
     BackendDef {
         domain: "diagnostics".to_string(),
@@ -70,8 +41,6 @@ pub fn diagnostics_backend_def() -> BackendDef {
     }
 }
 
-/// Route a `proxmox.__diagnostics.{diagnose|repair}` backend call. Returns
-/// `None` for any other name so the caller can fall through.
 pub fn dispatch(
     name: &str,
     args: serde_json::Value,
@@ -97,25 +66,17 @@ pub fn dispatch(
     }))
 }
 
-/// A backend-ABI error value: the toolkit's `Result<Value, Value>` uses a plain
-/// JSON string for a message-only error.
 fn err_val(msg: impl Into<String>) -> serde_json::Value {
     serde_json::Value::String(msg.into())
 }
 
-/// Guest-agent state for one running QEMU VM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentState {
-    /// Enabled in config and responding — healthy, no finding.
     Ok,
-    /// Not enabled in the VM config.
     Disabled,
-    /// Enabled in config but not answering (package missing/stopped in guest).
     Unresponsive,
 }
 
-/// Pure classifier: given whether the agent is enabled in config and whether it
-/// answered a ping, decide the state.
 fn classify(enabled_in_config: bool, ping_ok: bool) -> AgentState {
     if !enabled_in_config {
         AgentState::Disabled
@@ -126,9 +87,6 @@ fn classify(enabled_in_config: bool, ping_ok: bool) -> AgentState {
     }
 }
 
-/// Is the QEMU guest agent enabled in a VM config's `agent` field? PVE returns
-/// it either as a bare `1`/`0` or a property string like
-/// `enabled=1,fstrim_cloned_disks=1`.
 fn config_agent_enabled(cfg: &GuestConfigData) -> bool {
     if cfg.get_int("agent") == Some(1) {
         return true;
@@ -140,48 +98,24 @@ fn config_agent_enabled(cfg: &GuestConfigData) -> bool {
     false
 }
 
-/// Diagnose every running QEMU VM across all enabled endpoints, plus the
-/// node-local LXC shm-trap sweep.
 pub async fn diagnose(args: DiagnoseArgs) -> Vec<Finding> {
     let mut findings = diagnose_qemu_agents(args).await;
     findings.extend(diagnose_lxc_shm_traps().await);
-    // Node-local: scans /proc for non-hypervisor workloads running on the host
-    // itself (the PVE API exposes no process list). Empty off a PVE node.
     findings.extend(diagnose_host_workloads());
-    // Cluster-wide: vCPU committed to running guests vs physical cores.
     findings.extend(crate::overallocation::diagnose_overallocation().await);
-    // Cluster-wide: memory over-allocation, under-used guests, live pressure.
     findings.extend(crate::memory::diagnose_memory().await);
-    // Node-local: reads the `mp` entries in /etc/pve/lxc/*.conf and compares each
-    // bind-mount source against the node root's device. Empty off a PVE node.
     findings.extend(diagnose_guest_mounts());
-    // Cluster-wide: running guests no enabled vzdump job covers, and jobs that
-    // queue behind each other on one node.
     findings.extend(crate::backup_jobs::diagnose_backup_jobs().await);
-    // Node-local: app state in LXC bind mounts, which vzdump never includes.
     findings.extend(crate::bind_mounts::diagnose_bind_mounts());
-    // Cluster-wide: thin pools whose volumes add up to more than the pool holds.
     findings.extend(crate::thin_pool::diagnose_thin_pools().await);
-    // Cluster-wide: old guest snapshots pinning thin-pool space.
     findings.extend(crate::stale_snapshots::diagnose_stale_snapshots().await);
     findings
 }
 
-/// Node-local sweep: classify every LXC mountpoint through orca's
-/// [`plugin_toolkit::mount_audit`].
-///
-/// The split is deliberate — this plugin gathers the FACTS (the `mp` lines, and a
-/// `stat` comparing each bind source's device to `/`), orca owns the JUDGEMENT
-/// (that an uncapped bind mount sharing a filesystem with the node root means a
-/// guest can fill the hypervisor). Keeping the severity rules in orca stops every
-/// plugin reimplementing them and drifting apart.
-///
-/// The root device is stat'ed ONCE per sweep rather than per mount. Empty off a
-/// PVE node, where /etc/pve/lxc does not exist.
 fn diagnose_guest_mounts() -> Vec<Finding> {
     let dir = std::path::Path::new("/etc/pve/lxc");
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new(); // not a PVE node
+        return Vec::new();
     };
     let node = local_node();
     let root_dev = crate::mount_scan::root_device();
@@ -210,11 +144,6 @@ fn diagnose_guest_mounts() -> Vec<Finding> {
     findings
 }
 
-/// Render one [`plugin_toolkit::mount_audit::MountFinding`] as a PVE finding.
-///
-/// Severity comes from the risk orca assigned, not from a local guess: filling
-/// the node root takes down every guest on it, where filling a dedicated
-/// filesystem takes down one workload.
 fn finding_guest_mount(
     node: &str,
     vmid: u64,
@@ -251,16 +180,10 @@ fn finding_guest_mount(
              never sees this — only the configuration does.",
             f.detail
         ),
-        // No automatic repair: replacing a mountpoint rewrites the CT config and
-        // needs a restart, and choosing the replacement storage + size is an
-        // operator decision orca must not make unattended.
         repair: None,
     }
 }
 
-/// Node-local sweep: flag any non-hypervisor workload (e.g. `minio`,
-/// `act_runner`) running directly on this PVE host instead of inside a guest.
-/// See [`crate::host_workloads`]. Empty off a PVE node.
 fn diagnose_host_workloads() -> Vec<Finding> {
     let node = local_node();
     crate::host_workloads::scan_host_workloads()
@@ -273,8 +196,6 @@ fn finding_host_workload(node: &str, label: &str) -> Finding {
     Finding {
         id: format!("host-workload::{node}::{label}"),
         provider: PROVIDER.to_string(),
-        // Warn, not Crit: it's a hygiene/architecture problem, not an active
-        // outage — the host still runs, but it's no longer clean/disposable.
         severity: Severity::Warn,
         title: format!(
             "Non-hypervisor workload '{label}' is running directly on PVE node '{node}'"
@@ -288,18 +209,13 @@ fn finding_host_workload(node: &str, label: &str) -> Finding {
              resources. Move '{label}' into a dedicated LXC or VM and remove it from the host. \
              orca does not stop host processes automatically — this needs a deliberate migration."
         ),
-        // No safe automatic repair: relocating a live service into a guest is a
-        // manual migration. The detail carries the guidance; the notification is
-        // the action.
         repair: None,
     }
 }
 
-/// Diagnose every running QEMU VM across all enabled endpoints.
 async fn diagnose_qemu_agents(_args: DiagnoseArgs) -> Vec<Finding> {
-    for_each_enabled_endpoint("diagnostics.qemu_agent", |cfg, ep| async move {
-        let http = cfg.build_reqwest_client()?;
-        let items = cluster_resources(&cfg.endpoint, Some("vm"))?;
+    for_each_enabled_endpoint("diagnostics.qemu_agent", |_, ep| async move {
+        let items = cluster_resources(&ep.name, Some("vm"))?;
 
         let mut findings = Vec::new();
         for e in items {
@@ -310,7 +226,7 @@ async fn diagnose_qemu_agents(_args: DiagnoseArgs) -> Vec<Finding> {
                 continue;
             }
             if e.status.as_deref() != Some("running") {
-                continue; // a stopped VM can't answer the agent — not a fault.
+                continue;
             }
             let (node, vmid) = match (e.node, e.vmid) {
                 (Some(n), Some(v)) if !n.is_empty() && v > 0 => (n, v as u64),
@@ -318,15 +234,11 @@ async fn diagnose_qemu_agents(_args: DiagnoseArgs) -> Vec<Finding> {
             };
             let name = e.name.unwrap_or_else(|| format!("vmid-{vmid}"));
 
-            let cfg_resp = match fetch_guest_config(
-                &http,
-                &cfg.base_url,
-                &node,
-                GuestKind::Qemu,
-                vmid,
-            )
-            .await
-            {
+            let config = match plugin_toolkit::api::call::<GuestConfigData>(
+                crate::backup::config_op(GuestKind::Qemu, "get"),
+                &ep.name,
+                serde_json::json!({ "node": node, "vmid": vmid }),
+            ) {
                 Ok(c) => c,
                 Err(err) => {
                     tracing::debug!(node = %node, vmid, error = %err,
@@ -334,10 +246,8 @@ async fn diagnose_qemu_agents(_args: DiagnoseArgs) -> Vec<Finding> {
                     continue;
                 }
             };
-            let enabled = config_agent_enabled(&cfg_resp.data);
+            let enabled = config_agent_enabled(&config);
 
-            // Only ping when the config says the agent should be up; a ping to a
-            // config-disabled agent always fails and would be noise.
             let ping_ok = if enabled {
                 plugin_toolkit::api::call::<serde_json::Value>(
                     AGENT_PING_OP,
@@ -364,8 +274,6 @@ async fn diagnose_qemu_agents(_args: DiagnoseArgs) -> Vec<Finding> {
     .await
 }
 
-/// This node's name (PVE node == hostname). Falls back to `"local"` so a
-/// finding id stays stable-ish even if the hostname can't be read.
 pub(crate) fn local_node() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .or_else(|_| std::fs::read_to_string("/etc/hostname"))
@@ -375,7 +283,6 @@ pub(crate) fn local_node() -> String {
         .unwrap_or_else(|| "local".to_string())
 }
 
-/// The CT's `hostname:` from its conf, for a friendly finding title.
 fn ct_name(conf: &str) -> Option<String> {
     conf.lines()
         .find_map(|l| l.trim().strip_prefix("hostname:"))
@@ -384,23 +291,17 @@ fn ct_name(conf: &str) -> Option<String> {
 }
 
 async fn diagnose_lxc_shm_traps() -> Vec<Finding> {
-    for_each_enabled_endpoint("diagnostics.shm_trap", |cfg, ep| async move {
-        let http = cfg.build_reqwest_client()?;
-        shm_findings(&http, &cfg.base_url, &ep.name).await
+    for_each_enabled_endpoint("diagnostics.shm_trap", |_, ep| async move {
+        shm_findings(&ep.name)
     })
     .await
 }
 
-async fn shm_findings(
-    http: &plugin_toolkit::reqwest::Client,
-    base_url: &str,
-    endpoint: &str,
-) -> anyhow::Result<Vec<Finding>> {
-    let resources =
-        crate::backup::raw_get_data(http, base_url, "cluster/resources?type=vm").await?;
+fn shm_findings(endpoint: &str) -> anyhow::Result<Vec<Finding>> {
+    let resources = crate::api_path::get(endpoint, "cluster/resources?type=vm")?;
     let mut findings = Vec::new();
     for (node, vmid, name) in lxc_guests(&resources) {
-        let config = match ct_config(http, base_url, &node, vmid).await {
+        let config = match ct_config(endpoint, &node, vmid) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(vmid, error = %e, "shm-trap: CT config read failed");
@@ -414,14 +315,8 @@ async fn shm_findings(
     Ok(findings)
 }
 
-async fn ct_config(
-    http: &plugin_toolkit::reqwest::Client,
-    base_url: &str,
-    node: &str,
-    vmid: u64,
-) -> anyhow::Result<serde_json::Value> {
-    let path = format!("nodes/{}/lxc/{vmid}/config", crate::backup::enc(node));
-    crate::backup::raw_get_data(http, base_url, &path).await
+fn ct_config(endpoint: &str, node: &str, vmid: u64) -> anyhow::Result<serde_json::Value> {
+    crate::api_path::get(endpoint, &format!("nodes/{node}/lxc/{vmid}/config"))
 }
 
 fn ct_traps(config: &serde_json::Value) -> Vec<crate::shm_trap::ShmTrap> {
@@ -480,7 +375,6 @@ fn finding_shm_trap(
     Finding {
         id: format!("lxc-shm-trap::{node}::{vmid}::{}", trap.target),
         provider: PROVIDER.to_string(),
-        // High: this actively OOM-kills the workload and crash-loops it.
         severity: Severity::Crit,
         title: format!(
             "CT {vmid} ('{name}') tmpfs /{} is {} MiB but the memory cap is {} MiB — OOM-kill risk",
@@ -511,27 +405,14 @@ fn finding_shm_trap(
     }
 }
 
-async fn repair_shm_memory(
+fn raise_ct_memory(
     endpoint: &str,
     node: &str,
     vmid: u64,
     memory_mb: u64,
 ) -> Result<String, String> {
-    let cfg = resolve_config(endpoint).await.map_err(|e| e.to_string())?;
-    let http = cfg.build_reqwest_client().map_err(|e| e.to_string())?;
-    raise_ct_memory(&http, &cfg.base_url, node, vmid, memory_mb).await
-}
-
-async fn raise_ct_memory(
-    http: &plugin_toolkit::reqwest::Client,
-    base_url: &str,
-    node: &str,
-    vmid: u64,
-    memory_mb: u64,
-) -> Result<String, String> {
-    let config = ct_config(http, base_url, node, vmid)
-        .await
-        .map_err(|e| format!("GET CT {vmid} config: {e:#}"))?;
+    let config =
+        ct_config(endpoint, node, vmid).map_err(|e| format!("GET CT {vmid} config: {e:#}"))?;
     let traps = ct_traps(&config);
     if !traps
         .iter()
@@ -542,9 +423,7 @@ async fn raise_ct_memory(
             traps.len()
         ));
     }
-    let status_path = format!("nodes/{}/status", crate::backup::enc(node));
-    let status = crate::backup::raw_get_data(http, base_url, &status_path)
-        .await
+    let status = crate::api_path::get(endpoint, &format!("nodes/{node}/status"))
         .map_err(|e| format!("GET node {node} status: {e:#}"))?;
     let total_mb = status
         .pointer("/memory/total")
@@ -561,14 +440,13 @@ async fn raise_ct_memory(
             "CT {vmid} memory is already at or above {memory_mb} MiB (already fixed?)"
         ));
     };
-    let url = format!(
-        "{}/nodes/{}/lxc/{vmid}/config",
-        base_url.trim_end_matches('/'),
-        crate::backup::enc(node)
-    );
-    crate::backup::put_form(http, &url, &pairs)
-        .await
-        .map_err(|e| format!("PUT CT {vmid} memory: {e:#}"))?;
+    crate::api_path::send(
+        "PUT",
+        endpoint,
+        &format!("nodes/{node}/lxc/{vmid}/config"),
+        &pairs,
+    )
+    .map_err(|e| format!("PUT CT {vmid} memory: {e:#}"))?;
     Ok(format!(
         "Raised CT {vmid} memory to {memory_mb} MiB through the PVE API; a running CT applies \
          it live."
@@ -649,7 +527,6 @@ fn finding_unresponsive(endpoint: &str, node: &str, vmid: u64, name: &str) -> Fi
     }
 }
 
-/// Parse a repair id `<action>::<endpoint>::<node>::<vmid>`.
 fn parse_repair_id(id: &str) -> Option<(String, String, String, u64)> {
     let mut p = id.split("::");
     let action = p.next()?.to_string();
@@ -671,7 +548,6 @@ fn outcome(repair_id: &str, ok: bool, message: String) -> RepairOutcome {
     }
 }
 
-/// Run a repair by its `RepairSpec.id`.
 pub async fn repair(args: RepairArgs) -> RepairOutcome {
     if let Some(rest) = args.repair_id.strip_prefix("shm-memory::") {
         let parsed = match rest.split("::").collect::<Vec<_>>().as_slice() {
@@ -689,7 +565,7 @@ pub async fn repair(args: RepairArgs) -> RepairOutcome {
                 format!("malformed shm-memory repair id '{}'", args.repair_id),
             );
         };
-        return match repair_shm_memory(&endpoint, &node, vmid, memory_mb).await {
+        return match raise_ct_memory(&endpoint, &node, vmid, memory_mb) {
             Ok(msg) => outcome(&args.repair_id, true, msg),
             Err(e) => outcome(&args.repair_id, false, e),
         };
@@ -718,8 +594,6 @@ pub async fn repair(args: RepairArgs) -> RepairOutcome {
                 format!("failed to enable the guest agent for vmid {vmid}: {e}"),
             ),
         },
-        // No in-guest channel — return honest, actionable guidance rather than
-        // pretending to remediate.
         "guest-install" => outcome(
             &args.repair_id,
             false,
@@ -739,7 +613,6 @@ pub async fn repair(args: RepairArgs) -> RepairOutcome {
     }
 }
 
-/// Set `agent: 1` on a VM's config via the PVE API.
 async fn enable_agent(endpoint: &str, node: &str, vmid: u64) -> anyhow::Result<()> {
     plugin_toolkit::api::call::<serde_json::Value>(
         ENABLE_AGENT_OP,
@@ -775,7 +648,6 @@ mod tests {
         assert!(!config_agent_enabled(&cfg_from(
             r#"{"data":{"agent":"enabled=0"}}"#
         )));
-        // absent
         assert!(!config_agent_enabled(&cfg_from(r#"{"data":{"cores":2}}"#)));
     }
 
@@ -835,7 +707,6 @@ mod tests {
         assert_eq!(f.id, "host-workload::frigg::minio");
         assert_eq!(f.severity, Severity::Warn);
         assert!(f.title.contains("minio") && f.title.contains("frigg"));
-        // Relocation is a manual migration — no automatic repair.
         assert!(f.repair.is_none());
     }
 
@@ -888,9 +759,7 @@ mod tests {
 
     type Reply = (u16, String);
 
-    const BASE: &str = "https://10.0.0.5:8006/api2/json";
-
-    fn run_pve<F, T>(respond: F, f: impl AsyncFnOnce() -> T) -> (T, Vec<String>)
+    fn run_pve<F, T>(respond: F, f: impl FnOnce() -> T) -> (T, Vec<String>)
     where
         F: Fn(&str, &str, &str) -> Reply + 'static,
     {
@@ -898,33 +767,21 @@ mod tests {
         let seen = log.clone();
         let out = plugin_toolkit::capsink::with_cap_sink(
             Box::new(move |cap: &str, raw: &str| {
-                assert_eq!(cap, "http.request");
-                let req: serde_json::Value = serde_json::from_str(raw).unwrap();
-                let method = req["method"].as_str().unwrap().to_string();
-                let path = req["url"]
-                    .as_str()
-                    .unwrap()
-                    .trim_start_matches(BASE)
-                    .trim_start_matches('/')
-                    .to_string();
-                let body: Vec<u8> = serde_json::from_value(req["body"].clone()).unwrap_or_default();
-                let body = String::from_utf8(body).unwrap();
+                assert_eq!(cap, "api.call");
+                let (method, path, args) = crate::test_support::api_call_route(raw);
+                let path = path.trim_start_matches('/').to_string();
+                let body = if args["body"].is_null() {
+                    String::new()
+                } else {
+                    args["body"].to_string()
+                };
                 seen.lock().unwrap().push(format!("{method} {path} {body}"));
                 let (status, out) = respond(&method, &path, &body);
-                Ok(serde_json::json!({
-                    "status": status,
-                    "headers": [["content-type", "application/json"]],
-                    "body": out.into_bytes(),
-                })
-                .to_string())
+                crate::test_support::api_call_reply(
+                    &serde_json::json!({ "status": status, "body": out.into_bytes() }).to_string(),
+                )
             }),
-            || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(f())
-            },
+            f,
         );
         let log = log.lock().unwrap().clone();
         (out, log)
@@ -944,16 +801,11 @@ mod tests {
         }
     }
 
-    fn http() -> plugin_toolkit::reqwest::Client {
-        plugin_toolkit::reqwest::Client::new()
-    }
-
     #[test]
     fn repair_reads_then_puts_memory_with_the_digest() {
-        let (msg, log) = run_pve(
-            pve_reply((200, r#"{"data":null}"#.to_string())),
-            async || raise_ct_memory(&http(), BASE, "thor", 110, 12288).await,
-        );
+        let (msg, log) = run_pve(pve_reply((200, r#"{"data":null}"#.to_string())), || {
+            raise_ct_memory("pve", "thor", 110, 12288)
+        });
         assert!(msg.unwrap().contains("12288 MiB"));
         assert_eq!(log.len(), 3, "{log:?}");
         assert!(
@@ -961,7 +813,7 @@ mod tests {
             "{log:?}"
         );
         assert!(
-            log[2].contains("memory=12288") && log[2].contains("digest=d1"),
+            log[2].contains(r#""memory":"12288""#) && log[2].contains(r#""digest":"d1""#),
             "{log:?}"
         );
     }
@@ -972,8 +824,8 @@ mod tests {
             400,
             r#"{"errors":{"digest":"detected modified configuration"}}"#.to_string(),
         );
-        let (out, _) = run_pve(pve_reply(reply), async || {
-            raise_ct_memory(&http(), BASE, "thor", 110, 12288).await
+        let (out, _) = run_pve(pve_reply(reply), || {
+            raise_ct_memory("pve", "thor", 110, 12288)
         });
         let err = out.unwrap_err();
         assert!(
@@ -984,8 +836,8 @@ mod tests {
 
     #[test]
     fn repair_rejects_a_mismatched_or_oversized_target() {
-        let (out, log) = run_pve(pve_reply((200, "{}".to_string())), async || {
-            raise_ct_memory(&http(), BASE, "thor", 110, 999_999).await
+        let (out, log) = run_pve(pve_reply((200, "{}".to_string())), || {
+            raise_ct_memory("pve", "thor", 110, 999_999)
         });
         let err = out.unwrap_err();
         assert!(err.contains("does not match a current shm trap"), "{err}");
@@ -999,9 +851,7 @@ mod tests {
             ),
             _ => (200, r#"{"data":null}"#.to_string()),
         };
-        let (out, log) = run_pve(small_node, async || {
-            raise_ct_memory(&http(), BASE, "thor", 110, 12288).await
-        });
+        let (out, log) = run_pve(small_node, || raise_ct_memory("pve", "thor", 110, 12288));
         let err = out.unwrap_err();
         assert!(err.contains("exceeds node thor memory (8192 MiB)"), "{err}");
         assert!(!log.iter().any(|l| l.starts_with("PUT")));
@@ -1011,7 +861,7 @@ mod tests {
     fn a_failed_ct_config_read_does_not_stop_the_sweep() {
         let routes = |_: &str, path: &str, _: &str| {
             match path {
-            "cluster/resources?type=vm" => (
+            "cluster/resources" => (
                 200,
                 r#"{"data":[{"type":"lxc","node":"thor","vmid":109},{"type":"lxc","node":"thor","vmid":110,"name":"mimir"}]}"#
                     .to_string(),
@@ -1020,7 +870,7 @@ mod tests {
             _ => (500, "{}".to_string()),
         }
         };
-        let (findings, log) = run_pve(routes, async || shm_findings(&http(), BASE, "pve").await);
+        let (findings, log) = run_pve(routes, || shm_findings("pve"));
         let findings = findings.unwrap();
         assert!(
             log.iter()
@@ -1049,7 +899,6 @@ mod tests {
     fn unknown_diagnostics_op_is_an_error() {
         let r = dispatch("proxmox.__diagnostics.bogus", serde_json::json!({})).unwrap();
         assert!(r.is_err());
-        // A non-diagnostics name falls through.
         assert!(dispatch("proxmox.__unit.list", serde_json::json!({})).is_none());
     }
 

@@ -1,37 +1,13 @@
-//! LVM-thin discard drift and allocation divergence.
-//!
-//! A thin volume only returns blocks to its pool when the guest's deletes reach
-//! it as discards. Without `mountoptions=discard` (LXC) or `discard=on` (QEMU
-//! disk), thin allocation only ever grows, so the pool can fill while every
-//! guest filesystem on it still reports free space.
-//!
-//! Two verbs:
-//!
-//! * `proxmox.thin.audit` (read) — per guest, every disk on `lvmthin` storage:
-//!   whether discard is active, staged for the next start, or missing (with the
-//!   exact config value the remediation would write); and, for running LXC root
-//!   filesystems, thin allocation vs in-guest usage.
-//! * `proxmox.thin.enable_discard` (mutating, dry-run by default via orca's
-//!   central execute gate) — rewrites the disk lines to carry discard.
-//!
-//! The PVE API cannot report whether anything schedules `fstrim` (that is a
-//! host systemd unit), and it reports in-guest usage only for LXC root
-//! filesystems, so VM divergence is not measured here.
-
 use std::collections::{HashMap, HashSet};
 
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json::Value;
 
-use crate::backup::{enc, put_form, raw_get_data};
+use crate::GuestKind;
 use crate::responses::{ConfigField, GuestConfigData};
 use crate::responses::{ResourceType, cluster_resources};
-use crate::tools::{EndpointFailure, fan_out_enabled_endpoints, resolve_config};
-use crate::{Config, GuestKind, fetch_guest_config};
+use crate::tools::{EndpointFailure, fan_out_enabled_endpoints};
 
-/// Thin allocation exceeding in-guest usage by this many percentage points of
-/// the volume size is flagged. A volume with working discard tracks its
-/// filesystem within a few points.
 pub const DIVERGENCE_WARN_PCT: f64 = 15.0;
 
 const THIN_PLUGIN: &str = "lvmthin";
@@ -86,8 +62,6 @@ pub struct ThinGuestAudit {
     pub volumes: Vec<ThinVolumeAudit>,
 }
 
-/// Something the audit could not read. Guests or volumes behind it are absent
-/// from (or incomplete in) the report rather than clean.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ThinAuditError {
     /// `None` when the endpoint registry itself could not be listed.
@@ -111,7 +85,6 @@ pub struct ThinAuditReport {
     pub errors: Vec<ThinAuditError>,
 }
 
-/// One config key as `/nodes/{node}/{kind}/{vmid}/pending` reports it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PendingEntry {
     pub key: String,
@@ -120,7 +93,6 @@ pub struct PendingEntry {
     pub delete: bool,
 }
 
-/// Thin-pool usage of one volume from a storage content listing.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct VolumeUsage {
     pub size: Option<u64>,
@@ -153,7 +125,6 @@ pub fn parse_pending(data: &Value) -> Vec<PendingEntry> {
         .unwrap_or_default()
 }
 
-/// `volid → usage` from a `/nodes/{node}/storage/{storage}/content` listing.
 pub fn parse_content(data: &Value) -> HashMap<String, VolumeUsage> {
     data.as_array()
         .map(|items| {
@@ -174,8 +145,6 @@ pub fn parse_content(data: &Value) -> HashMap<String, VolumeUsage> {
         .unwrap_or_default()
 }
 
-/// Whether `key` names a guest disk that could sit on thin storage. `unusedN`,
-/// EFI vars and TPM state are excluded: nothing writes through them.
 fn is_disk_key(kind: GuestKind, key: &str) -> bool {
     let indexed = |prefix: &str| {
         key.strip_prefix(prefix)
@@ -187,8 +156,6 @@ fn is_disk_key(kind: GuestKind, key: &str) -> bool {
     }
 }
 
-/// `(volid, storage)` of a disk line, or `None` for bind mounts, CD-ROMs and
-/// empty drives.
 pub fn volume_of(kind: GuestKind, value: &str) -> Option<(String, String)> {
     let mut parts = value.split(',');
     let first = parts.next()?.trim();
@@ -221,10 +188,6 @@ pub fn has_discard(kind: GuestKind, value: &str) -> bool {
     }
 }
 
-/// `value` with discard turned on, every other option preserved. LXC mount
-/// options are `;`-separated inside one `mountoptions=`, so an existing set is
-/// extended rather than given a second key; QEMU's `discard=ignore` is
-/// replaced.
 pub fn with_discard(kind: GuestKind, value: &str) -> String {
     if has_discard(kind, value) {
         return value.to_string();
@@ -268,12 +231,6 @@ pub fn divergence_pct(size: u64, allocated: u64, fs_used: u64) -> Option<f64> {
     (size > 0).then(|| allocated.saturating_sub(fs_used) as f64 / size as f64 * 100.0)
 }
 
-/// Pure: audit one guest's thin volumes from its pending listing (which
-/// carries both the active and the staged value of every key).
-///
-/// `thin` is the set of `lvmthin` storage ids on the guest's node; `usage` maps
-/// volid to pool allocation on that same node (volids repeat across nodes);
-/// `rootfs_used` is the in-guest root filesystem usage of a running container.
 pub fn audit_volumes(
     kind: GuestKind,
     pending: &[PendingEntry],
@@ -332,22 +289,13 @@ struct GuestRef {
     kind: GuestKind,
     name: Option<String>,
     running: bool,
-    /// In-guest root filesystem usage, meaningful only for a running LXC.
     disk: Option<u64>,
 }
 
-/// Audit every non-template guest on one endpoint (optionally one node). Fails
-/// only when the guest inventory itself is unreadable; anything narrower is
-/// recorded in [`ThinAuditReport::errors`].
-pub async fn audit_endpoint(
-    cfg: &Config,
-    endpoint: &str,
-    node: Option<&str>,
-) -> Result<ThinAuditReport> {
+pub fn audit_endpoint(endpoint: &str, node: Option<&str>) -> Result<ThinAuditReport> {
     use ResourceType as Kind;
 
-    let http = cfg.build_reqwest_client()?;
-    let items = cluster_resources(&cfg.endpoint, None)?;
+    let items = cluster_resources(endpoint, None)?;
 
     let mut thin: HashMap<String, HashSet<String>> = HashMap::new();
     let mut guests = Vec::new();
@@ -392,8 +340,7 @@ pub async fn audit_endpoint(
     let mut usage: HashMap<String, HashMap<String, VolumeUsage>> = HashMap::new();
     for (n, stores) in &thin {
         for s in stores {
-            let path = format!("nodes/{}/storage/{}/content", enc(n), enc(s));
-            match raw_get_data(&http, &cfg.base_url, &path).await {
+            match crate::api_path::get(endpoint, &format!("nodes/{n}/storage/{s}/content")) {
                 Ok(data) => usage
                     .entry(n.clone())
                     .or_default()
@@ -420,13 +367,8 @@ pub async fn audit_endpoint(
         if node_thin.is_empty() {
             continue;
         }
-        let path = format!(
-            "nodes/{}/{}/{}/pending",
-            enc(&g.node),
-            g.kind.as_str(),
-            g.vmid
-        );
-        let pending = match raw_get_data(&http, &cfg.base_url, &path).await {
+        let path = format!("nodes/{}/{}/{}/pending", g.node, g.kind.as_str(), g.vmid);
+        let pending = match crate::api_path::get(endpoint, &path) {
             Ok(data) => parse_pending(&data),
             Err(e) => {
                 tracing::warn!(endpoint, node = %g.node, vmid = g.vmid, error = %e,
@@ -469,9 +411,6 @@ pub struct DiscardChange {
     pub state: Option<DiscardState>,
 }
 
-/// Pure: the disk lines of `cfg` (pending values applied) that need discard.
-/// `only` narrows to named keys; naming a key that is not a thin disk is an
-/// error rather than a silent no-op.
 pub fn plan_discard(
     kind: GuestKind,
     cfg: &GuestConfigData,
@@ -512,7 +451,6 @@ pub fn plan_discard(
     Ok(out)
 }
 
-/// `lvmthin` storage ids on one node.
 pub fn parse_thin_storages(data: &Value) -> HashSet<String> {
     data.as_array()
         .map(|items| {
@@ -539,31 +477,27 @@ pub struct ThinDiscardOutcome {
     pub warnings: Vec<String>,
 }
 
-/// Write discard onto every thin disk of one guest that lacks it.
-pub async fn enable_discard(
-    cfg: &Config,
+pub fn enable_discard(
     endpoint: &str,
     node: &str,
     kind: GuestKind,
     vmid: u64,
     only: &[String],
 ) -> Result<ThinDiscardOutcome> {
-    let http = cfg.build_reqwest_client()?;
-    let storages = raw_get_data(
-        &http,
-        &cfg.base_url,
-        &format!("nodes/{}/storage", enc(node)),
-    )
-    .await?;
+    let storages = crate::api_path::get(endpoint, &format!("nodes/{node}/storage"))?;
     let thin = parse_thin_storages(&storages);
-    let config = fetch_guest_config(&http, &cfg.base_url, node, kind, vmid).await?;
-    if config.data.get_int("template").unwrap_or(0) != 0 {
+    let config = plugin_toolkit::api::call::<GuestConfigData>(
+        crate::backup::config_op(kind, "get"),
+        endpoint,
+        json!({ "node": node, "vmid": vmid }),
+    )?;
+    if config.get_int("template").unwrap_or(0) != 0 {
         bail!(
             "{} {vmid} is a template; change discard on the guests cloned from it",
             kind.as_str()
         );
     }
-    let mut changes = plan_discard(kind, &config.data, &thin, only)?;
+    let mut changes = plan_discard(kind, &config, &thin, only)?;
     let mut warnings = Vec::new();
 
     if !changes.is_empty() {
@@ -571,26 +505,17 @@ pub async fn enable_discard(
             .iter()
             .map(|c| (c.key.clone(), c.after.clone()))
             .collect();
-        // PVE rejects the write if the config changed since it was read; without
-        // the digest the PUT could clobber a concurrent edit.
-        let Some(ConfigField::Str(digest)) = config.data.fields.get("digest") else {
+        let Some(ConfigField::Str(digest)) = config.fields.get("digest") else {
             bail!(
                 "{} {vmid} config read returned no digest; refusing an unguarded write",
                 kind.as_str()
             );
         };
         pairs.push(("digest".to_string(), digest.clone()));
-        let url = format!(
-            "{}/nodes/{}/{}/{}/config",
-            cfg.base_url.trim_end_matches('/'),
-            enc(node),
-            kind.as_str(),
-            vmid
-        );
-        put_form(&http, &url, &pairs).await?;
+        let base = format!("nodes/{node}/{}/{vmid}", kind.as_str());
+        crate::api_path::send("PUT", endpoint, &format!("{base}/config"), &pairs)?;
 
-        let path = format!("nodes/{}/{}/{}/pending", enc(node), kind.as_str(), vmid);
-        match raw_get_data(&http, &cfg.base_url, &path).await {
+        match crate::api_path::get(endpoint, &format!("{base}/pending")) {
             Ok(data) => {
                 let pending = parse_pending(&data);
                 for c in &mut changes {
@@ -624,10 +549,6 @@ pub async fn enable_discard(
     })
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// proxmox.thin.audit / proxmox.thin.enable_discard
-// ═══════════════════════════════════════════════════════════════════════════
-
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
 pub struct ThinAuditArgs {
     /// Registered endpoint. Omit to audit every enabled endpoint.
@@ -649,19 +570,16 @@ pub struct ThinAuditArgs {
 async fn proxmox_thin_audit(args: ThinAuditArgs, _ctx: &ToolCtx) -> Result<ThinAuditReport> {
     let node = args.node.clone();
     if let Some(name) = &args.endpoint {
-        let cfg = resolve_config(name).await?;
-        return audit_endpoint(&cfg, name, node.as_deref()).await;
+        return audit_endpoint(name, node.as_deref());
     }
-    let fan = fan_out_enabled_endpoints("thin.audit", |cfg, ep| {
+    let fan = fan_out_enabled_endpoints("thin.audit", |_, ep| {
         let node = node.clone();
-        async move { Ok(vec![audit_endpoint(&cfg, &ep.name, node.as_deref()).await?]) }
+        async move { Ok(vec![audit_endpoint(&ep.name, node.as_deref())?]) }
     })
     .await;
     merge_fan_out(fan.items, fan.failures, fan.attempted)
 }
 
-/// Fold per-endpoint reports and endpoint-level failures into one report.
-/// Nothing read is an error, never an empty report that reads as all-clean.
 fn merge_fan_out(
     reports: Vec<ThinAuditReport>,
     failures: Vec<EndpointFailure>,
@@ -720,7 +638,15 @@ pub struct ThinEnableDiscardArgs {
 /// inside the guest return blocks to the pool. On a running guest PVE stages
 /// the change until its next start. Run `proxmox.thin.audit` for the exact
 /// values this writes.
-#[orca_tool(domain = "proxmox", verb = "thin.enable_discard", role = "admin")]
+#[orca_tool(
+    domain = "proxmox",
+    verb = "thin.enable_discard",
+    role = "admin",
+    reaches = [
+        "proxmox.put_update_vm_nodes_node_qemu_vmid_config",
+        "proxmox.put_update_vm_nodes_node_lxc_vmid_config"
+    ]
+)]
 async fn proxmox_thin_enable_discard(
     args: ThinEnableDiscardArgs,
     ctx: &ToolCtx,
@@ -732,8 +658,7 @@ async fn proxmox_thin_enable_discard(
         (Some(_), Some(_)) => bail!("set either `vmid` or `ctid`, not both"),
         (None, None) => bail!("`vmid` or `ctid` required"),
     };
-    let cfg = resolve_config(&args.endpoint).await?;
-    enable_discard(&cfg, &args.endpoint, &args.node, kind, vmid, &args.volumes).await
+    enable_discard(&args.endpoint, &args.node, kind, vmid, &args.volumes)
 }
 
 #[cfg(test)]
@@ -757,7 +682,6 @@ mod tests {
             with_discard(GuestKind::Lxc, v),
             "local-lvm:vm-117-disk-0,size=98G,mountoptions=discard"
         );
-        // `discard=1` is not an LXC rootfs option; it must not count.
         assert!(!has_discard(
             GuestKind::Lxc,
             "local-lvm:vm-1-disk-0,discard=1"
@@ -883,8 +807,6 @@ mod tests {
         assert!(!v[0].diverged);
     }
 
-    /// `pct set` on a running CT stages the change; the audit must say so
-    /// rather than report it as fixed or as still missing.
     #[test]
     fn staged_discard_is_pending_restart() {
         let pending = parse_pending(&json!([{
@@ -975,52 +897,27 @@ mod tests {
         .to_string()
     }
 
-    fn test_config() -> Config {
-        Config::new(
-            "https://10.0.0.5:8006/api2/json",
-            "orca@pve!orca",
-            "00000000-0000-0000-0000-000000000000",
-        )
-    }
-
-    /// Answer `http.request` by method + path suffix; record every request.
     fn run_against<T>(
         routes: Vec<(&'static str, &'static str, String)>,
-        f: impl AsyncFnOnce() -> T,
+        f: impl FnOnce() -> T,
     ) -> (T, Vec<Value>) {
         let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
         let log = seen.clone();
         let out = plugin_toolkit::capsink::with_cap_sink(
             Box::new(move |cap: &str, raw: &str| {
-                if cap == "api.call" {
-                    let (method, path, _) = crate::test_support::api_call_route(raw);
-                    for (m, suffix, body) in &routes {
-                        if *m == method && path.ends_with(suffix) {
-                            return crate::test_support::api_call_reply(body);
-                        }
-                    }
-                    panic!("unexpected api.call {method} {path}");
-                }
-                assert_eq!(cap, "http.request");
-                let req: Value = serde_json::from_str(raw).unwrap();
-                log.lock().unwrap().push(req.clone());
-                let method = req["method"].as_str().unwrap();
-                let url = req["url"].as_str().unwrap();
-                let path = url.split('?').next().unwrap();
+                assert_eq!(cap, "api.call");
+                let (method, path, args) = crate::test_support::api_call_route(raw);
+                log.lock()
+                    .unwrap()
+                    .push(json!({"method": method, "url": path, "args": args}));
                 for (m, suffix, body) in &routes {
                     if *m == method && path.ends_with(suffix) {
-                        return Ok(body.clone());
+                        return crate::test_support::api_call_reply(body);
                     }
                 }
-                panic!("unexpected request {method} {url}");
+                panic!("unexpected api.call {method} {path}");
             }),
-            || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(f())
-            },
+            f,
         );
         let seen = seen.lock().unwrap().clone();
         (out, seen)
@@ -1066,9 +963,7 @@ mod tests {
                 ),
             ),
         ];
-        let (res, seen) = run_against(routes, async || {
-            audit_endpoint(&test_config(), "pve", None).await
-        });
+        let (res, seen) = run_against(routes, || audit_endpoint("pve", None));
         let report = res.unwrap();
         assert!(report.errors.is_empty(), "{:#?}", report.errors);
         let audit = report.guests;
@@ -1116,8 +1011,8 @@ mod tests {
                 ),
             ),
         ];
-        let (res, seen) = run_against(routes, async || {
-            enable_discard(&test_config(), "pve", "hyp1", GuestKind::Lxc, 117, &[]).await
+        let (res, seen) = run_against(routes, || {
+            enable_discard("pve", "hyp1", GuestKind::Lxc, 117, &[])
         });
         let out = res.unwrap();
         assert_eq!(out.changes.len(), 1);
@@ -1125,13 +1020,12 @@ mod tests {
         assert!(out.restart_required);
 
         let put = seen.iter().find(|r| r["method"] == "PUT").unwrap();
-        let body: Vec<u8> = serde_json::from_value(put["body"].clone()).unwrap();
-        let body = String::from_utf8(body).unwrap();
-        assert!(
-            body.contains("rootfs=local-lvm%3Avm-117-disk-0%2Csize%3D98G%2Cmountoptions%3Ddiscard"),
+        let body = &put["args"]["body"];
+        assert_eq!(
+            body["rootfs"], "local-lvm:vm-117-disk-0,size=98G,mountoptions=discard",
             "{body}"
         );
-        assert!(body.contains("digest=d1g"), "{body}");
+        assert_eq!(body["digest"], "d1g", "{body}");
     }
 
     #[test]
@@ -1151,8 +1045,8 @@ mod tests {
                 ),
             ),
         ];
-        let (res, seen) = run_against(routes, async || {
-            enable_discard(&test_config(), "pve", "hyp1", GuestKind::Qemu, 106, &[]).await
+        let (res, seen) = run_against(routes, || {
+            enable_discard("pve", "hyp1", GuestKind::Qemu, 106, &[])
         });
         let out = res.unwrap();
         assert!(out.changes.is_empty());
@@ -1236,17 +1130,13 @@ mod tests {
         ]
     }
 
-    /// Node-local `local-lvm` reuses volids across nodes; each guest must read
-    /// its own node's allocation.
     #[test]
     fn same_volid_on_two_nodes_is_keyed_per_node() {
         let content = reply(
             200,
             json!([{"volid": "local-lvm:vm-100-disk-0", "size": 8 * GIB, "used": 7 * GIB}]),
         );
-        let (res, _) = run_against(two_node_routes(content), async || {
-            audit_endpoint(&test_config(), "pve", None).await
-        });
+        let (res, _) = run_against(two_node_routes(content), || audit_endpoint("pve", None));
         let report = res.unwrap();
         let alloc = |node: &str| {
             report
@@ -1270,9 +1160,7 @@ mod tests {
             "/nodes/hyp1/lxc/100/pending",
             reply(500, Value::Null),
         ));
-        let (res, _) = run_against(routes, async || {
-            audit_endpoint(&test_config(), "pve", None).await
-        });
+        let (res, _) = run_against(routes, || audit_endpoint("pve", None));
         let report = res.unwrap();
         assert_eq!(report.guests.len(), 1, "{report:#?}");
         assert_eq!(report.guests[0].vmid, 200);
@@ -1324,8 +1212,8 @@ mod tests {
             json!({"rootfs": "local-lvm:vm-117-disk-0,size=98G"}),
             reply(200, json!([])),
         );
-        let (res, seen) = run_against(routes, async || {
-            enable_discard(&test_config(), "pve", "hyp1", GuestKind::Lxc, 117, &[]).await
+        let (res, seen) = run_against(routes, || {
+            enable_discard("pve", "hyp1", GuestKind::Lxc, 117, &[])
         });
         assert!(res.unwrap_err().to_string().contains("no digest"));
         assert!(seen.iter().all(|r| r["method"] == "GET"));
@@ -1337,8 +1225,8 @@ mod tests {
             json!({"rootfs": "local-lvm:vm-117-disk-0,size=98G", "template": 1, "digest": "d"}),
             reply(200, json!([])),
         );
-        let (res, seen) = run_against(routes, async || {
-            enable_discard(&test_config(), "pve", "hyp1", GuestKind::Lxc, 117, &[]).await
+        let (res, seen) = run_against(routes, || {
+            enable_discard("pve", "hyp1", GuestKind::Lxc, 117, &[])
         });
         assert!(res.unwrap_err().to_string().contains("template"));
         assert!(seen.iter().all(|r| r["method"] == "GET"));
@@ -1350,8 +1238,8 @@ mod tests {
             json!({"rootfs": "local-lvm:vm-117-disk-0,size=98G", "digest": "d"}),
             reply(500, Value::Null),
         );
-        let (res, seen) = run_against(routes, async || {
-            enable_discard(&test_config(), "pve", "hyp1", GuestKind::Lxc, 117, &[]).await
+        let (res, seen) = run_against(routes, || {
+            enable_discard("pve", "hyp1", GuestKind::Lxc, 117, &[])
         });
         let out = res.unwrap();
         assert!(seen.iter().any(|r| r["method"] == "PUT"));

@@ -1,21 +1,3 @@
-//! Scheduled vzdump jobs, managed through `/cluster/backup` (the API behind
-//! `/etc/pve/jobs.cfg`).
-//!
-//! Verbs:
-//!
-//! * `proxmox.backup_job.list` (read).
-//! * `proxmox.backup_job.upsert` / `proxmox.backup_job.delete` (admin): dry-run
-//!   by default, returning the field-by-field diff against the current job.
-//!   `prune-backups` defaults to [`DEFAULT_PRUNE`], the fleet retention policy.
-//! * `proxmox.guest.pxarexclude` (admin): a container's `/.pxarexclude`,
-//!   written through orca's lxc-push seam.
-//!
-//! Diagnostics ([`diagnose_backup_jobs`]): a running guest no enabled job
-//! covers, guests with no backup within their job's schedule, a failed latest
-//! vzdump run, unreadable backup storage, and jobs that queue behind each
-//! other on one node. vzdump holds a per-node lock, so a node's jobs run one at a time: a job scheduled while an
-//! earlier one is still running waits, and a long queue overruns its window.
-
 use std::collections::{BTreeMap, HashMap};
 
 use plugin_toolkit::contract::CallerIdentity;
@@ -24,18 +6,13 @@ use plugin_toolkit::contract::plan::PlannedChange;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json::Value;
 
-use crate::Config;
-use crate::backup::{enc, post_form, put_form, raw_get_data};
 use crate::execute::{self, Change};
 use crate::lxc_guest::{self, GuestIo};
 use crate::responses::{ClusterResource, ResourceType, cluster_resources};
-use crate::tools::{for_each_enabled_endpoint, resolve_config};
+use crate::tools::for_each_enabled_endpoint;
 
-/// Fleet retention policy for scheduled backups.
 pub const DEFAULT_PRUNE: &str = "keep-last=10";
 
-/// Queue window assumed for a node with no finished vzdump task in its recent
-/// history.
 pub const DEFAULT_QUEUE_WINDOW_MIN: u32 = 60;
 
 const PROVIDER: &str = "proxmox";
@@ -53,7 +30,6 @@ const PRUNE_KEYS: [&str; 7] = [
 const MODES: [&str; 3] = ["snapshot", "suspend", "stop"];
 const COMPRESS: [&str; 5] = ["0", "1", "gzip", "lzo", "zstd"];
 
-/// Which guests a job backs up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum Selection {
@@ -77,7 +53,6 @@ fn join_ids(ids: &[u64]) -> String {
     ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",")
 }
 
-/// One vzdump job as `/cluster/backup` reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct BackupJob {
     pub id: String,
@@ -125,7 +100,6 @@ fn truthy(v: &Value) -> Option<bool> {
     }
 }
 
-/// `pve-vmid-list`: ids separated by commas, semicolons or spaces.
 pub fn parse_vmid_list(s: &str) -> Vec<u64> {
     let mut ids: Vec<u64> = s
         .split([',', ';', ' '])
@@ -136,8 +110,6 @@ pub fn parse_vmid_list(s: &str) -> Vec<u64> {
     ids
 }
 
-/// `prune-backups` in canonical key order. PVE reports it either as a property
-/// string or as an object, depending on version.
 pub fn canonical_prune(v: &Value) -> Option<String> {
     let pairs: Vec<(String, String)> = match v {
         Value::String(s) => s
@@ -205,7 +177,6 @@ pub fn parse_job(v: &Value) -> Option<BackupJob> {
             vmids: parse_vmid_list(&s),
         })
     };
-    // Jobs created before PVE 7 carry `starttime` + `dow` instead of `schedule`.
     let schedule = get("schedule").or_else(|| {
         let time = get("starttime")?;
         Some(match get("dow") {
@@ -237,17 +208,13 @@ pub fn parse_jobs(data: &Value) -> Vec<BackupJob> {
     jobs
 }
 
-pub async fn fetch_jobs(cfg: &Config) -> Result<Vec<BackupJob>> {
-    let http = cfg.build_reqwest_client()?;
-    Ok(parse_jobs(
-        &raw_get_data(&http, &cfg.base_url, "cluster/backup").await?,
-    ))
+pub fn fetch_jobs(endpoint: &str) -> Result<Vec<BackupJob>> {
+    Ok(parse_jobs(&crate::api_path::get(
+        endpoint,
+        "cluster/backup",
+    )?))
 }
 
-// ── upsert planning ─────────────────────────────────────────────────────────
-
-/// What `upsert` was asked for. `None` leaves the current value alone (or takes
-/// PVE's default on create); `prune_backups` is always enforced.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JobSpec {
     pub id: String,
@@ -272,12 +239,10 @@ pub struct FieldChange {
     pub after: Option<String>,
 }
 
-/// The form write `upsert` would send.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JobWrite {
     pub create: bool,
     pub set: Vec<(String, String)>,
-    /// Keys to clear (PUT `delete=`). Only switching selection clears keys.
     pub delete: Vec<String>,
     pub changes: Vec<FieldChange>,
 }
@@ -288,7 +253,6 @@ impl JobWrite {
     }
 }
 
-/// Pure: the write that turns `current` into `want`.
 pub fn plan_upsert(current: Option<&BackupJob>, want: &JobSpec) -> Result<JobWrite> {
     if want.id.is_empty() || want.id.chars().any(char::is_whitespace) || want.id.len() > 50 {
         bail!(
@@ -479,8 +443,6 @@ fn planned_changes(id: &str, w: &JobWrite) -> Vec<PlannedChange> {
         .collect()
 }
 
-// ── verbs ───────────────────────────────────────────────────────────────────
-
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
 pub struct BackupJobListArgs {
     #[arg(long)]
@@ -498,7 +460,7 @@ async fn proxmox_backup_job_list(
     args: BackupJobListArgs,
     _ctx: &ToolCtx,
 ) -> Result<Vec<BackupJob>> {
-    fetch_jobs(&resolve_config(&args.endpoint).await?).await
+    fetch_jobs(&args.endpoint)
 }
 
 fn default_prune() -> String {
@@ -627,13 +589,12 @@ pub struct BackupJobApplied {
 }
 
 pub async fn upsert(
-    cfg: &Config,
     args: &BackupJobUpsertArgs,
     caller: Option<&CallerIdentity>,
 ) -> Result<Change<BackupJobApplied>> {
     const TOOL: &str = "proxmox.backup_job.upsert";
     let spec = args.spec()?;
-    let jobs = fetch_jobs(cfg).await?;
+    let jobs = fetch_jobs(&args.endpoint)?;
     let current = jobs.iter().find(|j| j.id == spec.id);
     let w = plan_upsert(current, &spec)?;
     let verb = if w.create { "create" } else { "update" };
@@ -653,25 +614,23 @@ pub async fn upsert(
     let mut warnings = Vec::new();
     let mut job = current.cloned();
     if !w.is_noop() {
-        let http = cfg.build_reqwest_client()?;
-        let root = cfg.base_url.trim_end_matches('/');
         if w.create {
             let mut pairs = vec![("id".to_string(), spec.id.clone())];
             pairs.extend(w.set.iter().cloned());
-            post_form(&http, &format!("{root}/cluster/backup"), &pairs).await?;
+            crate::api_path::send("POST", &args.endpoint, "cluster/backup", &pairs)?;
         } else {
             let mut pairs = w.set.clone();
             if !w.delete.is_empty() {
                 pairs.push(("delete".into(), w.delete.join(",")));
             }
-            put_form(
-                &http,
-                &format!("{root}/cluster/backup/{}", enc(&spec.id)),
+            crate::api_path::send(
+                "PUT",
+                &args.endpoint,
+                &format!("cluster/backup/{}", crate::backup::enc(&spec.id)),
                 &pairs,
-            )
-            .await?;
+            )?;
         }
-        job = match fetch_jobs(cfg).await {
+        job = match fetch_jobs(&args.endpoint) {
             Ok(jobs) => jobs.into_iter().find(|j| j.id == spec.id),
             Err(e) => {
                 warnings.push(format!(
@@ -699,15 +658,18 @@ pub async fn upsert(
     domain = "proxmox",
     verb = "backup_job.upsert",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    reaches = [
+        "proxmox.post_create_job_cluster_backup",
+        "proxmox.put_update_job_cluster_backup_id"
+    ]
 )]
 async fn proxmox_backup_job_upsert(
     args: BackupJobUpsertArgs,
     ctx: &ToolCtx,
 ) -> Result<Change<BackupJobApplied>> {
     execute::require_admin("proxmox.backup_job.upsert", ctx.caller().as_ref())?;
-    let cfg = resolve_config(&args.endpoint).await?;
-    upsert(&cfg, &args, ctx.caller().as_ref()).await
+    upsert(&args, ctx.caller().as_ref()).await
 }
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
@@ -723,12 +685,11 @@ pub struct BackupJobDeleteArgs {
 }
 
 pub async fn delete(
-    cfg: &Config,
     args: &BackupJobDeleteArgs,
     caller: Option<&CallerIdentity>,
 ) -> Result<Change<BackupJobApplied>> {
     const TOOL: &str = "proxmox.backup_job.delete";
-    let jobs = fetch_jobs(cfg).await?;
+    let jobs = fetch_jobs(&args.endpoint)?;
     let job = jobs.into_iter().find(|j| j.id == args.id).ok_or_else(|| {
         anyhow!(
             "no vzdump job '{}' on endpoint '{}'",
@@ -761,22 +722,12 @@ pub async fn delete(
         )?));
     }
     execute::authorize_execute(TOOL, caller)?;
-    let http = cfg.build_reqwest_client()?;
-    let url = format!(
-        "{}/cluster/backup/{}",
-        cfg.base_url.trim_end_matches('/'),
-        enc(&args.id)
-    );
-    let resp = http
-        .delete(&url)
-        .send()
-        .await
-        .map_err(|e| anyhow!("DELETE {url}: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("DELETE {url}: HTTP {}: {body}", status.as_u16());
-    }
+    crate::api_path::send(
+        "DELETE",
+        &args.endpoint,
+        &format!("cluster/backup/{}", crate::backup::enc(&args.id)),
+        &[],
+    )?;
     Ok(Change::Applied(BackupJobApplied {
         dry_run: false,
         endpoint: args.endpoint.clone(),
@@ -794,18 +745,16 @@ pub async fn delete(
     domain = "proxmox",
     verb = "backup_job.delete",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    reaches = ["proxmox.delete_delete_job_cluster_backup_id"]
 )]
 async fn proxmox_backup_job_delete(
     args: BackupJobDeleteArgs,
     ctx: &ToolCtx,
 ) -> Result<Change<BackupJobApplied>> {
     execute::require_admin("proxmox.backup_job.delete", ctx.caller().as_ref())?;
-    let cfg = resolve_config(&args.endpoint).await?;
-    delete(&cfg, &args, ctx.caller().as_ref()).await
+    delete(&args, ctx.caller().as_ref()).await
 }
-
-// ── .pxarexclude ────────────────────────────────────────────────────────────
 
 const PXAREXCLUDE: &str = "/.pxarexclude";
 
@@ -837,7 +786,6 @@ pub struct PxarExcludeApplied {
     pub patterns: Vec<String>,
 }
 
-/// `-old` / `+new` lines between two files, in order of the new file.
 pub(crate) fn line_diff(before: &str, after: &str) -> String {
     let old: Vec<&str> = before.lines().collect();
     let new: Vec<&str> = after.lines().collect();
@@ -930,8 +878,6 @@ async fn proxmox_guest_pxarexclude(
     Err(lxc_guest::unsupported(args.ctid))
 }
 
-// ── schedules ───────────────────────────────────────────────────────────────
-
 fn parse_day(s: &str) -> Option<u32> {
     let s = s.get(..3)?;
     DAYS.iter().position(|d| *d == s).map(|i| i as u32)
@@ -958,7 +904,6 @@ fn parse_days(tok: &str) -> Option<Vec<u32>> {
     Some(out)
 }
 
-/// One calendar-event field (`*`, `5`, `1,13`, `8..17`, `*/15`, `0/30`).
 fn parse_field(s: &str, max: u32) -> Option<Vec<u32>> {
     let mut out = Vec::new();
     for part in s.split(',') {
@@ -988,9 +933,6 @@ fn parse_field(s: &str, max: u32) -> Option<Vec<u32>> {
     Some(out)
 }
 
-/// Start times of a PVE calendar event as minutes from Monday 00:00, or `None`
-/// for a form this subset does not model (dates other than `*-*-*`, seconds
-/// steps), which is reported rather than guessed.
 pub fn schedule_starts(schedule: &str) -> Option<Vec<u32>> {
     let s = schedule.trim().to_ascii_lowercase();
     let all_days: Vec<u32> = (0..7).collect();
@@ -1035,12 +977,9 @@ pub fn schedule_starts(schedule: &str) -> Option<Vec<u32>> {
     Some(out)
 }
 
-// ── coverage + queue analysis ───────────────────────────────────────────────
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestRow {
     pub vmid: u64,
-    /// `qemu` or `lxc`.
     pub kind: String,
     pub node: String,
     pub name: Option<String>,
@@ -1049,7 +988,6 @@ pub struct GuestRow {
     pub pool: Option<String>,
 }
 
-/// Whether `job` selects `g`, ignoring `enabled`.
 pub fn selects(job: &BackupJob, g: &GuestRow) -> bool {
     if job.node.as_deref().is_some_and(|n| n != g.node) {
         return false;
@@ -1062,7 +1000,6 @@ pub fn selects(job: &BackupJob, g: &GuestRow) -> bool {
     }
 }
 
-/// Running, non-template guests no enabled job selects.
 pub fn uncovered<'a>(jobs: &[BackupJob], guests: &'a [GuestRow]) -> Vec<&'a GuestRow> {
     guests
         .iter()
@@ -1074,25 +1011,19 @@ pub fn uncovered<'a>(jobs: &[BackupJob], guests: &'a [GuestRow]) -> Vec<&'a Gues
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueOverlap {
     pub node: String,
-    /// Starts first; `second` queues behind it.
     pub first: String,
     pub second: String,
     pub gap_min: u32,
     pub window_min: u32,
-    /// `window_min` came from this node's task history, not the default.
     pub measured: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QueueReport {
     pub overlaps: Vec<QueueOverlap>,
-    /// `(job id, schedule)` that [`schedule_starts`] could not model.
     pub unparsed: Vec<(String, String)>,
 }
 
-/// Per node, enabled jobs that select at least one guest there and whose
-/// starts fall within that node's queue window of each other. `windows` is the
-/// longest recent vzdump run per node, in minutes.
 pub fn queue_overlaps(
     jobs: &[BackupJob],
     guests: &[GuestRow],
@@ -1129,8 +1060,6 @@ pub fn queue_overlaps(
         };
         for (i, a) in node_jobs.iter().enumerate() {
             for b in &node_jobs[i + 1..] {
-                // The pair's closest approach in either direction, across the
-                // week boundary.
                 let mut best: Option<(u32, bool)> = None;
                 for sa in &starts[a.id.as_str()] {
                     for sb in &starts[b.id.as_str()] {
@@ -1161,8 +1090,6 @@ pub fn queue_overlaps(
     report
 }
 
-/// Longest finished vzdump task in a `/nodes/{node}/tasks` listing, in whole
-/// minutes (rounded up).
 pub fn longest_vzdump_min(tasks: &Value) -> Option<u32> {
     tasks
         .as_array()?
@@ -1460,11 +1387,10 @@ pub fn finding_storage_unreadable(scope: &str, node: &str, storage: &str, err: &
     }
 }
 
-async fn diagnose_endpoint(cfg: &Config, endpoint: &str) -> Result<Vec<Finding>> {
-    let http = cfg.build_reqwest_client()?;
-    let jobs = parse_jobs(&raw_get_data(&http, &cfg.base_url, "cluster/backup").await?);
-    let guests = guest_rows(cluster_resources(&cfg.endpoint, Some("vm"))?);
-    let scope = crate::cluster::fetch_cluster_status(&cfg.endpoint)
+fn diagnose_endpoint(endpoint: &str) -> Result<Vec<Finding>> {
+    let jobs = fetch_jobs(endpoint)?;
+    let guests = guest_rows(cluster_resources(endpoint, Some("vm"))?);
+    let scope = crate::cluster::fetch_cluster_status(endpoint)
         .ok()
         .and_then(|s| s.name)
         .unwrap_or_else(|| endpoint.to_string());
@@ -1475,8 +1401,8 @@ async fn diagnose_endpoint(cfg: &Config, endpoint: &str) -> Result<Vec<Finding>>
     let mut windows = HashMap::new();
     let mut failures = Vec::new();
     for n in nodes {
-        let path = format!("nodes/{}/tasks?typefilter=vzdump&limit=100", enc(n));
-        match raw_get_data(&http, &cfg.base_url, &path).await {
+        let path = format!("nodes/{n}/tasks?typefilter=vzdump&limit=100");
+        match crate::api_path::get(endpoint, &path) {
             Ok(tasks) => {
                 if let Some(w) = longest_vzdump_min(&tasks) {
                     windows.insert(n.to_string(), w);
@@ -1501,12 +1427,8 @@ async fn diagnose_endpoint(cfg: &Config, endpoint: &str) -> Result<Vec<Finding>>
     }
     let mut newest = HashMap::new();
     for (node, storage) in listings {
-        let path = format!(
-            "nodes/{}/storage/{}/content?content=backup",
-            enc(&node),
-            enc(&storage)
-        );
-        match raw_get_data(&http, &cfg.base_url, &path).await {
+        let path = format!("nodes/{node}/storage/{storage}/content?content=backup");
+        match crate::api_path::get(endpoint, &path) {
             Ok(content) => {
                 newest.insert((node, storage), newest_backups(&content));
             }
@@ -1540,12 +1462,9 @@ async fn diagnose_endpoint(cfg: &Config, endpoint: &str) -> Result<Vec<Finding>>
     Ok(findings)
 }
 
-/// Coverage and queue findings for every enabled endpoint. Endpoints of one
-/// cluster report the same jobs and guests, so findings are keyed by cluster
-/// and deduplicated.
 pub async fn diagnose_backup_jobs() -> Vec<Finding> {
-    let mut findings = for_each_enabled_endpoint("diagnostics.backup_jobs", |cfg, ep| async move {
-        diagnose_endpoint(&cfg, &ep.name).await
+    let mut findings = for_each_enabled_endpoint("diagnostics.backup_jobs", |_, ep| async move {
+        diagnose_endpoint(&ep.name)
     })
     .await;
     let mut seen = std::collections::HashSet::new();
@@ -1560,7 +1479,6 @@ mod tests {
     use plugin_toolkit::serde_json::json;
     use std::sync::{Arc, Mutex};
 
-    /// Shape of a PVE 8 `/cluster/backup` listing.
     fn jobs_fixture() -> Value {
         json!([
             {"id": "backup-5fba7fbe", "type": "vzdump", "enabled": 1, "schedule": "sun 01:00",
@@ -1892,8 +1810,6 @@ mod tests {
         assert!(stale_backups(&jobs, &guests, &HashMap::new(), &HashMap::new(), now).is_empty());
     }
 
-    // ── HTTP-level tests against recorded PVE responses ───────────────────
-
     fn reply(status: u16, data: Value) -> String {
         let body = serde_json::to_vec(&json!({ "data": data })).unwrap();
         json!({
@@ -1904,16 +1820,6 @@ mod tests {
         .to_string()
     }
 
-    fn test_config() -> Config {
-        Config::new(
-            "https://10.0.0.5:8006/api2/json",
-            "orca@pve!orca",
-            "00000000-0000-0000-0000-000000000000",
-        )
-    }
-
-    /// Answer `http.request` by method + path; `responses` are consumed in
-    /// order per route so a re-read can differ from the first read.
     fn run_against<T>(
         routes: Vec<(&'static str, &'static str, Vec<String>)>,
         f: impl AsyncFnOnce() -> T,
@@ -1925,7 +1831,10 @@ mod tests {
             Box::new(move |cap: &str, raw: &str| {
                 let api = cap == "api.call";
                 let (method, url) = if api {
-                    let (method, path, _) = crate::test_support::api_call_route(raw);
+                    let (method, path, args) = crate::test_support::api_call_route(raw);
+                    log.lock()
+                        .unwrap()
+                        .push(json!({"method": method, "url": path, "args": args}));
                     (method, path)
                 } else {
                     assert_eq!(cap, "http.request");
@@ -1975,9 +1884,8 @@ mod tests {
         }
     }
 
-    fn body_of(req: &Value) -> String {
-        let bytes: Vec<u8> = serde_json::from_value(req["body"].clone()).unwrap();
-        String::from_utf8(bytes).unwrap()
+    fn body_of(req: &Value) -> Value {
+        req["args"]["body"].clone()
     }
 
     fn upsert_args(v: Value) -> BackupJobUpsertArgs {
@@ -1988,7 +1896,7 @@ mod tests {
     fn dry_run_upsert_returns_the_diff_and_never_writes() {
         let routes = vec![("GET", "/cluster/backup", vec![reply(200, jobs_fixture())])];
         let args = upsert_args(json!({"endpoint": "pve", "id": "backup-71860b8f"}));
-        let (res, seen) = run_against(routes, async || upsert(&test_config(), &args, None).await);
+        let (res, seen) = run_against(routes, async || upsert(&args, None).await);
         let Change::Plan(plan) = res.unwrap() else {
             panic!("expected a plan")
         };
@@ -2021,9 +1929,7 @@ mod tests {
             "endpoint": "pve", "id": "backup-old", "vmids": [116], "enabled": true,
             "execute": true,
         }));
-        let (res, seen) = run_against(routes, async || {
-            upsert(&test_config(), &args, Some(&admin())).await
-        });
+        let (res, seen) = run_against(routes, async || upsert(&args, Some(&admin())).await);
         let Change::Applied(out) = res.unwrap() else {
             panic!("expected applied")
         };
@@ -2034,10 +1940,10 @@ mod tests {
         );
         let put = seen.iter().find(|r| r["method"] == "PUT").unwrap();
         let body = body_of(put);
-        assert!(body.contains("vmid=116"), "{body}");
-        assert!(body.contains("enabled=1"), "{body}");
-        assert!(body.contains("prune-backups=keep-last%3D10"), "{body}");
-        assert!(body.contains("delete=all%2Cexclude"), "{body}");
+        assert_eq!(body["vmid"], "116", "{body}");
+        assert_eq!(body["enabled"], "1", "{body}");
+        assert_eq!(body["prune-backups"], "keep-last=10", "{body}");
+        assert_eq!(body["delete"], "all,exclude", "{body}");
     }
 
     #[test]
@@ -2050,20 +1956,15 @@ mod tests {
             "endpoint": "pve", "id": "ct116", "vmids": [116], "schedule": "sun 01:00",
             "storage": "pbs", "execute": true,
         }));
-        let (res, seen) = run_against(routes, async || {
-            upsert(&test_config(), &args, Some(&admin())).await
-        });
+        let (res, seen) = run_against(routes, async || upsert(&args, Some(&admin())).await);
         let Change::Applied(out) = res.unwrap() else {
             panic!("expected applied")
         };
         assert_eq!(out.action, "create");
         let post = seen.iter().find(|r| r["method"] == "POST").unwrap();
         let body = body_of(post);
-        assert!(body.starts_with("id=ct116"), "{body}");
-        assert!(
-            body.contains("schedule=sun%2001%3A00") || body.contains("schedule=sun+01%3A00"),
-            "{body}"
-        );
+        assert_eq!(body["id"], "ct116", "{body}");
+        assert_eq!(body["schedule"], "sun 01:00", "{body}");
     }
 
     #[test]
@@ -2072,7 +1973,7 @@ mod tests {
         let args = upsert_args(json!({
             "endpoint": "pve", "id": "backup-71860b8f", "execute": true,
         }));
-        let (res, seen) = run_against(routes, async || upsert(&test_config(), &args, None).await);
+        let (res, seen) = run_against(routes, async || upsert(&args, None).await);
         assert!(res.unwrap_err().to_string().contains("no caller identity"));
         assert!(seen.iter().all(|r| r["method"] == "GET"));
     }
@@ -2092,9 +1993,7 @@ mod tests {
             id: "backup-old".into(),
             execute: false,
         };
-        let (res, seen) = run_against(routes.clone(), async || {
-            delete(&test_config(), &plan_args, None).await
-        });
+        let (res, seen) = run_against(routes.clone(), async || delete(&plan_args, None).await);
         assert!(matches!(res.unwrap(), Change::Plan(p) if p.changes[0].action == "delete"));
         assert!(seen.iter().all(|r| r["method"] == "GET"));
 
@@ -2102,9 +2001,7 @@ mod tests {
             execute: true,
             ..plan_args
         };
-        let (res, seen) = run_against(routes, async || {
-            delete(&test_config(), &exec_args, Some(&admin())).await
-        });
+        let (res, seen) = run_against(routes, async || delete(&exec_args, Some(&admin())).await);
         assert!(matches!(res.unwrap(), Change::Applied(a) if a.action == "delete"));
         assert!(seen.iter().any(|r| r["method"] == "DELETE"));
     }
@@ -2117,7 +2014,7 @@ mod tests {
             id: "nope".into(),
             execute: false,
         };
-        let (res, _) = run_against(routes, async || delete(&test_config(), &args, None).await);
+        let (res, _) = run_against(routes, async || delete(&args, None).await);
         assert!(res.unwrap_err().to_string().contains("no vzdump job"));
     }
 
@@ -2164,9 +2061,7 @@ mod tests {
                 )],
             ),
         ];
-        let (res, seen) = run_against(routes, async || {
-            diagnose_endpoint(&test_config(), "pve").await
-        });
+        let (res, seen) = run_against(routes, async || diagnose_endpoint("pve"));
         let findings = res.unwrap();
         let ids: Vec<&str> = findings.iter().map(|f| f.id.as_str()).collect();
         assert!(ids.contains(&"backup-uncovered::lab::116"), "{ids:?}");
@@ -2226,9 +2121,7 @@ mod tests {
                 vec![reply(500, json!(null))],
             ),
         ];
-        let (res, _) = run_against(routes, async || {
-            diagnose_endpoint(&test_config(), "pve").await
-        });
+        let (res, _) = run_against(routes, async || diagnose_endpoint("pve"));
         let findings = res.unwrap();
         let ids: Vec<&str> = findings.iter().map(|f| f.id.as_str()).collect();
         assert!(ids.contains(&"backup-stale::lab::110"), "{ids:?}");
