@@ -16,7 +16,7 @@
 use plugin_toolkit::prelude::*;
 
 use crate::Config;
-use crate::generated;
+use plugin_toolkit::api;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // proxmox.{list,detail,create,update,delete} — endpoint registry CRUD.
@@ -64,20 +64,22 @@ impl From<crate::ProxmoxActionResult> for ProxmoxActionResult {
 
 /// Resolve a registered endpoint into a ready [`Config`]: the first reachable
 /// base URL (`resolve_reachable` over the endpoint's `routes` fallback list)
-/// plus the secure-first token secret. Single place both the generated client
-/// and the topology/roster reqwest paths flow through.
+/// plus the secure-first token secret, tagged with the endpoint name
+/// `api::call` keys on. Single place the raw reqwest paths flow through.
 pub(crate) async fn resolve_config(name: &str) -> Result<Config> {
     let row = endpoint_db::require(name)?;
     let secret = resolve_token_secret(name, &row)?;
     // Endpoints are registered as the bare host root (e.g. `https://host:8006`),
     // which is also what the reachability probe hits. The PVE REST API lives
-    // under `/api2/json`; both the generated client and the hand-rolled
-    // `fetch_guest_config`/topology paths join their `/nodes/...` routes onto
+    // under `/api2/json`; the hand-rolled `fetch_guest_config`/topology
+    // paths join their `/nodes/...` routes onto
     // `Config::base_url`, so promote the reachable root to the API root here.
     // Idempotent: an address already ending in `/api2/json` is left as-is.
     let reachable = route::resolve_reachable(name, &row.routes, row.insecure).await?;
     let base_url = api_root(&reachable);
-    Ok(Config::new(base_url, row.token_id, secret).insecure(row.insecure))
+    Ok(Config::new(base_url, row.token_id, secret)
+        .insecure(row.insecure)
+        .endpoint(name))
 }
 
 /// Promote a bare PVE host URL to its REST API root (`.../api2/json`),
@@ -89,10 +91,6 @@ fn api_root(base: &str) -> String {
     } else {
         format!("{trimmed}/api2/json")
     }
-}
-
-pub(crate) async fn make_client(name: &str) -> Result<generated::Client> {
-    Ok(resolve_config(name).await?.build_generated_client()?)
 }
 
 /// An enabled endpoint the fan-out could not read.
@@ -119,9 +117,8 @@ pub(crate) struct FanOut<T> {
 /// `warn!`, recorded in [`FanOut::failures`], and skipped: one flaky host must
 /// never blank the fleet-wide view.
 ///
-/// `work` receives a ready `Config` (call `build_generated_client()` for the
-/// typed client, or `build_reqwest_client()` for the raw path) plus the
-/// endpoint row. `op` is a short label for the log lines.
+/// `work` receives a ready `Config` (`cfg.endpoint` for `api::call`, or
+/// `build_reqwest_client()` for the raw path) plus the endpoint row. `op` is a short label for the log lines.
 pub(crate) async fn fan_out_enabled_endpoints<T, F, Fut>(op: &str, work: F) -> FanOut<T>
 where
     F: Fn(Config, ProxmoxEndpoint) -> Fut,
@@ -245,21 +242,10 @@ pub struct ProxmoxNodeRow {
     role = "read"
 )]
 async fn proxmox_nodes(args: ProxmoxNodesArgs, _ctx: &ToolCtx) -> Result<Vec<ProxmoxNodeRow>> {
-    let client = make_client(&args.endpoint).await?;
-    let items = client
-        .get_index_nodes()
-        .await
-        .map_err(|e| anyhow::anyhow!("proxmox.nodes: {e}"))?
-        .into_inner();
-    Ok(items
-        .into_iter()
-        .map(|n| ProxmoxNodeRow {
-            node: n.node,
-            status: Some(n.status.to_string()),
-            uptime: n.uptime,
-            cpu: n.cpu,
-        })
-        .collect())
+    let items: Vec<ProxmoxNodeRow> =
+        api::call("proxmox.get_index_nodes", &args.endpoint, json!({}))
+            .map_err(|e| anyhow::anyhow!("proxmox.nodes: {e}"))?;
+    Ok(items)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -304,37 +290,20 @@ async fn proxmox_node_detail(
     args: ProxmoxNodeDetailArgs,
     _ctx: &ToolCtx,
 ) -> Result<ProxmoxNodeDetailOutput> {
-    let client = make_client(&args.endpoint).await?;
-    let vms = client
-        .get_vmlist_nodes_node_qemu(&args.node, None)
-        .await
-        .map_err(|e| anyhow::anyhow!("proxmox.node_detail vms: {e}"))?
-        .into_inner();
-    let containers = client
-        .get_vmlist_nodes_node_lxc(&args.node)
-        .await
-        .map_err(|e| anyhow::anyhow!("proxmox.node_detail containers: {e}"))?
-        .into_inner();
+    let node = json!({ "node": args.node });
+    let vms: Vec<ProxmoxGuestRow> = api::call(
+        "proxmox.get_vmlist_nodes_node_qemu",
+        &args.endpoint,
+        node.clone(),
+    )
+    .map_err(|e| anyhow::anyhow!("proxmox.node_detail vms: {e}"))?;
+    let containers: Vec<ProxmoxGuestRow> =
+        api::call("proxmox.get_vmlist_nodes_node_lxc", &args.endpoint, node)
+            .map_err(|e| anyhow::anyhow!("proxmox.node_detail containers: {e}"))?;
     Ok(ProxmoxNodeDetailOutput {
-        node: args.node.clone(),
-        vms: vms
-            .into_iter()
-            .map(|v| ProxmoxGuestRow {
-                vmid: v.vmid as u64,
-                name: v.name,
-                status: Some(v.status.to_string()),
-                uptime: v.uptime,
-            })
-            .collect(),
-        containers: containers
-            .into_iter()
-            .map(|c| ProxmoxGuestRow {
-                vmid: c.vmid as u64,
-                name: c.name,
-                status: Some(c.status.to_string()),
-                uptime: c.uptime,
-            })
-            .collect(),
+        node: args.node,
+        vms,
+        containers,
     })
 }
 
@@ -361,20 +330,38 @@ pub struct ProxmoxActionArgs {
 
 /// [MUTATES STATE] Run a lifecycle action against one VM (`vmid`) or
 /// container (`ctid`) on the named node.
-#[orca_tool(domain = "proxmox", verb = "action", role = "admin")]
+#[orca_tool(
+    domain = "proxmox",
+    verb = "action",
+    role = "admin",
+    reaches = [
+        "proxmox.post_vm_start_nodes_node_qemu_vmid_status_start",
+        "proxmox.post_vm_stop_nodes_node_qemu_vmid_status_stop",
+        "proxmox.post_vm_shutdown_nodes_node_qemu_vmid_status_shutdown",
+        "proxmox.post_vm_reboot_nodes_node_qemu_vmid_status_reboot",
+        "proxmox.post_vm_start_nodes_node_lxc_vmid_status_start",
+        "proxmox.post_vm_stop_nodes_node_lxc_vmid_status_stop",
+        "proxmox.post_vm_shutdown_nodes_node_lxc_vmid_status_shutdown",
+        "proxmox.post_vm_reboot_nodes_node_lxc_vmid_status_reboot"
+    ]
+)]
 async fn proxmox_action(args: ProxmoxActionArgs, ctx: &ToolCtx) -> Result<ProxmoxActionResult> {
     crate::execute::require_admin("proxmox.action", ctx.caller().as_ref())?;
     if args.vmid.is_some() && args.ctid.is_some() {
         bail!("set either `vmid` or `ctid`, not both");
     }
     let action: crate::ProxmoxAction = args.action.parse()?;
-    let client = make_client(&args.endpoint).await?;
     let (vmid, is_lxc) = match (args.vmid, args.ctid) {
         (Some(v), None) => (v, false),
         (None, Some(c)) => (c, true),
         _ => bail!("`vmid` or `ctid` required"),
     };
-    let upid = run_lifecycle(&client, &args.node, vmid, is_lxc, action).await?;
+    let kind = if is_lxc {
+        crate::GuestKind::Lxc
+    } else {
+        crate::GuestKind::Qemu
+    };
+    let upid = crate::run_lifecycle(&args.endpoint, &args.node, kind, vmid, action)?;
     Ok(ProxmoxActionResult {
         node: args.node,
         vmid,
@@ -382,72 +369,6 @@ async fn proxmox_action(args: ProxmoxActionArgs, ctx: &ToolCtx) -> Result<Proxmo
         upid: Some(upid),
         status: 200,
     })
-}
-
-async fn run_lifecycle(
-    client: &generated::Client,
-    node: &str,
-    vmid: u64,
-    is_lxc: bool,
-    action: crate::ProxmoxAction,
-) -> Result<String> {
-    let vmid_i = vmid as i64;
-    let upid = match (is_lxc, action) {
-        (false, crate::ProxmoxAction::Start) => client
-            .post_vm_start_nodes_node_qemu_vmid_status_start(node, vmid_i, &Default::default())
-            .await
-            .map_err(|e| anyhow::anyhow!("qemu start {vmid}: {e}"))?
-            .into_inner(),
-        (false, crate::ProxmoxAction::Stop) => client
-            .post_vm_stop_nodes_node_qemu_vmid_status_stop(node, vmid_i, &Default::default())
-            .await
-            .map_err(|e| anyhow::anyhow!("qemu stop {vmid}: {e}"))?
-            .into_inner(),
-        (false, crate::ProxmoxAction::Shutdown) => client
-            .post_vm_shutdown_nodes_node_qemu_vmid_status_shutdown(
-                node,
-                vmid_i,
-                &Default::default(),
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("qemu shutdown {vmid}: {e}"))?
-            .into_inner(),
-        (false, crate::ProxmoxAction::Reboot) => client
-            .post_vm_reboot_nodes_node_qemu_vmid_status_reboot(node, vmid_i, &Default::default())
-            .await
-            .map_err(|e| anyhow::anyhow!("qemu reboot {vmid}: {e}"))?
-            .into_inner(),
-        (true, crate::ProxmoxAction::Start) => client
-            .post_vm_start_nodes_node_lxc_vmid_status_start(node, vmid_i, &Default::default())
-            .await
-            .map_err(|e| anyhow::anyhow!("lxc start {vmid}: {e}"))?
-            .into_inner(),
-        (true, crate::ProxmoxAction::Stop) => client
-            .post_vm_stop_nodes_node_lxc_vmid_status_stop(node, vmid_i, &Default::default())
-            .await
-            .map_err(|e| anyhow::anyhow!("lxc stop {vmid}: {e}"))?
-            .into_inner(),
-        (true, crate::ProxmoxAction::Shutdown) => client
-            .post_vm_shutdown_nodes_node_lxc_vmid_status_shutdown(node, vmid_i, &Default::default())
-            .await
-            .map_err(|e| anyhow::anyhow!("lxc shutdown {vmid}: {e}"))?
-            .into_inner(),
-        (true, crate::ProxmoxAction::Reboot) => client
-            .post_vm_reboot_nodes_node_lxc_vmid_status_reboot(node, vmid_i, &Default::default())
-            .await
-            .map_err(|e| anyhow::anyhow!("lxc reboot {vmid}: {e}"))?
-            .into_inner(),
-    };
-    Ok(upid)
-}
-
-// Backwards-compat: the action tool builds a `crate::ProxmoxActionResult`-
-// shaped value then converts via `From`. Keep the conversion working by
-// providing the obvious identity build path above without forcing the
-// caller to import the crate-level type.
-impl ProxmoxActionResult {
-    // Avoid an unused-impl footgun: the From impl above is the only
-    // construction path, so no additional helpers needed here.
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -490,14 +411,13 @@ async fn proxmox_host_logs(
     args: ProxmoxHostLogsArgs,
     _ctx: &ToolCtx,
 ) -> Result<crate::responses::JournalResponse> {
-    let client = make_client(&args.endpoint).await?;
     let q = crate::responses::JournalQuery {
         since: args.since,
         until: args.until,
         lastentries: args.lastentries,
         service: args.service,
     };
-    Ok(crate::fetch_journal(&client, &args.node, q).await?)
+    Ok(crate::fetch_journal(&args.endpoint, &args.node, q)?)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -566,8 +486,7 @@ async fn proxmox_cluster_status(
     args: ProxmoxClusterStatusArgs,
     _ctx: &ToolCtx,
 ) -> Result<ProxmoxClusterStatusOutput> {
-    let client = make_client(&args.endpoint).await?;
-    let status = crate::cluster::fetch_cluster_status(&client).await?;
+    let status = crate::cluster::fetch_cluster_status(&args.endpoint)?;
     Ok(status.into())
 }
 
@@ -596,8 +515,7 @@ async fn proxmox_cluster_list(
 ) -> Result<Vec<ProxmoxClusterListEntry>> {
     Ok(
         for_each_enabled_endpoint("cluster_list", |cfg, ep| async move {
-            let client = cfg.build_generated_client()?;
-            let status = crate::cluster::fetch_cluster_status(&client).await?;
+            let status = crate::cluster::fetch_cluster_status(&cfg.endpoint)?;
             Ok(vec![ProxmoxClusterListEntry {
                 endpoint: ep.name,
                 status: status.into(),

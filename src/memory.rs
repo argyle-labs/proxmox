@@ -577,9 +577,7 @@ pub(crate) async fn guard_create(
 pub async fn diagnose_memory() -> Vec<Finding> {
     let mut findings = for_each_enabled_endpoint("diagnostics.memory", |cfg, ep| async move {
         let t = MemoryThresholds::default();
-        let client = cfg.build_generated_client()?;
-        let scope = crate::cluster::fetch_cluster_status(&client)
-            .await
+        let scope = crate::cluster::fetch_cluster_status(&cfg.endpoint)
             .ok()
             .and_then(|s| s.name)
             .unwrap_or_else(|| ep.name.clone());

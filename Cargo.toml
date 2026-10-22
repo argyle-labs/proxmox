@@ -21,11 +21,10 @@ crate-type = ["rlib"]
 name = "proxmox"
 path = "src/main.rs"
 
-# Proxmox VE plugin. Typed client codegenned by progenitor from the vendored
-# upstream spec (`specs/proxmox.openapi.json`, derived from a cluster node's
-# `apidoc.js`). `build.rs` runs `plugin_toolkit_build::openapi::generate_all`
-# over the whole spec. Refresh by overwriting `specs/apidoc.js` +
-# `specs/proxmox.openapi.json`.
+# Proxmox VE plugin. `build.rs` turns the vendored upstream spec
+# (`specs/proxmox.openapi.json`, derived from a cluster node's `apidoc.js`) into
+# the api-surface table orca core's executor runs every `api::call` against.
+# Refresh by overwriting `specs/apidoc.js` + `specs/proxmox.openapi.json`.
 #
 # Beyond its tool surface, this plugin contributes three domain backends over the
 # subprocess wire protocol (see `src/registration.rs` + `src/main.rs`): a
@@ -43,23 +42,17 @@ path = "src/main.rs"
 # api_client / http / urlencoding / futures_util / reqwest / tokio) is
 # re-exported by the toolkit + its prelude.
 #
-# CI builds `--locked`.
-# Thin profile: `delegated-http` retargets the progenitor-generated client onto
-# orca's `http.request` capability, so this plugin links NO reqwest/rustls/hyper/
-# progenitor-client. `default-features = false` drops the real `http`/`openapi`
-# stacks; `tools` (orca_tool anchors) + `db` (thin endpoint_resource CRUD over
-# db_op) + `containers` (the domain proxmox registers) + `delegated-http` are all
-# it needs. `secrets`/`serve`/`storage` are always-on. See [[plugins-stay-thin]].
-plugin-toolkit = { version = "=0.2.1-rc.33", registry = "gitea", package = "orca-plugin-toolkit", default-features = false, features = ["tools", "db", "containers", "delegated-http"] }
+# CI builds `--locked`. Thin profile: typed API ops go through core's executor
+# (`api::call`); `delegated-http` carries the remaining raw-URL calls over orca's
+# `http.request` capability, so this plugin links NO reqwest/rustls/hyper.
+# `default-features = false` drops the real `http`/`openapi` stacks; `tools`
+# (orca_tool anchors) + `db` (thin endpoint_resource CRUD over db_op) +
+# `containers` (the domain proxmox registers) + `delegated-http` are all it
+# needs. `secrets`/`serve`/`storage` are always-on. See [[plugins-stay-thin]].
+plugin-toolkit = { version = "=0.2.1-rc.35", registry = "gitea", package = "orca-plugin-toolkit", default-features = false, features = ["tools", "db", "containers", "delegated-http"] }
 
-# Light, genuinely-external deps the plugin's own source + generated client still
-# name at the crate root. The toolkit-build codegen (`rewrite_codegen_paths`)
-# redirects progenitor's `::serde`/`::serde_json`/`::reqwest`/`::progenitor_client`/
-# `::chrono`/`::uuid`/`::regress`/`::bytes` to `::plugin_toolkit::*`, so those are
-# NOT direct deps — the delegated shims + always-on chrono/uuid/regress supply
-# them. `thiserror` is NOT rewritten (generated code emits bare `::thiserror`), and
-# the hand-written source uses `serde`/`serde_json` derives directly, so those three
-# stay. None drags a transitive heavyweight.
+# Light, genuinely-external deps the plugin source names at the crate root. None
+# drags a transitive heavyweight.
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 thiserror   = "2"
@@ -88,18 +81,17 @@ sha2        = "0.10"
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
 # Spec-refresh tool only (examples/pve_to_openapi.rs + spec-tools/from_pve.rs):
 # parse Proxmox's `apidoc.js` dialect into an `openapiv3` document. Proxmox-
-# specific, so it lives here, not in orca's generic `openapi` crate. The
-# build-time normalize → progenitor pass (build.rs) handles the rest.
+# specific, so it lives here, not in orca's generic `openapi` crate.
 openapiv3 = "2"
 indexmap  = "2"
 anyhow    = "1"
 # PVE's own inittab getty regex, run in the guest-standard tests.
 regex     = "1"
-openapi   = { version = "=0.2.1-rc.33", registry = "gitea", package = "orca-openapi" }
+openapi   = { version = "=0.2.1-rc.35", registry = "gitea", package = "orca-openapi" }
 
 [build-dependencies]
-plugin-toolkit-build = { version = "=0.2.1-rc.33", registry = "gitea", package = "orca-plugin-toolkit-build" }
-openapi = { version = "=0.2.1-rc.33", registry = "gitea", package = "orca-openapi" }
+plugin-toolkit-build = { version = "=0.2.1-rc.35", registry = "gitea", package = "orca-plugin-toolkit-build" }
+openapi = { version = "=0.2.1-rc.35", registry = "gitea", package = "orca-openapi" }
 
 # Match orca's workspace lint floor: discarding a Result/Option via
 # `let _ = ...` was a load-bearing past incident, so keep it a hard error here

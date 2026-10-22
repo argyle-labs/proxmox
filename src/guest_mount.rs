@@ -34,7 +34,6 @@ use plugin_toolkit::storage::{GuestMountSpec, MountHealth, parse_option_string};
 use serde::Deserialize;
 
 use crate::Config;
-use crate::generated::{self, types as gtypes};
 
 /// Invoke-name prefix for this domain's ops (`proxmox.__guest_mount.*`).
 pub const GM_PREFIX: &str = "proxmox.__guest_mount";
@@ -865,8 +864,7 @@ impl PveIo {
         for name in names {
             let found = async {
                 let cfg = crate::tools::resolve_config(&name).await?;
-                let ct =
-                    crate::lxc_guest::find_ct_opt(&cfg.build_generated_client()?, vmid).await?;
+                let ct = crate::lxc_guest::find_ct_opt(&name, vmid)?;
                 Ok::<_, plugin_toolkit::anyhow::Error>((cfg, ct))
             }
             .await;
@@ -912,22 +910,19 @@ pub(crate) async fn root_client(endpoint: &str, cfg: &Config) -> Result<reqwest:
     let anon = plugin_toolkit::api_client::ApiClientBuilder::new()
         .build()
         .map_err(|e| format!("http client: {e:#}"))?;
-    let body = gtypes::PostCreateTicketAccessTicketBody {
-        new_format: None,
-        otp: None,
-        password,
-        path: None,
-        privs: None,
-        realm: None,
-        tfa_challenge: None,
-        username: ROOT_USER.parse().map_err(|e| format!("{ROOT_USER}: {e}"))?,
-    };
-    let ticket = generated::Client::new_with_client(&cfg.base_url, anon)
-        .post_create_ticket_access_ticket(&body)
-        .await
-        .map_err(|e| format!("{ROOT_USER} login on endpoint '{}': {e}", endpoint))?
-        .into_inner();
-    let (ticket, csrf) = root_session(endpoint, ticket.ticket, ticket.csrf_prevention_token)?;
+    let url = format!("{}/access/ticket", cfg.base_url.trim_end_matches('/'));
+    let ticket = crate::backup::post_form_data(
+        &anon,
+        &url,
+        &[
+            ("username".to_string(), ROOT_USER.to_string()),
+            ("password".to_string(), password),
+        ],
+    )
+    .await
+    .map_err(|e| format!("{ROOT_USER} login on endpoint '{}': {e:#}", endpoint))?;
+    let field = |k: &str| ticket.get(k).and_then(Value::as_str).map(String::from);
+    let (ticket, csrf) = root_session(endpoint, field("ticket"), field("CSRFPreventionToken"))?;
     plugin_toolkit::api_client::ApiClientBuilder::new()
         .header("cookie", format!("PVEAuthCookie={ticket}"))
         .and_then(|b| b.header("csrfpreventiontoken", csrf))

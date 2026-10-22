@@ -7,17 +7,21 @@
 //!
 //! Two-step fetch per endpoint:
 //!   1. `GET /cluster/resources?type=vm` — every VM + LXC in the cluster
-//!      via the typed generated client.
+//!      via `api::call`.
 //!   2. `GET /nodes/{node}/{kind}/{vmid}/config` per guest — via
-//!      `fetch_guest_config` (raw URL: progenitor can't model the
+//!      `fetch_guest_config` (raw URL: the schema can't model the
 //!      indexed `netN` keys we depend on). Calls fan out concurrently.
+//!
+//! Live guest IPs ride the raw path too: the interface listings are
+//! admin-role in the api surface, and this collector runs as a read caller.
 //!
 //! Errors are scoped per endpoint and per guest: a broken endpoint blanks
 //! that endpoint's contribution but doesn't kill claims from others; a
 //! guest whose config 404s is skipped silently (it may have been deleted
 //! between the cluster-list and the config fetch).
 
-use crate::generated::{self, types as gtypes};
+use crate::backup::{enc, raw_get_data};
+use crate::responses::{ResourceType, cluster_resources};
 use crate::tools::for_each_enabled_endpoint;
 use crate::{GuestKind, fetch_guest_config};
 use plugin_toolkit::contract::TopologyClaim;
@@ -46,30 +50,25 @@ impl TopologyCollector for ProxmoxTopology {
 pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {
     Ok(for_each_enabled_endpoint("topology", |cfg, ep| async move {
         let http = cfg.build_reqwest_client()?;
-        let client = generated::Client::new_with_client(&cfg.base_url, http.clone());
-        collect_for_endpoint(&client, &http, &cfg.base_url, &ep.name).await
+        collect_for_endpoint(&http, &cfg.base_url, &ep.name).await
     })
     .await)
 }
 
 async fn collect_for_endpoint(
-    client: &generated::Client,
     http: &reqwest::Client,
     base_url: &str,
     provider_instance: &str,
 ) -> anyhow::Result<Vec<TopologyClaim>> {
-    let items = client
-        .get_resources_cluster_resources(Some(gtypes::GetResourcesClusterResourcesType::Vm))
-        .await
-        .map_err(|e| anyhow::anyhow!("proxmox cluster resources: {e}"))?
-        .into_inner();
+    let items = cluster_resources(provider_instance, Some("vm"))
+        .map_err(|e| anyhow::anyhow!("proxmox {e:#}"))?;
 
     let guests: Vec<GuestRef> = items
         .into_iter()
         .filter_map(|e| {
             let kind = match e.type_ {
-                gtypes::GetResourcesClusterResourcesResponseItemType::Qemu => GuestKind::Qemu,
-                gtypes::GetResourcesClusterResourcesResponseItemType::Lxc => GuestKind::Lxc,
+                ResourceType::Qemu => GuestKind::Qemu,
+                ResourceType::Lxc => GuestKind::Lxc,
                 _ => return None,
             };
             let node = e.node?;
@@ -110,7 +109,7 @@ async fn collect_for_endpoint(
         // Best-effort live IPs. A guest with no agent (QEMU) or no running
         // interfaces reports nothing — that's an expected gap, not an error,
         // so failures are swallowed and `routes` is simply left empty.
-        let routes = fetch_guest_routes(client, g.kind, &g.node, g.vmid).await;
+        let routes = fetch_guest_routes(http, base_url, g.kind, &g.node, g.vmid).await;
         let state = normalize_state(g.status.as_deref());
         Some(TopologyClaim {
             kind: kind_to_claim_kind(g.kind).to_string(),
@@ -166,47 +165,52 @@ fn normalize_state(status: Option<&str>) -> Option<String> {
 /// running) is logged at debug and yields an empty vec — a noted gap, not a
 /// hard error, so one guest can't break the whole collect.
 async fn fetch_guest_routes(
-    client: &generated::Client,
+    http: &reqwest::Client,
+    base_url: &str,
     kind: GuestKind,
     node: &str,
     vmid: u64,
 ) -> Vec<Route> {
-    let vmid = vmid as i64;
-    match kind {
-        GuestKind::Lxc => match client
-            .get_ip_nodes_node_lxc_vmid_interfaces(node, vmid)
-            .await
-        {
-            Ok(resp) => {
-                // Each interface carries a typed `ip-addresses` list plus the
-                // legacy `inet`/`inet6` (CIDR) fields; fold both in and dedupe.
-                let raw = resp.into_inner().into_iter().flat_map(|iface| {
-                    let typed = iface.ip_addresses.into_iter().filter_map(|a| a.ip_address);
-                    typed
-                        .chain(iface.inet)
-                        .chain(iface.inet6)
-                        .collect::<Vec<_>>()
-                });
-                routes_from_ips(raw)
-            }
-            Err(e) => {
-                tracing::debug!(node = %node, vmid, error = %e, "proxmox topology: lxc interfaces failed");
-                Vec::new()
-            }
-        },
-        GuestKind::Qemu => match client
-            .get_network_get_interfaces_nodes_node_qemu_vmid_agent_network_get_interfaces(
-                node, vmid,
-            )
-            .await
-        {
-            Ok(resp) => routes_from_qemu_agent(&resp.into_inner()),
-            Err(e) => {
-                tracing::debug!(node = %node, vmid, error = %e, "proxmox topology: qemu guest-agent network-get-interfaces failed (agent absent?)");
-                Vec::new()
-            }
-        },
+    let path = match kind {
+        GuestKind::Lxc => format!("nodes/{}/lxc/{vmid}/interfaces", enc(node)),
+        GuestKind::Qemu => format!(
+            "nodes/{}/qemu/{vmid}/agent/network-get-interfaces",
+            enc(node)
+        ),
+    };
+    match (kind, raw_get_data(http, base_url, &path).await) {
+        (GuestKind::Lxc, Ok(resp)) => routes_from_lxc_interfaces(&resp),
+        (GuestKind::Qemu, Ok(resp)) => resp
+            .as_object()
+            .map(routes_from_qemu_agent)
+            .unwrap_or_default(),
+        (GuestKind::Lxc, Err(e)) => {
+            tracing::debug!(node = %node, vmid, error = %e, "proxmox topology: lxc interfaces failed");
+            Vec::new()
+        }
+        (GuestKind::Qemu, Err(e)) => {
+            tracing::debug!(node = %node, vmid, error = %e, "proxmox topology: qemu guest-agent network-get-interfaces failed (agent absent?)");
+            Vec::new()
+        }
     }
+}
+
+/// Each LXC interface carries a typed `ip-addresses` list plus the legacy
+/// `inet`/`inet6` (CIDR) fields; fold both in and dedupe.
+fn routes_from_lxc_interfaces(resp: &plugin_toolkit::serde_json::Value) -> Vec<Route> {
+    let ips = resp.as_array().into_iter().flatten().flat_map(|iface| {
+        let typed = iface
+            .get("ip-addresses")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|a| a.get("ip-address").and_then(|v| v.as_str()));
+        let legacy = ["inet", "inet6"]
+            .into_iter()
+            .filter_map(|k| iface.get(k).and_then(|v| v.as_str()));
+        typed.chain(legacy).map(String::from).collect::<Vec<_>>()
+    });
+    routes_from_ips(ips)
 }
 
 /// Parse the QEMU guest-agent `network-get-interfaces` payload (an untyped

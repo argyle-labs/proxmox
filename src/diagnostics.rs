@@ -21,7 +21,7 @@
 //!
 //! LXC guests have no guest agent, so they are not diagnosed here.
 
-use crate::generated::{self, types as gtypes};
+use crate::responses::{ResourceType, cluster_resources};
 use crate::tools::{for_each_enabled_endpoint, resolve_config};
 use crate::{GuestKind, fetch_guest_config, responses::GuestConfigData};
 use plugin_toolkit::abi::BackendDef;
@@ -56,6 +56,7 @@ impl DiagnosticsProvider for ProxmoxDiagnostics {
 /// [`ProxmoxDiagnostics`] facet on the `Plugin` builder instead.
 pub const DIAG_PREFIX: &str = "proxmox.__diagnostics";
 const PROVIDER: &str = "proxmox";
+pub const ENABLE_AGENT_OP: &str = "proxmox.put_update_vm_nodes_node_qemu_vmid_config";
 
 /// The `diagnostics` backend descriptor this plugin advertises.
 pub fn diagnostics_backend_def() -> BackendDef {
@@ -296,19 +297,11 @@ fn finding_host_workload(node: &str, label: &str) -> Finding {
 async fn diagnose_qemu_agents(_args: DiagnoseArgs) -> Vec<Finding> {
     for_each_enabled_endpoint("diagnostics.qemu_agent", |cfg, ep| async move {
         let http = cfg.build_reqwest_client()?;
-        let client = generated::Client::new_with_client(&cfg.base_url, http.clone());
-        let items = client
-            .get_resources_cluster_resources(Some(gtypes::GetResourcesClusterResourcesType::Vm))
-            .await
-            .map_err(|e| anyhow::anyhow!("cluster resources: {e}"))?
-            .into_inner();
+        let items = cluster_resources(&cfg.endpoint, Some("vm"))?;
 
         let mut findings = Vec::new();
         for e in items {
-            if !matches!(
-                e.type_,
-                gtypes::GetResourcesClusterResourcesResponseItemType::Qemu
-            ) {
+            if !matches!(e.type_, ResourceType::Qemu) {
                 continue;
             }
             if e.template.unwrap_or(false) {
@@ -344,10 +337,12 @@ async fn diagnose_qemu_agents(_args: DiagnoseArgs) -> Vec<Finding> {
             // Only ping when the config says the agent should be up; a ping to a
             // config-disabled agent always fails and would be noise.
             let ping_ok = if enabled {
-                client
-                    .post_ping_nodes_node_qemu_vmid_agent_ping(&node, vmid as i64)
-                    .await
-                    .is_ok()
+                let url = format!(
+                    "{}/nodes/{}/qemu/{vmid}/agent/ping",
+                    cfg.base_url.trim_end_matches('/'),
+                    crate::backup::enc(&node)
+                );
+                crate::backup::post_form(&http, &url, &[]).await.is_ok()
             } else {
                 false
             };
@@ -744,16 +739,12 @@ pub async fn repair(args: RepairArgs) -> RepairOutcome {
 
 /// Set `agent: 1` on a VM's config via the PVE API.
 async fn enable_agent(endpoint: &str, node: &str, vmid: u64) -> anyhow::Result<()> {
-    let cfg = resolve_config(endpoint).await?;
-    let client = cfg.build_generated_client()?;
-    let body = gtypes::PutUpdateVmNodesNodeQemuVmidConfigBody {
-        agent: Some("1".to_string()),
-        ..Default::default()
-    };
-    client
-        .put_update_vm_nodes_node_qemu_vmid_config(node, vmid as i64, &body)
-        .await
-        .map_err(|e| anyhow::anyhow!("PUT vm config: {e}"))?;
+    plugin_toolkit::api::call::<serde_json::Value>(
+        ENABLE_AGENT_OP,
+        endpoint,
+        serde_json::json!({ "node": node, "vmid": vmid, "body": { "agent": "1" } }),
+    )
+    .map_err(|e| e.context("PUT vm config"))?;
     Ok(())
 }
 

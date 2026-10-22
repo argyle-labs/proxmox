@@ -243,26 +243,15 @@ fn decode_backup(args_json: &str) -> Result<(String, String)> {
 /// endpoint. One `/cluster/resources` call per endpoint keeps this cheap enough
 /// for the bridge's synchronous `instances` call.
 async fn guest_instances(kind: GuestKind) -> Result<String> {
-    use crate::generated::types as gtypes;
+    use crate::responses::ResourceType;
     let want = match kind {
-        GuestKind::Qemu => gtypes::GetResourcesClusterResourcesResponseItemType::Qemu,
-        GuestKind::Lxc => gtypes::GetResourcesClusterResourcesResponseItemType::Lxc,
+        GuestKind::Qemu => ResourceType::Qemu,
+        GuestKind::Lxc => ResourceType::Lxc,
     };
     let mut ids = Vec::new();
     for name in crate::tools::enabled_endpoint_names() {
-        let cfg = match crate::tools::resolve_config(&name).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(endpoint = %name, error = %e, "backup instances: resolve failed");
-                continue;
-            }
-        };
-        let client = cfg.build_generated_client()?;
-        let items = match client
-            .get_resources_cluster_resources(Some(gtypes::GetResourcesClusterResourcesType::Vm))
-            .await
-        {
-            Ok(r) => r.into_inner(),
+        let items = match crate::responses::cluster_resources(&name, Some("vm")) {
+            Ok(r) => r,
             Err(e) => {
                 tracing::warn!(endpoint = %name, error = %e, "backup instances: cluster resources failed");
                 continue;
@@ -287,8 +276,7 @@ async fn guest_instances(kind: GuestKind) -> Result<String> {
 }
 
 /// Capture one guest's raw config object to `payload_dir/config.json`. The raw
-/// endpoint (vs the generated client) preserves indexed keys — `net0`, `mp0`,
-/// … — that progenitor collapses.
+/// endpoint preserves indexed keys (`net0`, `mp0`, …) the schema collapses.
 async fn guest_backup(kind: GuestKind, instance: &str, dir: &str) -> Result<String> {
     let (node, vmid) = parse_instance(instance)?;
     let (cfg, _) = resolve_endpoint_for_node(&node).await?;

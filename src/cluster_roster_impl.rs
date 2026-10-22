@@ -44,8 +44,7 @@ impl ClusterRoster for ProxmoxClusterRoster {
     async fn list_clusters(&self) -> anyhow::Result<Vec<ClusterEntry>> {
         Ok(
             for_each_enabled_endpoint("list_clusters", |cfg, ep| async move {
-                let client = cfg.build_generated_client()?;
-                let s = crate::cluster::fetch_cluster_status(&client).await?;
+                let s = crate::cluster::fetch_cluster_status(&cfg.endpoint)?;
                 Ok(vec![ClusterEntry {
                     endpoint: ep.name,
                     name: s.name,

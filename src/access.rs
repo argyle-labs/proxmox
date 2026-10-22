@@ -24,8 +24,9 @@
 
 use plugin_toolkit::prelude::*;
 
-use crate::generated::{self, types as gtypes};
-use crate::tools::{ProxmoxEndpoint, endpoint_db, make_client, token_secret_name};
+use crate::tools::{ProxmoxEndpoint, endpoint_db, token_secret_name};
+use plugin_toolkit::api;
+use plugin_toolkit::serde_json::Value;
 
 /// Least-privilege role granted to the runtime identity. Full guest lifecycle
 /// (create/delete included, per the chosen scope) but no access-management or
@@ -61,140 +62,129 @@ pub struct ProvisionedIdentity {
     pub privsep: bool,
 }
 
+#[derive(Deserialize)]
+struct RoleRow {
+    roleid: String,
+}
+
+#[derive(Deserialize)]
+struct UserRow {
+    userid: String,
+}
+
+#[derive(Deserialize)]
+struct GeneratedToken {
+    #[serde(rename = "full-tokenid")]
+    full_tokenid: String,
+    value: String,
+}
+
 // ── Primitives (each wraps one /access endpoint) ────────────────────────────
 
 /// Create the `OrcaOps` role if absent, or update its privilege set if it
 /// already exists (idempotent — safe to re-run during rotation).
-pub async fn ensure_role(client: &generated::Client, roleid: &str, privs: &str) -> Result<()> {
-    let exists = client
-        .get_index_access_roles()
-        .await
-        .map_err(|e| anyhow::anyhow!("proxmox access: list roles: {e}"))?
-        .into_inner()
-        .iter()
-        .any(|r| r.roleid == roleid);
-
-    if exists {
-        let body = gtypes::PutUpdateRoleAccessRolesRoleidBody {
-            append: Some(false),
-            privs: Some(privs.to_string()),
-        };
-        client
-            .put_update_role_access_roles_roleid(roleid, &body)
-            .await
-            .map_err(|e| anyhow::anyhow!("proxmox access: update role {roleid}: {e}"))?;
+pub fn ensure_role(endpoint: &str, roleid: &str, privs: &str) -> Result<()> {
+    let roles: Vec<RoleRow> = api::call("proxmox.get_index_access_roles", endpoint, json!({}))
+        .context("proxmox access: list roles")?;
+    if roles.iter().any(|r| r.roleid == roleid) {
+        api::call::<Value>(
+            "proxmox.put_update_role_access_roles_roleid",
+            endpoint,
+            json!({ "roleid": roleid, "body": { "append": false, "privs": privs } }),
+        )
+        .with_context(|| format!("proxmox access: update role {roleid}"))?;
     } else {
-        let body = gtypes::PostCreateRoleAccessRolesBody {
-            roleid: roleid.to_string(),
-            privs: Some(privs.to_string()),
-        };
-        client
-            .post_create_role_access_roles(&body)
-            .await
-            .map_err(|e| anyhow::anyhow!("proxmox access: create role {roleid}: {e}"))?;
+        api::call::<Value>(
+            "proxmox.post_create_role_access_roles",
+            endpoint,
+            json!({ "body": { "roleid": roleid, "privs": privs } }),
+        )
+        .with_context(|| format!("proxmox access: create role {roleid}"))?;
     }
     Ok(())
 }
 
 /// Create a user if absent (idempotent). Enables the account.
-pub async fn ensure_user(client: &generated::Client, userid: &str) -> Result<()> {
-    let exists = client
-        .get_index_access_users(None, None)
-        .await
-        .map_err(|e| anyhow::anyhow!("proxmox access: list users: {e}"))?
-        .into_inner()
-        .iter()
-        .any(|u| u.userid == userid);
-    if exists {
+pub fn ensure_user(endpoint: &str, userid: &str) -> Result<()> {
+    let users: Vec<UserRow> = api::call("proxmox.get_index_access_users", endpoint, json!({}))
+        .context("proxmox access: list users")?;
+    if users.iter().any(|u| u.userid == userid) {
         return Ok(());
     }
-    let body = gtypes::PostCreateUserAccessUsersBody {
-        userid: userid.to_string(),
-        enable: Some(true),
-        comment: None,
-        email: None,
-        expire: None,
-        firstname: None,
-        lastname: None,
-        groups: None,
-        keys: None,
-        password: None,
-    };
-    client
-        .post_create_user_access_users(&body)
-        .await
-        .map_err(|e| anyhow::anyhow!("proxmox access: create user {userid}: {e}"))?;
+    api::call::<Value>(
+        "proxmox.post_create_user_access_users",
+        endpoint,
+        json!({ "body": { "userid": userid, "enable": true } }),
+    )
+    .with_context(|| format!("proxmox access: create user {userid}"))?;
     Ok(())
 }
 
 /// Grant `roleid` at `path` to a user and/or a token id, propagating to
 /// children. PVE merges ACL entries, so this is additive and idempotent.
-pub async fn grant_acl(
-    client: &generated::Client,
+pub fn grant_acl(
+    endpoint: &str,
     path: &str,
     roleid: &str,
     users: Option<&str>,
     tokens: Option<&str>,
 ) -> Result<()> {
-    let body = gtypes::PutUpdateAclAccessAclBody {
-        path: path.to_string(),
-        roles: roleid.to_string(),
-        propagate: Some(true),
-        users: users.map(str::to_string),
-        tokens: tokens.map(str::to_string),
-        groups: None,
-        delete: None,
-    };
-    client
-        .put_update_acl_access_acl(&body)
-        .await
-        .map_err(|e| anyhow::anyhow!("proxmox access: grant {roleid} at {path}: {e}"))?;
+    api::call::<Value>(
+        "proxmox.put_update_acl_access_acl",
+        endpoint,
+        crate::args(json!({
+            "body": {
+                "path": path,
+                "roles": roleid,
+                "propagate": true,
+                "users": users,
+                "tokens": tokens,
+            }
+        })),
+    )
+    .with_context(|| format!("proxmox access: grant {roleid} at {path}"))?;
     Ok(())
 }
 
 /// Generate (or regenerate) an API token for `userid`. Returns the full token
 /// id and the one-time secret. `privsep` on means the token's effective
 /// privileges are the intersection of its own ACL and the user's.
-pub async fn generate_token(
-    client: &generated::Client,
+pub fn generate_token(
+    endpoint: &str,
     userid: &str,
     tokenid: &str,
     privsep: bool,
     comment: Option<&str>,
 ) -> Result<(String, String)> {
-    let tid: gtypes::PostGenerateTokenAccessUsersUseridTokenTokenidTokenid = tokenid
-        .parse()
-        .map_err(|e| anyhow::anyhow!("proxmox access: invalid token id '{tokenid}': {e}"))?;
-    let body = gtypes::PostGenerateTokenAccessUsersUseridTokenTokenidBody {
-        privsep: Some(privsep),
-        comment: comment.map(str::to_string),
-        expire: None,
-    };
-    let resp = client
-        .post_generate_token_access_users_userid_token_tokenid(userid, &tid, &body)
-        .await
-        .map_err(|e| anyhow::anyhow!("proxmox access: generate token {userid}!{tokenid}: {e}"))?
-        .into_inner();
+    let resp: GeneratedToken = api::call(
+        "proxmox.post_generate_token_access_users_userid_token_tokenid",
+        endpoint,
+        crate::args(json!({
+            "userid": userid,
+            "tokenid": tokenid,
+            "body": { "privsep": privsep, "comment": comment },
+        })),
+    )
+    .with_context(|| format!("proxmox access: generate token {userid}!{tokenid}"))?;
     Ok((resp.full_tokenid, resp.value))
 }
 
 /// Delete a token (used to revoke/rotate). Idempotent from the caller's view:
 /// a missing token surfaces as an error the caller may ignore during teardown.
-pub async fn delete_token(client: &generated::Client, userid: &str, tokenid: &str) -> Result<()> {
-    let tid: gtypes::DeleteRemoveTokenAccessUsersUseridTokenTokenidTokenid = tokenid
-        .parse()
-        .map_err(|e| anyhow::anyhow!("proxmox access: invalid token id '{tokenid}': {e}"))?;
-    client
-        .delete_remove_token_access_users_userid_token_tokenid(userid, &tid)
-        .await
-        .map_err(|e| anyhow::anyhow!("proxmox access: delete token {userid}!{tokenid}: {e}"))?;
+pub fn delete_token(endpoint: &str, userid: &str, tokenid: &str) -> Result<()> {
+    api::call::<Value>(
+        "proxmox.delete_remove_token_access_users_userid_token_tokenid",
+        endpoint,
+        json!({ "userid": userid, "tokenid": tokenid }),
+    )
+    .with_context(|| format!("proxmox access: delete token {userid}!{tokenid}"))?;
     Ok(())
 }
 
 // ── Bootstrap orchestrator ──────────────────────────────────────────────────
 
 /// Mint the least-privilege runtime identity on a cluster reachable via
-/// `client` (which must currently carry an elevated/admin credential).
+/// `endpoint` (which must currently carry an elevated/admin credential).
 ///
 /// Sequence: ensure `OrcaOps` role → ensure `orca@pve` user → grant the role to
 /// the user → generate a privsep token → grant the role to the token id. The
@@ -204,22 +194,26 @@ pub async fn delete_token(client: &generated::Client, userid: &str, tokenid: &st
 ///
 /// Re-running rotates the token (a fresh secret) while leaving role/user/ACL in
 /// place — the basis for scheduled rotation.
-pub async fn bootstrap_orca_identity(client: &generated::Client) -> Result<ProvisionedIdentity> {
-    ensure_role(client, ORCA_ROLE, ORCA_OPS_PRIVS).await?;
-    ensure_user(client, ORCA_USER).await?;
-    grant_acl(client, "/", ORCA_ROLE, Some(ORCA_USER), None).await?;
+pub fn bootstrap_orca_identity(endpoint: &str) -> Result<ProvisionedIdentity> {
+    ensure_role(endpoint, ORCA_ROLE, ORCA_OPS_PRIVS)?;
+    ensure_user(endpoint, ORCA_USER)?;
+    grant_acl(endpoint, "/", ORCA_ROLE, Some(ORCA_USER), None)?;
 
     // Regenerate cleanly: drop any stale token so the secret is fresh. A
-    // missing token (first bootstrap) is the expected non-error case.
-    if let Err(e) = delete_token(client, ORCA_USER, ORCA_TOKEN).await {
+    // missing token (first bootstrap) is the expected non-error case, but a
+    // dry run must surface its plan rather than continue.
+    if let Err(e) = delete_token(endpoint, ORCA_USER, ORCA_TOKEN) {
+        if e.downcast_ref::<api::Planned>().is_some() {
+            return Err(e);
+        }
         tracing::debug!(error = %e, "no existing orca token to drop before regeneration");
     }
     let (token_id, secret) =
-        generate_token(client, ORCA_USER, ORCA_TOKEN, true, Some("orca runtime")).await?;
+        generate_token(endpoint, ORCA_USER, ORCA_TOKEN, true, Some("orca runtime"))?;
 
     // Privsep tokens start with no privileges of their own — grant the role to
     // the token id too, or its effective privilege set is empty.
-    grant_acl(client, "/", ORCA_ROLE, None, Some(&token_id)).await?;
+    grant_acl(endpoint, "/", ORCA_ROLE, None, Some(&token_id))?;
 
     Ok(ProvisionedIdentity {
         token_id,
@@ -264,14 +258,25 @@ pub struct AccessBootstrapReport {
 /// identity on a registered endpoint, store its token secret in the abstract
 /// secrets domain, and repoint the endpoint at it. Run once with root/admin
 /// credentials, then rotate the bootstrap credential away.
-#[orca_tool(domain = "proxmox", verb = "access_bootstrap", role = "admin")]
+#[orca_tool(
+    domain = "proxmox",
+    verb = "access_bootstrap",
+    role = "admin",
+    reaches = [
+        "proxmox.put_update_role_access_roles_roleid",
+        "proxmox.post_create_role_access_roles",
+        "proxmox.post_create_user_access_users",
+        "proxmox.put_update_acl_access_acl",
+        "proxmox.post_generate_token_access_users_userid_token_tokenid",
+        "proxmox.delete_remove_token_access_users_userid_token_tokenid"
+    ]
+)]
 async fn proxmox_access_bootstrap(
     args: AccessBootstrapArgs,
     ctx: &ToolCtx,
 ) -> Result<AccessBootstrapReport> {
     crate::execute::require_admin("proxmox.access_bootstrap", ctx.caller().as_ref())?;
-    let client = make_client(&args.endpoint).await?;
-    let id = bootstrap_orca_identity(&client).await?;
+    let id = bootstrap_orca_identity(&args.endpoint)?;
     let secret = id
         .secret
         .clone()

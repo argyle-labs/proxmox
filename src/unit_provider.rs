@@ -18,7 +18,7 @@
 //! `endpoint_db` the tool surface owns, so registering a host once lights up
 //! both the tool surface and the unit surface.
 
-use plugin_toolkit::anyhow::{Result, anyhow};
+use plugin_toolkit::anyhow::{Context, Result, anyhow};
 use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::contract::unit::{
     ACTION_BACKUP, ACTION_RESTORE, ActionDecl, ActionOutcome, CreateArgs, DeleteArgs, DetailArgs,
@@ -34,7 +34,8 @@ use plugin_toolkit::serde_json::{self, json};
 
 use crate::GuestKind;
 use crate::execute::Change;
-use crate::generated::{self, types as gtypes};
+use crate::responses::{ResourceType, cluster_resources};
+use plugin_toolkit::api;
 
 const KIND_VM: &str = "vm";
 const KIND_LXC: &str = "lxc";
@@ -458,20 +459,13 @@ fn facts_of_provision(p: &ProvisionPayload) -> UnitFacts {
 }
 
 /// Enumerate qemu + lxc guests for one endpoint via `/cluster/resources`.
-async fn guests_for_endpoint(
-    client: &generated::Client,
-    endpoint: &str,
-) -> Result<Vec<GuestSummary>> {
-    let items = client
-        .get_resources_cluster_resources(Some(gtypes::GetResourcesClusterResourcesType::Vm))
-        .await
-        .map_err(|e| anyhow!("cluster resources: {e}"))?
-        .into_inner();
+fn guests_for_endpoint(endpoint: &str) -> Result<Vec<GuestSummary>> {
+    let items = cluster_resources(endpoint, Some("vm"))?;
     let mut out = Vec::new();
     for r in items {
         let kind = match r.type_ {
-            gtypes::GetResourcesClusterResourcesResponseItemType::Qemu => GuestKind::Qemu,
-            gtypes::GetResourcesClusterResourcesResponseItemType::Lxc => GuestKind::Lxc,
+            ResourceType::Qemu => GuestKind::Qemu,
+            ResourceType::Lxc => GuestKind::Lxc,
             _ => continue,
         };
         let (Some(node), Some(vmid)) = (r.node, r.vmid) else {
@@ -517,13 +511,12 @@ async fn guests_for_endpoint(
 async fn all_guests() -> Result<Vec<GuestSummary>> {
     Ok(
         crate::tools::for_each_enabled_endpoint("units", |cfg, ep| async move {
-            let client = cfg.build_generated_client()?;
-            let mut v = guests_for_endpoint(&client, &ep.name).await?;
+            let mut v = guests_for_endpoint(&cfg.endpoint)?;
             // One cluster-status probe per endpoint stamps the cluster name onto
             // every guest, so the canonical id collapses the same guest seen from
             // all member nodes. A standalone host (or a probe failure) leaves it
             // None → canonical falls back to the endpoint.
-            let cluster = match crate::cluster::fetch_cluster_status(&client).await {
+            let cluster = match crate::cluster::fetch_cluster_status(&cfg.endpoint) {
                 Ok(s) => s.name,
                 Err(e) => {
                     tracing::debug!(endpoint = %ep.name, error = %e, "proxmox units: cluster_status probe failed; canonical falls back to endpoint");
@@ -540,8 +533,8 @@ async fn all_guests() -> Result<Vec<GuestSummary>> {
 }
 
 /// Resolve the node a `(kind, vmid)` currently runs on for one endpoint.
-async fn resolve_node(client: &generated::Client, kind: GuestKind, vmid: u64) -> Result<String> {
-    let guests = guests_for_endpoint(client, "").await?;
+fn resolve_node(endpoint: &str, kind: GuestKind, vmid: u64) -> Result<String> {
+    let guests = guests_for_endpoint(endpoint)?;
     guests
         .into_iter()
         .find(|g| g.vmid == vmid && g.kind == kind_str(kind))
@@ -552,12 +545,19 @@ async fn resolve_node(client: &generated::Client, kind: GuestKind, vmid: u64) ->
 /// The storage a `backup` writes to when the payload names none: the first
 /// enabled backup-content storage on `node`. Errors (rather than guessing) if the
 /// node exposes no backup storage — a clear signal to configure one or pass it.
-async fn default_backup_storage(client: &generated::Client, node: &str) -> Result<String> {
-    let storages = client
-        .get_index_nodes_node_storage(node, Some("backup"), Some(true), None, None, None)
-        .await
-        .map_err(|e| anyhow!("list backup storages on {node}: {e}"))?
-        .into_inner();
+fn default_backup_storage(endpoint: &str, node: &str) -> Result<String> {
+    #[derive(serde::Deserialize)]
+    struct StorageRow {
+        storage: String,
+        #[serde(default)]
+        content: String,
+    }
+    let storages: Vec<StorageRow> = api::call(
+        "proxmox.get_index_nodes_node_storage",
+        endpoint,
+        json!({ "node": node, "content": "backup", "enabled": true }),
+    )
+    .with_context(|| format!("list backup storages on {node}"))?;
     storages
         .into_iter()
         .find(|s| s.content.split(',').any(|c| c.trim() == "backup"))
@@ -572,20 +572,25 @@ async fn default_backup_storage(client: &generated::Client, node: &str) -> Resul
 /// non-`OK` exit — a silently-running or failed task must never let a mutation
 /// proceed. Bounded by `deadline`; returns the terminal exit status text.
 async fn wait_for_task(
-    client: &generated::Client,
+    endpoint: &str,
     node: &str,
     upid: &str,
     deadline: plugin_toolkit::time::Deadline,
 ) -> Result<String> {
+    #[derive(serde::Deserialize)]
+    struct TaskStatus {
+        status: String,
+        exitstatus: Option<String>,
+    }
     loop {
-        let status = client
-            .get_read_task_status_nodes_node_tasks_upid_status(node, upid)
-            .await
-            .map_err(|e| anyhow!("task status {upid} on {node}: {e}"))?
-            .into_inner();
-        // `status` is Running until the task stops; then `exitstatus` is set.
-        use gtypes::GetReadTaskStatusNodesNodeTasksUpidStatusResponseStatus as TaskStatus;
-        if !matches!(status.status, TaskStatus::Running) {
+        let status: TaskStatus = api::call(
+            "proxmox.get_read_task_status_nodes_node_tasks_upid_status",
+            endpoint,
+            json!({ "node": node, "upid": upid }),
+        )
+        .with_context(|| format!("task status {upid} on {node}"))?;
+        // `status` is `running` until the task stops; then `exitstatus` is set.
+        if status.status != "running" {
             let exit = status.exitstatus.unwrap_or_default();
             if exit == "OK" {
                 return Ok(exit);
@@ -605,16 +610,18 @@ async fn wait_for_task(
 /// log for the `creating … archive '<path>'` line PVE emits. This turns the
 /// task UPID into a concrete restore locator (an absolute archive path the
 /// restore create call accepts as `archive` / `ostemplate`).
-async fn archive_from_task_log(
-    client: &generated::Client,
-    node: &str,
-    upid: &str,
-) -> Result<String> {
-    let lines = client
-        .get_read_task_log_nodes_node_tasks_upid_log(node, upid, None, None, None)
-        .await
-        .map_err(|e| anyhow!("task log {upid} on {node}: {e}"))?
-        .into_inner();
+fn archive_from_task_log(endpoint: &str, node: &str, upid: &str) -> Result<String> {
+    #[derive(serde::Deserialize)]
+    struct LogLine {
+        #[serde(default)]
+        t: String,
+    }
+    let lines: Vec<LogLine> = api::call(
+        "proxmox.get_read_task_log_nodes_node_tasks_upid_log",
+        endpoint,
+        json!({ "node": node, "upid": upid }),
+    )
+    .with_context(|| format!("task log {upid} on {node}"))?;
     lines
         .iter()
         .find_map(|l| parse_archive_line(&l.t))
@@ -693,15 +700,12 @@ impl ProxmoxUnitProvider {
             .id
             .parse()
             .map_err(|_| anyhow!("vmid '{}' is not a u64", args.id.id))?;
-        let client = crate::tools::make_client(&endpoint).await?;
-        let mut guest = guests_for_endpoint(&client, &endpoint)
-            .await?
+        let mut guest = guests_for_endpoint(&endpoint)?
             .into_iter()
             .find(|g| g.vmid == vmid && g.kind == kind_str(kind))
             .ok_or_else(|| anyhow!("{} vmid {vmid} not found on {endpoint}", kind_str(kind)))?;
         // Match the canonical id List produces (cluster-scoped when clustered).
-        guest.cluster = crate::cluster::fetch_cluster_status(&client)
-            .await
+        guest.cluster = crate::cluster::fetch_cluster_status(&endpoint)
             .ok()
             .and_then(|s| s.name);
         Ok(VerbOutcome::Item(Self::list_item(&guest)))
@@ -732,9 +736,8 @@ impl ProxmoxUnitProvider {
             .id
             .parse()
             .map_err(|_| anyhow!("vmid '{}' is not a u64", args.id.id))?;
-        let client = crate::tools::make_client(&endpoint).await?;
-        let node = resolve_node(&client, kind, vmid).await?;
-        lifecycle(&client, &node, vmid, kind, &args.action).await?;
+        let node = resolve_node(&endpoint, kind, vmid)?;
+        lifecycle(&endpoint, &node, vmid, kind, &args.action)?;
         Ok(VerbOutcome::Action(ActionOutcome {
             changed: true,
             message: format!("{} {} {vmid} on {node}", args.action, kind_str(kind)),
@@ -766,11 +769,10 @@ impl ProxmoxUnitProvider {
             Some(raw) => serde_json::from_str(&raw).map_err(|e| anyhow!("backup payload: {e}"))?,
             None => BackupPayload::default(),
         };
-        let client = crate::tools::make_client(&endpoint).await?;
-        let node = resolve_node(&client, kind, vmid).await?;
+        let node = resolve_node(&endpoint, kind, vmid)?;
         let storage = match p.storage {
             Some(s) => s,
-            None => default_backup_storage(&client, &node).await?,
+            None => default_backup_storage(&endpoint, &node)?,
         };
 
         let mut body = serde_json::Map::new();
@@ -784,19 +786,14 @@ impl ProxmoxUnitProvider {
         if let Some(notes) = &p.notes {
             body.insert("notes-template".into(), json!(notes));
         }
-        let typed: gtypes::PostVzdumpNodesNodeVzdumpBody =
-            serde_json::from_value(serde_json::Value::Object(body))
-                .map_err(|e| anyhow!("vzdump body: {e}"))?;
-        let upid = client
-            .post_vzdump_nodes_node_vzdump(&node, &typed)
-            .await
-            .map_err(|e| anyhow!("vzdump {} {vmid} on {node}: {e}", kind_str(kind)))?
-            .into_inner();
+        let upid: String =
+            api::call(VZDUMP_OP, &endpoint, json!({ "node": node, "body": body }))
+                .with_context(|| format!("vzdump {} {vmid} on {node}", kind_str(kind)))?;
 
         // A backup gates a mutation — wait for it and fail loudly if it errors.
         let deadline = plugin_toolkit::time::Deadline::after(BACKUP_TASK_DEADLINE);
-        wait_for_task(&client, &node, &upid, deadline).await?;
-        let archive = archive_from_task_log(&client, &node, &upid).await?;
+        wait_for_task(&endpoint, &node, &upid, deadline).await?;
+        let archive = archive_from_task_log(&endpoint, &node, &upid)?;
 
         let backup = BackupRef {
             locator: archive,
@@ -895,8 +892,7 @@ impl ProxmoxUnitProvider {
         if archive.is_empty() {
             return Err(anyhow!("restore backup ref has an empty locator"));
         }
-        let client = crate::tools::make_client(&endpoint).await?;
-        let node = resolve_node(&client, kind, vmid).await?;
+        let node = resolve_node(&endpoint, kind, vmid)?;
 
         let mut body = serde_json::Map::new();
         body.insert("vmid".into(), json!(vmid));
@@ -907,31 +903,27 @@ impl ProxmoxUnitProvider {
             // `ostemplate` with `restore=1`.
             GuestKind::Lxc => {
                 body.insert("ostemplate".into(), json!(archive));
-                let typed: gtypes::PostCreateVmNodesNodeLxcBody =
-                    serde_json::from_value(serde_json::Value::Object(body))
-                        .map_err(|e| anyhow!("lxc restore body: {e}"))?;
-                client
-                    .post_create_vm_nodes_node_lxc(&node, &typed)
-                    .await
-                    .map_err(|e| anyhow!("lxc restore {vmid} on {node}: {e}"))?
-                    .into_inner()
+                api::call::<String>(
+                    CREATE_LXC_OP,
+                    &endpoint,
+                    json!({ "node": node, "body": body }),
+                )
+                .with_context(|| format!("lxc restore {vmid} on {node}"))?
             }
             // QEMU restore rides in `archive`.
             GuestKind::Qemu => {
                 body.insert("archive".into(), json!(archive));
-                let typed: gtypes::PostCreateVmNodesNodeQemuBody =
-                    serde_json::from_value(serde_json::Value::Object(body))
-                        .map_err(|e| anyhow!("qemu restore body: {e}"))?;
-                client
-                    .post_create_vm_nodes_node_qemu(&node, &typed)
-                    .await
-                    .map_err(|e| anyhow!("qemu restore {vmid} on {node}: {e}"))?
-                    .into_inner()
+                api::call::<String>(
+                    CREATE_QEMU_OP,
+                    &endpoint,
+                    json!({ "node": node, "body": body }),
+                )
+                .with_context(|| format!("qemu restore {vmid} on {node}"))?
             }
         };
         if !upid.is_empty() {
             let deadline = plugin_toolkit::time::Deadline::after(RESTORE_TASK_DEADLINE);
-            wait_for_task(&client, &node, &upid, deadline).await?;
+            wait_for_task(&endpoint, &node, &upid, deadline).await?;
         }
         Ok(VerbOutcome::Item(ItemOutcome::new(
             id.clone(),
@@ -1016,15 +1008,17 @@ impl ProxmoxUnitProvider {
         .map_err(|e| anyhow!("provision refused: {e}"))?;
 
         let cfg = crate::tools::resolve_config(&p.endpoint).await?;
-        let client = cfg.build_generated_client()?;
 
         let vmid = match p.vmid {
             Some(v) => v,
-            None => client
-                .get_nextid_cluster_nextid(None)
-                .await
-                .map_err(|e| anyhow!("nextid: {e}"))?
-                .into_inner() as u64,
+            None => {
+                let next: serde_json::Value =
+                    api::call("proxmox.get_nextid_cluster_nextid", &p.endpoint, json!({}))
+                        .context("nextid")?;
+                next.as_u64()
+                    .or_else(|| next.as_str()?.parse().ok())
+                    .ok_or_else(|| anyhow!("nextid: not a vmid: {next}"))?
+            }
         };
 
         let upid = provision(&cfg, &p, kind, vmid).await?;
@@ -1050,13 +1044,11 @@ impl ProxmoxUnitProvider {
         name: &str,
         action: &str,
     ) -> Result<(u64, String)> {
-        let client = crate::tools::make_client(endpoint).await?;
-        let guest = guests_for_endpoint(&client, endpoint)
-            .await?
+        let guest = guests_for_endpoint(endpoint)?
             .into_iter()
             .find(|g| g.name == name && g.kind == kind_str(kind))
             .ok_or_else(|| anyhow!("{} named '{name}' not found on {endpoint}", kind_str(kind)))?;
-        lifecycle(&client, &guest.node, guest.vmid, kind, action).await?;
+        lifecycle(endpoint, &guest.node, guest.vmid, kind, action)?;
         Ok((guest.vmid, guest.node))
     }
 
@@ -1071,9 +1063,7 @@ impl ProxmoxUnitProvider {
         kind: GuestKind,
         name: &str,
     ) -> Result<Option<GuestSummary>> {
-        let client = crate::tools::make_client(endpoint).await?;
-        Ok(guests_for_endpoint(&client, endpoint)
-            .await?
+        Ok(guests_for_endpoint(endpoint)?
             .into_iter()
             .find(|g| g.name == name && g.kind == kind_str(kind)))
     }
@@ -1087,9 +1077,7 @@ impl ProxmoxUnitProvider {
         kind: GuestKind,
         vmid: u64,
     ) -> Result<Option<GuestSummary>> {
-        let client = crate::tools::make_client(endpoint).await?;
-        Ok(guests_for_endpoint(&client, endpoint)
-            .await?
+        Ok(guests_for_endpoint(endpoint)?
             .into_iter()
             .find(|g| g.vmid == vmid && g.kind == kind_str(kind)))
     }
@@ -1105,24 +1093,11 @@ impl ProxmoxUnitProvider {
         kind: GuestKind,
         name: &str,
     ) -> Result<(u64, String)> {
-        let client = crate::tools::make_client(endpoint).await?;
-        let guest = guests_for_endpoint(&client, endpoint)
-            .await?
+        let guest = guests_for_endpoint(endpoint)?
             .into_iter()
             .find(|g| g.name == name && g.kind == kind_str(kind))
             .ok_or_else(|| anyhow!("{} named '{name}' not found on {endpoint}", kind_str(kind)))?;
-        let v = guest.vmid as i64;
-        let res = match kind {
-            GuestKind::Qemu => client
-                .delete_destroy_vm_nodes_node_qemu_vmid(&guest.node, v, None, None, None)
-                .await
-                .map(|_| ()),
-            GuestKind::Lxc => client
-                .delete_destroy_vm_nodes_node_lxc_vmid(&guest.node, v, None, None, None)
-                .await
-                .map(|_| ()),
-        };
-        res.map_err(|e| anyhow!("destroy {} {}: {e}", kind_str(kind), guest.vmid))?;
+        destroy(endpoint, &guest.node, kind, guest.vmid)?;
         Ok((guest.vmid, guest.node))
     }
 
@@ -1140,14 +1115,13 @@ impl ProxmoxUnitProvider {
         let p: ProvisionPayload =
             serde_json::from_str(&raw).map_err(|e| anyhow!("upsert payload: {e}"))?;
         let kind = kind_from_str(&p.kind)?;
-        let client = crate::tools::make_client(&p.endpoint).await?;
 
         // Target vmid: explicit in the payload, else the unit key.
         let vmid = p.vmid.or_else(|| args.id.id.parse::<u64>().ok());
 
         // Already present → ensure-present is a no-op (idempotent success).
         if let Some(v) = vmid
-            && resolve_node(&client, kind, v).await.is_ok()
+            && resolve_node(&p.endpoint, kind, v).is_ok()
         {
             return Ok(VerbOutcome::Action(ActionOutcome {
                 changed: false,
@@ -1173,20 +1147,8 @@ impl ProxmoxUnitProvider {
             .id
             .parse()
             .map_err(|_| anyhow!("vmid '{}' is not a u64", args.id.id))?;
-        let client = crate::tools::make_client(&endpoint).await?;
-        let node = resolve_node(&client, kind, vmid).await?;
-        let v = vmid as i64;
-        let res = match kind {
-            GuestKind::Qemu => client
-                .delete_destroy_vm_nodes_node_qemu_vmid(&node, v, None, None, None)
-                .await
-                .map(|_| ()),
-            GuestKind::Lxc => client
-                .delete_destroy_vm_nodes_node_lxc_vmid(&node, v, None, None, None)
-                .await
-                .map(|_| ()),
-        };
-        res.map_err(|e| anyhow!("destroy {} {vmid}: {e}", kind_str(kind)))?;
+        let node = resolve_node(&endpoint, kind, vmid)?;
+        destroy(&endpoint, &node, kind, vmid)?;
         Ok(VerbOutcome::Action(ActionOutcome {
             changed: true,
             message: format!("destroyed {} {vmid} on {node}", kind_str(kind)),
@@ -1194,64 +1156,60 @@ impl ProxmoxUnitProvider {
     }
 }
 
-/// One lifecycle transition. The generated method names differ only by kind +
-/// action, so this is the single place that fans across the eight combinations.
-async fn lifecycle(
-    client: &generated::Client,
-    node: &str,
-    vmid: u64,
-    kind: GuestKind,
-    action: &str,
-) -> Result<()> {
-    let v = vmid as i64;
-    let res = match (kind, action) {
-        (GuestKind::Qemu, "start") => client
-            .post_vm_start_nodes_node_qemu_vmid_status_start(node, v, &Default::default())
-            .await
-            .map(|_| ()),
-        (GuestKind::Qemu, "stop") => client
-            .post_vm_stop_nodes_node_qemu_vmid_status_stop(node, v, &Default::default())
-            .await
-            .map(|_| ()),
-        (GuestKind::Qemu, "shutdown") => client
-            .post_vm_shutdown_nodes_node_qemu_vmid_status_shutdown(node, v, &Default::default())
-            .await
-            .map(|_| ()),
-        (GuestKind::Qemu, "reboot") => client
-            .post_vm_reboot_nodes_node_qemu_vmid_status_reboot(node, v, &Default::default())
-            .await
-            .map(|_| ()),
-        (GuestKind::Lxc, "start") => client
-            .post_vm_start_nodes_node_lxc_vmid_status_start(node, v, &Default::default())
-            .await
-            .map(|_| ()),
-        (GuestKind::Lxc, "stop") => client
-            .post_vm_stop_nodes_node_lxc_vmid_status_stop(node, v, &Default::default())
-            .await
-            .map(|_| ()),
-        (GuestKind::Lxc, "shutdown") => client
-            .post_vm_shutdown_nodes_node_lxc_vmid_status_shutdown(node, v, &Default::default())
-            .await
-            .map(|_| ()),
-        (GuestKind::Lxc, "reboot") => client
-            .post_vm_reboot_nodes_node_lxc_vmid_status_reboot(node, v, &Default::default())
-            .await
-            .map(|_| ()),
-        (_, other) => {
-            return Err(anyhow!(
-                "unknown lifecycle action '{other}' (expected start | stop | shutdown | reboot)"
-            ));
-        }
-    };
-    res.map_err(|e| anyhow!("{action} {} {vmid}: {e}", kind_str(kind)))
+pub const VZDUMP_OP: &str = "proxmox.post_vzdump_nodes_node_vzdump";
+pub const CREATE_LXC_OP: &str = "proxmox.post_create_vm_nodes_node_lxc";
+pub const CREATE_QEMU_OP: &str = "proxmox.post_create_vm_nodes_node_qemu";
+pub const DESTROY_OPS: [&str; 2] = [
+    "proxmox.delete_destroy_vm_nodes_node_qemu_vmid",
+    "proxmox.delete_destroy_vm_nodes_node_lxc_vmid",
+];
+pub const LIFECYCLE_OPS: [&str; 8] = [
+    "proxmox.post_vm_start_nodes_node_qemu_vmid_status_start",
+    "proxmox.post_vm_stop_nodes_node_qemu_vmid_status_stop",
+    "proxmox.post_vm_shutdown_nodes_node_qemu_vmid_status_shutdown",
+    "proxmox.post_vm_reboot_nodes_node_qemu_vmid_status_reboot",
+    "proxmox.post_vm_start_nodes_node_lxc_vmid_status_start",
+    "proxmox.post_vm_stop_nodes_node_lxc_vmid_status_stop",
+    "proxmox.post_vm_shutdown_nodes_node_lxc_vmid_status_shutdown",
+    "proxmox.post_vm_reboot_nodes_node_lxc_vmid_status_reboot",
+];
+
+/// Every gated api-surface op the unit backend calls; declared as its `reaches`.
+pub fn reaches() -> Vec<String> {
+    [VZDUMP_OP, CREATE_LXC_OP, CREATE_QEMU_OP]
+        .into_iter()
+        .chain(DESTROY_OPS)
+        .chain(LIFECYCLE_OPS)
+        .map(String::from)
+        .collect()
+}
+
+/// One lifecycle transition against a guest.
+fn lifecycle(endpoint: &str, node: &str, vmid: u64, kind: GuestKind, action: &str) -> Result<()> {
+    let action: crate::ProxmoxAction = action.parse().map_err(|_| {
+        anyhow!("unknown lifecycle action '{action}' (expected start | stop | shutdown | reboot)")
+    })?;
+    crate::run_lifecycle(endpoint, node, kind, vmid, action).map(|_| ())
+}
+
+fn destroy(endpoint: &str, node: &str, kind: GuestKind, vmid: u64) -> Result<()> {
+    api::call::<serde_json::Value>(
+        &format!(
+            "proxmox.delete_destroy_vm_nodes_node_{}_vmid",
+            kind.as_str()
+        ),
+        endpoint,
+        json!({ "node": node, "vmid": vmid }),
+    )
+    .with_context(|| format!("destroy {} {vmid}", kind_str(kind)))?;
+    Ok(())
 }
 
 /// Every created VM gets the guest agent channel: it cannot be hot-added to a
 /// running VM, and without it the guest can't be exec'd into or fstrim its disks.
 const QEMU_AGENT_DEFAULT: &str = "enabled=1";
 
-/// The create body as JSON (only set fields); [`provision`] deserializes it into
-/// the generated typed body so required-field validation runs against the PVE schema.
+/// The create body as JSON (only set fields).
 fn create_body(
     p: &ProvisionPayload,
     kind: GuestKind,
@@ -1362,11 +1320,8 @@ async fn provision(
     vmid: u64,
 ) -> Result<Option<String>> {
     let map = create_body(p, kind, vmid)?;
-    let body = serde_json::Value::Object(map.clone());
     let upid = match kind {
         GuestKind::Lxc => {
-            let _: gtypes::PostCreateVmNodesNodeLxcBody =
-                serde_json::from_value(body).map_err(|e| anyhow!("lxc create body: {e}"))?;
             let http = if needs_root_pam(p) {
                 crate::guest_mount::root_client(&p.endpoint, cfg)
                     .await
@@ -1385,15 +1340,12 @@ async fn provision(
                     .map_err(|e| anyhow!("lxc create: {e}"))?;
             upid_of(data)?
         }
-        GuestKind::Qemu => {
-            let typed: gtypes::PostCreateVmNodesNodeQemuBody =
-                serde_json::from_value(body).map_err(|e| anyhow!("qemu create body: {e}"))?;
-            cfg.build_generated_client()?
-                .post_create_vm_nodes_node_qemu(&p.node, &typed)
-                .await
-                .map_err(|e| anyhow!("qemu create: {e}"))?
-                .into_inner()
-        }
+        GuestKind::Qemu => api::call::<String>(
+            CREATE_QEMU_OP,
+            &p.endpoint,
+            json!({ "node": p.node, "body": serde_json::Value::Object(map) }),
+        )
+        .context("qemu create")?,
     };
     // PVE returns the task UPID as the response body string; empty → None.
     Ok(if upid.is_empty() { None } else { Some(upid) })
@@ -1980,8 +1932,34 @@ mod tests {
         for (k, v) in want {
             assert_eq!(pairs.get(k).map(String::as_str), Some(v), "{k}");
         }
-        let _: gtypes::PostCreateVmNodesNodeLxcBody =
-            serde_json::from_value(serde_json::Value::Object(body)).unwrap();
+        assert_body_in_surface(CREATE_LXC_OP, &body);
+    }
+
+    fn assert_body_in_surface(op: &str, body: &serde_json::Map<String, serde_json::Value>) {
+        let surface: serde_json::Value = serde_json::from_slice(crate::API_SURFACE).unwrap();
+        let op = surface["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tool"] == op)
+            .unwrap();
+        let props = op["params"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["in"] == "body")
+            .unwrap()["schema"]["properties"]
+            .as_object()
+            .unwrap();
+        for key in body.keys() {
+            let stem = key.trim_end_matches(|c: char| c.is_ascii_digit());
+            let indexed = format!("{stem}[n]");
+            assert!(
+                props.contains_key(key) || (stem != key && props.contains_key(&indexed)),
+                "{key} is not a field of {}",
+                op["tool"]
+            );
+        }
     }
 
     #[test]
@@ -2141,9 +2119,7 @@ mod tests {
         .unwrap();
         let body = create_body(&p, GuestKind::Qemu, 120).unwrap();
         assert_eq!(body["agent"], json!("enabled=1"));
-        let typed: gtypes::PostCreateVmNodesNodeQemuBody =
-            serde_json::from_value(serde_json::Value::Object(body)).unwrap();
-        assert_eq!(typed.agent.as_deref(), Some("enabled=1"));
+        assert_body_in_surface(CREATE_QEMU_OP, &body);
     }
 
     #[test]

@@ -31,13 +31,44 @@ use plugin_toolkit::contract::guest_exec::{
     ExecOutput, ExecRequest, GuestExec, GuestRef, WriteFileRequest,
 };
 
-use crate::generated::{self, types as gtypes};
-use crate::tools::resolve_config;
 use anyhow::{Context, Result, anyhow, bail};
+use plugin_toolkit::api;
+use plugin_toolkit::serde_json::json;
+use serde::Deserialize;
 use std::time::{Duration, Instant};
 
 /// Registry name this backend registers under (the `guest_exec` provider key).
 const PROVIDER: &str = "proxmox";
+
+const EXEC_OP: &str = "proxmox.post_exec_nodes_node_qemu_vmid_agent_exec";
+const EXEC_STATUS_OP: &str = "proxmox.get_exec_status_nodes_node_qemu_vmid_agent_exec_status";
+const FILE_WRITE_OP: &str = "proxmox.post_file_write_nodes_node_qemu_vmid_agent_file_write";
+
+/// The api-surface ops this backend calls; declared as the facet's `reaches`.
+pub const REACHES: [&str; 3] = [EXEC_OP, EXEC_STATUS_OP, FILE_WRITE_OP];
+
+const INPUT_DATA_MAX: usize = 65536;
+const FILE_CONTENT_MAX: usize = 61440;
+
+#[derive(Deserialize)]
+struct ExecStarted {
+    pid: i64,
+}
+
+#[derive(Deserialize)]
+struct ExecStatus {
+    exited: bool,
+    exitcode: Option<i64>,
+    signal: Option<i64>,
+    #[serde(rename = "out-data")]
+    out_data: Option<String>,
+    #[serde(rename = "err-data")]
+    err_data: Option<String>,
+    #[serde(rename = "out-truncated")]
+    out_truncated: Option<bool>,
+    #[serde(rename = "err-truncated")]
+    err_truncated: Option<bool>,
+}
 
 /// Typed `guest_exec` facet for the `Plugin` builder. The builder drives it over
 /// the wire via `contract::guest_exec::dispatch_op`.
@@ -57,10 +88,10 @@ impl GuestExec for ProxmoxGuestExec {
     }
 }
 
-/// Resolve a [`GuestRef`] into the `(client, node, vmid)` the generated
-/// guest-agent calls need. proxmox reads `scope` as the PVE endpoint, `node` as
+/// Resolve a [`GuestRef`] into the `(endpoint, node, vmid)` the guest-agent
+/// calls need. proxmox reads `scope` as the PVE endpoint, `node` as
 /// the PVE node, and `id` as the vmid.
-async fn resolve_guest(guest: &GuestRef) -> Result<(generated::Client, String, i64)> {
+fn resolve_guest(guest: &GuestRef) -> Result<(String, String, i64)> {
     let scope = guest.scope.as_deref().ok_or_else(|| {
         anyhow!("guest_exec: `scope` (PVE endpoint) is required for the proxmox backend")
     })?;
@@ -75,50 +106,40 @@ async fn resolve_guest(guest: &GuestRef) -> Result<(generated::Client, String, i
         .id
         .parse()
         .with_context(|| format!("guest_exec: guest id '{}' is not a valid vmid", guest.id))?;
-    let client = resolve_config(scope).await?.build_generated_client()?;
-    Ok((client, node, vmid))
+    Ok((scope.to_string(), node, vmid))
 }
 
 /// Start `req.command` in the guest, then poll `exec-status` to completion.
 async fn exec(guest: GuestRef, req: ExecRequest) -> Result<ExecOutput> {
-    let (client, node, vmid) = resolve_guest(&guest).await?;
+    let (endpoint, node, vmid) = resolve_guest(&guest)?;
 
     // stdin: the sanctioned channel for sensitive input. The agent caps input-data
-    // at 65536 chars — the generated newtype's `TryFrom` enforces it.
+    // at 65536 chars.
     let input_data = match req.input_data.as_ref() {
         Some(bytes) => {
             let s = String::from_utf8(bytes.clone()).map_err(|_| {
                 anyhow!("guest_exec: input_data must be valid UTF-8 for the guest agent")
             })?;
-            Some(
-                gtypes::PostExecNodesNodeQemuVmidAgentExecBodyInputData::try_from(s)
-                    .map_err(|e| anyhow!("guest_exec: input_data rejected by guest agent: {e}"))?,
-            )
+            if s.chars().count() > INPUT_DATA_MAX {
+                bail!(
+                    "guest_exec: input_data rejected by guest agent: longer than {INPUT_DATA_MAX} characters"
+                );
+            }
+            Some(s)
         }
         None => None,
     };
 
-    let body = gtypes::PostExecNodesNodeQemuVmidAgentExecBody {
-        command: req.command.clone(),
-        input_data,
-    };
-    let pid = client
-        .post_exec_nodes_node_qemu_vmid_agent_exec(&node, vmid, &body)
-        .await
-        .map_err(|e| anyhow!("guest agent exec (vmid {vmid} on '{node}'): {e}"))?
-        .into_inner()
-        .pid;
+    let pid = start_exec(&endpoint, &node, vmid, &req.command, input_data)
+        .with_context(|| format!("guest agent exec (vmid {vmid} on '{node}')"))?;
 
     let deadline = Instant::now() + Duration::from_millis(req.timeout_ms());
     let interval = Duration::from_millis(req.poll_interval_ms());
     let cap = req.max_output_bytes() as usize;
 
     loop {
-        let status = client
-            .get_exec_status_nodes_node_qemu_vmid_agent_exec_status(&node, vmid, pid)
-            .await
-            .map_err(|e| anyhow!("guest agent exec-status (pid {pid}, vmid {vmid}): {e}"))?
-            .into_inner();
+        let status = exec_status(&endpoint, &node, vmid, pid)
+            .with_context(|| format!("guest agent exec-status (pid {pid}, vmid {vmid})"))?;
 
         if status.exited {
             let (stdout, out_cap_trunc) = cap_str(status.out_data.unwrap_or_default(), cap);
@@ -156,6 +177,33 @@ async fn exec(guest: GuestRef, req: ExecRequest) -> Result<ExecOutput> {
     }
 }
 
+fn start_exec(
+    endpoint: &str,
+    node: &str,
+    vmid: i64,
+    command: &[String],
+    input_data: Option<String>,
+) -> Result<i64> {
+    let started: ExecStarted = api::call(
+        EXEC_OP,
+        endpoint,
+        crate::args(json!({
+            "node": node,
+            "vmid": vmid,
+            "body": { "command": command, "input-data": input_data },
+        })),
+    )?;
+    Ok(started.pid)
+}
+
+fn exec_status(endpoint: &str, node: &str, vmid: i64, pid: i64) -> Result<ExecStatus> {
+    api::call(
+        EXEC_STATUS_OP,
+        endpoint,
+        json!({ "node": node, "vmid": vmid, "pid": pid }),
+    )
+}
+
 /// Truncate `s` to at most `cap` bytes on a UTF-8 char boundary, reporting whether
 /// anything was dropped.
 fn cap_str(s: String, cap: usize) -> (String, bool) {
@@ -175,42 +223,40 @@ fn cap_str(s: String, cap: usize) -> (String, bool) {
 /// field (verified against the spec: the body is `{content, encode, file}`). So a
 /// requested `mode`/`owner` is applied with a follow-up `chmod`/`chown` exec. The
 /// content is sent raw with `encode` defaulted (PVE base64-encodes it QMP-side);
-/// the agent caps it at 61440 chars, enforced by the generated newtype's
-/// `TryFrom`. Binary (non-UTF-8) or larger-than-cap writes are rejected here —
+/// the agent caps it at 61440 chars. Binary (non-UTF-8) or larger-than-cap writes are rejected here —
 /// chunked/base64 writes are a later slice.
 async fn write_file(guest: GuestRef, req: WriteFileRequest) -> Result<()> {
-    let (client, node, vmid) = resolve_guest(&guest).await?;
+    let (endpoint, node, vmid) = resolve_guest(&guest)?;
 
-    let content_str = String::from_utf8(req.contents.clone()).map_err(|_| {
+    let content = String::from_utf8(req.contents.clone()).map_err(|_| {
         anyhow!("guest_exec: write_file contents must be valid UTF-8 (binary/base64 writes are a later slice)")
     })?;
-    let content =
-        gtypes::PostFileWriteNodesNodeQemuVmidAgentFileWriteBodyContent::try_from(content_str)
-            .map_err(|e| {
-                anyhow!("guest_exec: file contents rejected by guest agent (cap 61440 chars): {e}")
-            })?;
+    if content.chars().count() > FILE_CONTENT_MAX {
+        bail!("guest_exec: file contents rejected by guest agent (cap {FILE_CONTENT_MAX} chars)");
+    }
 
-    let body = gtypes::PostFileWriteNodesNodeQemuVmidAgentFileWriteBody {
-        content,
-        // `None` → PVE default `encode=true`: it base64-encodes the content QMP-side.
-        encode: None,
-        file: req.path.clone(),
-    };
-    client
-        .post_file_write_nodes_node_qemu_vmid_agent_file_write(&node, vmid, &body)
-        .await
-        .map_err(|e| {
-            anyhow!(
-                "guest agent file-write '{}' (vmid {vmid} on '{node}'): {e}",
-                req.path
-            )
-        })?;
+    // `encode` omitted → PVE default `encode=true`: it base64-encodes the content QMP-side.
+    api::call::<plugin_toolkit::serde_json::Value>(
+        FILE_WRITE_OP,
+        &endpoint,
+        json!({
+            "node": node,
+            "vmid": vmid,
+            "body": { "content": content, "file": req.path },
+        }),
+    )
+    .with_context(|| {
+        format!(
+            "guest agent file-write '{}' (vmid {vmid} on '{node}')",
+            req.path
+        )
+    })?;
 
     // mode/owner are not native to file-write — apply them with chained exec. The
     // path is not a secret; the mode/owner values are not secrets.
     if let Some(mode) = req.mode.as_deref() {
         run_ok(
-            &client,
+            &endpoint,
             &node,
             vmid,
             vec!["chmod".to_string(), mode.to_string(), req.path.clone()],
@@ -220,7 +266,7 @@ async fn write_file(guest: GuestRef, req: WriteFileRequest) -> Result<()> {
     }
     if let Some(owner) = req.owner.as_deref() {
         run_ok(
-            &client,
+            &endpoint,
             &node,
             vmid,
             vec!["chown".to_string(), owner.to_string(), req.path.clone()],
@@ -233,33 +279,17 @@ async fn write_file(guest: GuestRef, req: WriteFileRequest) -> Result<()> {
 
 /// Run a short command in the guest and require a zero exit code — the chained
 /// `chmod`/`chown` helper. Uses the module's default loop policy.
-async fn run_ok(
-    client: &generated::Client,
-    node: &str,
-    vmid: i64,
-    command: Vec<String>,
-) -> Result<()> {
-    let body = gtypes::PostExecNodesNodeQemuVmidAgentExecBody {
-        command: command.clone(),
-        input_data: None,
-    };
-    let pid = client
-        .post_exec_nodes_node_qemu_vmid_agent_exec(node, vmid, &body)
-        .await
-        .map_err(|e| anyhow!("guest agent exec {command:?}: {e}"))?
-        .into_inner()
-        .pid;
+async fn run_ok(endpoint: &str, node: &str, vmid: i64, command: Vec<String>) -> Result<()> {
+    let pid = start_exec(endpoint, node, vmid, &command, None)
+        .with_context(|| format!("guest agent exec {command:?}"))?;
 
     let deadline = Instant::now()
         + Duration::from_millis(plugin_toolkit::contract::guest_exec::DEFAULT_TIMEOUT_MS);
     let interval =
         Duration::from_millis(plugin_toolkit::contract::guest_exec::DEFAULT_POLL_INTERVAL_MS);
     loop {
-        let status = client
-            .get_exec_status_nodes_node_qemu_vmid_agent_exec_status(node, vmid, pid)
-            .await
-            .map_err(|e| anyhow!("guest agent exec-status (pid {pid}): {e}"))?
-            .into_inner();
+        let status = exec_status(endpoint, node, vmid, pid)
+            .with_context(|| format!("guest agent exec-status (pid {pid})"))?;
         if status.exited {
             if status.exitcode == Some(0) {
                 return Ok(());
