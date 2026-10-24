@@ -335,15 +335,17 @@ pub fn orca_block(name: &str, service: &str, unit_id: &str) -> String {
 }
 
 pub fn has_orca_block(description: &str) -> bool {
-    description.contains(BLOCK_BEGIN) && description.contains(BLOCK_END)
+    description
+        .find(BLOCK_BEGIN)
+        .is_some_and(|start| description[start..].contains(BLOCK_END))
 }
 
 pub fn merge_description(existing: Option<&str>, block: &str) -> String {
     let existing = existing.unwrap_or_default();
-    if let (Some(start), Some(end)) = (existing.find(BLOCK_BEGIN), existing.find(BLOCK_END))
-        && start < end
+    if let Some(start) = existing.find(BLOCK_BEGIN)
+        && let Some(len) = existing[start..].find(BLOCK_END)
     {
-        let tail = &existing[end + BLOCK_END.len()..];
+        let tail = &existing[start + len + BLOCK_END.len()..];
         return format!("{}{block}{tail}", &existing[..start]);
     }
     let operator = existing.trim_end();
@@ -402,6 +404,7 @@ struct Guest {
     name: String,
     tags: Vec<String>,
     description: Option<String>,
+    digest: Option<String>,
 }
 
 fn name_key(kind: GuestKind) -> &'static str {
@@ -434,6 +437,7 @@ fn read_guest(
             .unwrap_or_default(),
         tags: text("tags").map(|t| parse_tags(&t)).unwrap_or_default(),
         description: text("description").filter(|d| !d.trim().is_empty()),
+        digest: text("digest"),
     })
 }
 
@@ -555,10 +559,10 @@ pub struct GuestLabelAudit {
 
 /// List every VM and LXC missing tags or a description, or with a default or
 /// unclear name, with its current tags, name, description, orca unit id and
-/// the tags `proxmox.guest_label_apply` would add.
+/// the tags `proxmox.guest.label.apply` would add.
 #[orca_tool(
     domain = "proxmox",
-    verb = "guest_label_audit",
+    verb = "guest.label.audit",
     execute_gated = false,
     role = "read",
     reaches = [
@@ -577,7 +581,7 @@ async fn proxmox_guest_label_audit(
     }
     let node = args.node.clone();
     let all = args.all;
-    let fan = fan_out_enabled_endpoints("guest_label_audit", |_, ep| {
+    let fan = fan_out_enabled_endpoints("guest.label.audit", |_, ep| {
         let node = node.clone();
         async move { Ok(vec![audit_endpoint(&ep.name, node.as_deref(), all)?]) }
     })
@@ -699,8 +703,8 @@ fn plan_guest(
     ))
 }
 
-fn apply_endpoint(args: &GuestLabelApplyArgs) -> Result<Vec<GuestLabelChange>> {
-    if args.all == !args.vmid.is_empty() {
+fn apply_endpoint(args: &GuestLabelApplyArgs, dry_run: bool) -> Result<Vec<GuestLabelChange>> {
+    if args.all != args.vmid.is_empty() {
         bail!("set either `vmid` or `all`");
     }
     if args.name.is_some() && args.vmid.len() != 1 {
@@ -727,7 +731,15 @@ fn apply_endpoint(args: &GuestLabelApplyArgs) -> Result<Vec<GuestLabelChange>> {
         let g = read_guest(&args.endpoint, &node, kind, vmid, fallback.as_deref())?;
         let uid = unit_id(cluster.as_deref(), &args.endpoint, kind, vmid);
         let (mut change, body) = plan_guest(&g, &uid, args)?;
-        if !body.is_empty() {
+        if !body.is_empty() && !dry_run {
+            let Some(digest) = &g.digest else {
+                bail!(
+                    "{} {vmid} config read returned no digest; refusing an unguarded write",
+                    kind_tag(kind)
+                );
+            };
+            let mut body = body;
+            body.insert("digest".into(), json!(digest));
             plugin_toolkit::api::call::<Value>(
                 config_op(kind, "put"),
                 &args.endpoint,
@@ -746,8 +758,9 @@ fn apply_endpoint(args: &GuestLabelApplyArgs) -> Result<Vec<GuestLabelChange>> {
 /// description text are kept; only the orca block is added or replaced.
 #[orca_tool(
     domain = "proxmox",
-    verb = "guest_label_apply",
+    verb = "guest.label.apply",
     role = "admin",
+    dry_run_aware = true,
     reaches = [
         "proxmox.get_resources_cluster_resources",
         "proxmox.get_vm_config_nodes_node_qemu_vmid_config",
@@ -760,8 +773,8 @@ async fn proxmox_guest_label_apply(
     args: GuestLabelApplyArgs,
     ctx: &ToolCtx,
 ) -> Result<Vec<GuestLabelChange>> {
-    crate::execute::require_admin("proxmox.guest_label_apply", ctx.caller().as_ref())?;
-    apply_endpoint(&args)
+    crate::execute::require_admin("proxmox.guest.label.apply", ctx.caller().as_ref())?;
+    apply_endpoint(&args, ctx.dry_run())
 }
 
 #[cfg(test)]
@@ -777,6 +790,7 @@ mod tests {
             name: name.into(),
             tags: tags.iter().map(|t| t.to_string()).collect(),
             description: description.map(str::to_string),
+            digest: Some("d".into()),
         }
     }
 
@@ -929,27 +943,105 @@ mod tests {
                     r#"[{"type":"lxc","node":"thor","vmid":112,"name":"sonarr"}]"#.into()
                 }
                 (_, "/cluster/status") => r#"[{"type":"cluster","name":"asgard"}]"#.into(),
-                ("GET", _) => r#"{"hostname":"sonarr"}"#.into(),
+                ("GET", _) => r#"{"hostname":"sonarr","digest":"abc"}"#.into(),
                 _ => "null".into(),
             },
-            || apply_endpoint(&apply_args()),
+            || apply_endpoint(&apply_args(), false),
         );
         let out = out.unwrap();
         assert!(out[0].applied);
         let put = calls.iter().find(|c| c.0 == "PUT").expect("a PUT");
         assert_eq!(put.1, "/nodes/thor/lxc/112/config");
         assert_eq!(put.2["body"]["tags"], "lxc;media;orca-managed");
+        assert_eq!(put.2["body"]["digest"], "abc");
         let desc = put.2["body"]["description"].as_str().unwrap();
         assert!(desc.contains("Unit id: `cluster:asgard/lxc/112`"), "{desc}");
+    }
+
+    #[test]
+    fn dry_run_plans_without_writing() {
+        let (out, calls) = record_api_calls(
+            |method, path| match (method, path) {
+                (_, "/cluster/resources") => {
+                    r#"[{"type":"lxc","node":"thor","vmid":112,"name":"sonarr"}]"#.into()
+                }
+                ("GET", _) => r#"{"hostname":"sonarr","digest":"abc"}"#.into(),
+                _ => "null".into(),
+            },
+            || apply_endpoint(&apply_args(), true),
+        );
+        let out = out.unwrap();
+        assert!(!out[0].applied);
+        assert_eq!(out[0].tags_after, ["lxc", "media", "orca-managed"]);
+        assert!(calls.iter().all(|c| c.0 != "PUT"));
+    }
+
+    #[test]
+    fn apply_refuses_a_write_without_a_digest() {
+        let (out, calls) = record_api_calls(
+            |method, path| match (method, path) {
+                (_, "/cluster/resources") => {
+                    r#"[{"type":"lxc","node":"thor","vmid":112,"name":"sonarr"}]"#.into()
+                }
+                ("GET", _) => r#"{"hostname":"sonarr"}"#.into(),
+                _ => "null".into(),
+            },
+            || apply_endpoint(&apply_args(), false),
+        );
+        assert!(out.is_err());
+        assert!(calls.iter().all(|c| c.0 != "PUT"));
+    }
+
+    #[test]
+    fn description_merge_ignores_a_stray_end_marker_before_the_block() {
+        let block = orca_block("plex", "plex", "u");
+        let existing = format!(
+            "note {BLOCK_END} keep
+
+{}",
+            orca_block("plex", "old", "u")
+        );
+        let merged = merge_description(Some(&existing), &block);
+        assert_eq!(merged, format!("note {BLOCK_END} keep\n\n{block}"));
+        assert_eq!(merge_description(Some(&merged), &block), merged);
+        assert!(!has_orca_block(&format!("{BLOCK_END}{BLOCK_BEGIN}")));
+    }
+
+    #[test]
+    fn normalized_tags_match_the_pve_charset() {
+        for raw in [
+            "Media Box",
+            "+x",
+            ".y",
+            "ü-tag",
+            "a;b,c",
+            "--",
+            "Stack_1.2+3",
+        ] {
+            if let Some(t) = normalize_tag(raw) {
+                let mut b = t.bytes();
+                let first = b.next().unwrap();
+                assert!(
+                    first.is_ascii_lowercase() || first.is_ascii_digit() || first == b'_',
+                    "{t}"
+                );
+                assert!(
+                    t.bytes().all(|c| c.is_ascii_lowercase()
+                        || c.is_ascii_digit()
+                        || matches!(c, b'_' | b'+' | b'.' | b'-')),
+                    "{t}"
+                );
+            }
+        }
     }
 
     #[test]
     fn apply_needs_vmid_or_all() {
         let mut args = apply_args();
         args.vmid.clear();
-        assert!(apply_endpoint(&args).is_err());
+        assert!(apply_endpoint(&args, false).is_err());
         args.all = true;
         args.name = Some("x".into());
-        assert!(apply_endpoint(&args).is_err());
+        assert!(apply_endpoint(&args, false).is_err());
     }
 }

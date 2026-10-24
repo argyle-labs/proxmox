@@ -61,7 +61,7 @@ fn every_tool_has_unique_name() {
 
 /// Fan-out verbs that default to every enabled endpoint when `endpoint` is
 /// omitted. Any other tool advertising an optional endpoint is a mistake.
-const OPTIONAL_ENDPOINT: &[&str] = &["proxmox.thin.audit", "proxmox.guest_label_audit"];
+const OPTIONAL_ENDPOINT: &[&str] = &["proxmox.thin.audit", "proxmox.guest.label.audit"];
 
 #[test]
 fn every_tool_input_schema_takes_endpoint() {
