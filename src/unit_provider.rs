@@ -186,6 +186,18 @@ pub struct ProvisionPayload {
     /// RAM held back for the host by the over-allocation guard; default 4096.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_reserve_mib: Option<u64>,
+    /// Role tag (media, backup, infra, ci, ai, network, storage, home); derived from `name` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// What the service is, for the orca-managed description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    /// Orca stack, tagged `stack-<stack>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<String>,
+    /// Extra tags added to the default scheme.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 /// LXC `features` flags; unset flags are omitted.
@@ -369,6 +381,13 @@ pub struct BackupPayload {
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
+
+pub(crate) fn canonical_id(cluster: Option<&str>, endpoint: &str, kind: &str, vmid: u64) -> String {
+    match cluster {
+        Some(c) => format!("cluster:{c}/{kind}/{vmid}"),
+        None => format!("endpoint:{endpoint}/{kind}/{vmid}"),
+    }
+}
 
 fn manager_for(endpoint: &str) -> String {
     UnitId::scoped_manager("proxmox", endpoint)
@@ -651,10 +670,7 @@ impl ProxmoxUnitProvider {
     /// collapses to one unit), else `endpoint:<name>/<kind>/<vmid>` for a
     /// standalone host. Consumed by core's `merge_by_canonical`.
     fn canonical(g: &GuestSummary) -> String {
-        match &g.cluster {
-            Some(c) => format!("cluster:{c}/{}/{}", g.kind, g.vmid),
-            None => format!("endpoint:{}/{}/{}", g.endpoint, g.kind, g.vmid),
-        }
+        canonical_id(g.cluster.as_deref(), &g.endpoint, &g.kind, g.vmid)
     }
 
     /// Build the list/detail item for a guest: canonical id (for dedup) plus the
@@ -992,7 +1008,10 @@ impl ProxmoxUnitProvider {
             }
         };
 
-        let upid = provision(&cfg, &p, kind, vmid).await?;
+        let cluster = crate::cluster::fetch_cluster_status(&p.endpoint)
+            .ok()
+            .and_then(|s| s.name);
+        let upid = provision(&cfg, &p, kind, vmid, cluster.as_deref()).await?;
         Ok(ProvisionResponse {
             endpoint: p.endpoint.clone(),
             node: p.node.clone(),
@@ -1261,6 +1280,36 @@ fn create_body(
     Ok(body)
 }
 
+fn create_labels(
+    p: &ProvisionPayload,
+    kind: GuestKind,
+    vmid: u64,
+    cluster: Option<&str>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let name = p
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("{}-{vmid}", kind_str(kind)));
+    let role = p
+        .role
+        .as_deref()
+        .and_then(crate::guest_label::normalize_tag);
+    let labels = crate::guest_label::labels_for(
+        kind,
+        &name,
+        &crate::guest_label::unit_id(cluster, &p.endpoint, kind, vmid),
+        role.as_deref(),
+        p.service.as_deref(),
+        p.stack.as_deref(),
+        &p.tags,
+        &[],
+    );
+    let mut map = serde_json::Map::new();
+    map.insert("tags".into(), json!(labels.tags.join(";")));
+    map.insert("description".into(), json!(labels.description));
+    map
+}
+
 fn needs_root_pam(p: &ProvisionPayload) -> bool {
     let features = p.features.as_ref().is_some_and(|f| {
         f.keyctl.is_some() || f.fuse.is_some() || f.mknod.is_some() || f.mount.is_some()
@@ -1283,8 +1332,10 @@ async fn provision(
     p: &ProvisionPayload,
     kind: GuestKind,
     vmid: u64,
+    cluster: Option<&str>,
 ) -> Result<Option<String>> {
-    let map = create_body(p, kind, vmid)?;
+    let mut map = create_body(p, kind, vmid)?;
+    map.extend(create_labels(p, kind, vmid, cluster));
     let upid = match kind {
         GuestKind::Lxc => {
             let http = if needs_root_pam(p) {
@@ -1954,6 +2005,31 @@ mod tests {
         assert!(!needs_root_pam(&p));
         p.mounts[0].volume = "/mnt/data".into();
         assert!(needs_root_pam(&p));
+    }
+
+    #[test]
+    fn create_labels_tag_and_describe_every_new_guest() {
+        let p: ProvisionPayload = serde_json::from_str(
+            r#"{"endpoint":"pve","node":"n","kind":"lxc","ostemplate":"t","name":"jellyfin","stack":"media","tags":["unit-jf"]}"#,
+        )
+        .unwrap();
+        let m = create_labels(&p, GuestKind::Lxc, 130, Some("asgard"));
+        assert_eq!(m["tags"], "lxc;media;orca-managed;stack-media;unit-jf");
+        let d = m["description"].as_str().unwrap();
+        assert!(d.contains("**jellyfin**: jellyfin (media)"), "{d}");
+        assert!(d.contains("`cluster:asgard/lxc/130`"), "{d}");
+        let p: ProvisionPayload = serde_json::from_str(
+            r#"{"endpoint":"pve","node":"n","kind":"vm","role":"ai","service":"Ollama"}"#,
+        )
+        .unwrap();
+        let m = create_labels(&p, GuestKind::Qemu, 131, None);
+        assert_eq!(m["tags"], "vm;ai;orca-managed");
+        assert!(
+            m["description"]
+                .as_str()
+                .unwrap()
+                .contains("**vm-131**: Ollama")
+        );
     }
 
     #[test]

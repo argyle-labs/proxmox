@@ -76,6 +76,8 @@ Every VM and LXC across every enabled endpoint is a **unit** (`kind = vm` or `lx
 | `proxmox.guest.standard.audit` | an LXC's guest standard: OS, root console autologin, the orca `update` gate, the app's own updater, and a leftover forced-command backup key. Unsupported: needs in-guest orca member ([docs/guest-standard.md](docs/guest-standard.md)) |
 | `proxmox.guest.standard.apply` | install root console autologin and the `update` gate in an LXC. Unsupported: needs in-guest orca member *(role: admin)* |
 | `proxmox.guest.update` | back an LXC up through the PVE API, then run its updater. Unsupported: needs in-guest orca member *(role: admin)* |
+| `proxmox.guest_label_audit` | every VM and LXC missing tags or a description, or with a default or unclear name, with its current tags, name, description, orca unit id and suggested tags |
+| `proxmox.guest_label_apply` | set the default tags (`lxc`/`vm`, role, `orca-managed`, `stack-<stack>`, extras) and an orca-managed description block on one or many guests, keeping existing tags and operator text *(role: admin)* |
 | `proxmox.guest.file_pull` | copy a file out of a guest. Unsupported for LXC (needs in-guest orca member); refused for VMs *(role: admin)* |
 | `proxmox.lxc_data.plan` | per LXC on this node: its mounts, the app's data paths (per-app table), where each lives (rootfs / volume / bind) and how it is backed up (vzdump / `lxc-bind` host capture / uncovered) |
 

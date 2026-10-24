@@ -61,7 +61,7 @@ fn every_tool_has_unique_name() {
 
 /// Fan-out verbs that default to every enabled endpoint when `endpoint` is
 /// omitted. Any other tool advertising an optional endpoint is a mistake.
-const OPTIONAL_ENDPOINT: &[&str] = &["proxmox.thin.audit"];
+const OPTIONAL_ENDPOINT: &[&str] = &["proxmox.thin.audit", "proxmox.guest_label_audit"];
 
 #[test]
 fn every_tool_input_schema_takes_endpoint() {
@@ -337,7 +337,9 @@ where
 
 #[test]
 fn every_admin_handler_refuses_a_non_admin_caller_itself() {
-    use proxmox::{access, backup_jobs, deploy, disk_grow, guest_standard, thin_discard, tools};
+    use proxmox::{
+        access, backup_jobs, deploy, disk_grow, guest_label, guest_standard, thin_discard, tools,
+    };
     let reader = plugin_toolkit::contract::CallerIdentity {
         user_id: "u".into(),
         username: "op".into(),
@@ -385,6 +387,10 @@ fn every_admin_handler_refuses_a_non_admin_caller_itself() {
         (
             run_handler::<disk_grow::ProxmoxGuestDiskGrow>,
             serde_json::json!({"endpoint": "pve", "node": "n", "vmid": 1, "disk": "scsi0", "grow_gib": 1}),
+        ),
+        (
+            run_handler::<guest_label::ProxmoxGuestLabelApply>,
+            serde_json::json!({"endpoint": "pve", "vmid": [1]}),
         ),
         (
             run_handler::<tools::ProxmoxAction>,
