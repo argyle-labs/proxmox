@@ -66,9 +66,6 @@ thiserror   = "2"
 schemars    = { version = "1", features = ["derive"] }
 anyhow      = "1"
 tracing     = "0.1"
-# Subprocess entrypoint only: format the plugin's own tracing to stderr, which
-# orca's supervisor inherits. `env-filter` honors `RUST_LOG`.
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio       = { version = "1", features = ["full"] }
 # Parses an endpoint URL to decide whether it names this host.
 url         = "2"
@@ -92,6 +89,13 @@ openapi   = { version = "=0.2.1-rc.39", registry = "gitea", package = "orca-open
 [build-dependencies]
 plugin-toolkit-build = { version = "=0.2.1-rc.39", registry = "gitea", package = "orca-plugin-toolkit-build" }
 openapi = { version = "=0.2.1-rc.39", registry = "gitea", package = "orca-openapi" }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
 
 # Match orca's workspace lint floor: discarding a Result/Option via
 # `let _ = ...` was a load-bearing past incident, so keep it a hard error here
