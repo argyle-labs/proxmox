@@ -17,7 +17,7 @@ fn main() {
                 secret: "proxmox.{endpoint}.token_secret".to_string(),
             }),
             response: ResponseRules {
-                envelope: Some("/data".to_string()),
+                envelope: Some("data".to_string()),
                 null_as: None,
                 lenient_bool: true,
                 lenient_number: true,

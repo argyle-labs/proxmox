@@ -125,7 +125,7 @@ fn surface_binds_pve_auth_envelope_and_root() {
         "PVEAPIToken={endpoint.token_id}={secret}"
     );
     assert_eq!(s["auth"]["secret"], "proxmox.{endpoint}.token_secret");
-    assert_eq!(s["response"]["envelope"], "/data");
+    assert_eq!(s["response"]["envelope"], "data");
     assert_eq!(s["response"]["lenient_bool"], true);
     assert_eq!(s["response"]["lenient_number"], true);
     assert_eq!(s["endpoint"]["table"], "endpoints");

@@ -530,4 +530,39 @@ mod tests {
     fn extract_mac_returns_none_for_no_mac() {
         assert!(extract_mac("memory=4096,cores=4").is_none());
     }
+
+    #[test]
+    fn cluster_resources_decodes_a_pve_enveloped_reply() {
+        let surface: openapi::surface::ApiSurface =
+            serde_json::from_slice(crate::API_SURFACE).unwrap();
+        let op = surface
+            .find("proxmox.get_resources_cluster_resources")
+            .unwrap();
+        let body = serde_json::json!({"data": [
+            {"id": "qemu/101", "type": "qemu", "node": "pve1", "vmid": 101,
+             "name": "web", "status": "running", "template": 0, "cpu": 0.02,
+             "maxcpu": 4, "mem": 1073741824u64, "maxmem": 4294967296u64,
+             "disk": 0, "maxdisk": 34359738368u64, "uptime": 86400, "tags": "orca;web"},
+            {"id": "lxc/112", "type": "lxc", "node": "pve1", "vmid": 112,
+             "name": "freyr", "status": "stopped", "template": 0},
+            {"id": "node/pve1", "type": "node", "node": "pve1", "status": "online"},
+            {"id": "storage/pve1/local", "type": "storage", "node": "pve1",
+             "storage": "local", "plugintype": "dir", "status": "available"}
+        ]});
+        let decoded = surface
+            .decode_response(op, body.to_string().as_bytes())
+            .unwrap();
+        let reply = decoded.to_string();
+        let rows =
+            plugin_toolkit::capsink::with_cap_sink(Box::new(move |_, _| Ok(reply.clone())), || {
+                cluster_resources("pve", Some("vm"))
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].type_, ResourceType::Qemu);
+        assert_eq!(rows[0].vmid, Some(101));
+        assert_eq!(rows[0].template, Some(false));
+        assert_eq!(rows[1].type_, ResourceType::Lxc);
+        assert_eq!(rows[3].type_, ResourceType::Storage);
+    }
 }
