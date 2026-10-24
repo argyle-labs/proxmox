@@ -1074,9 +1074,9 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "orca-container-runtime"
-version = "0.2.1-rc.35"
+version = "0.2.1-rc.39"
 source = "sparse+https://gitea.scottkey.me/api/packages/argyle-labs/cargo/"
-checksum = "87b40b8291ec3bd66119d1133da91096d127da616f7fcb7bb79bc50ba5abc5fc"
+checksum = "7a1f229e79c80c315870a993c7736a308b1eb7c7653141d858ed50c39f3a07af"
 dependencies = [
  "orca-contract",
  "orca-derive",
@@ -1088,9 +1088,9 @@ dependencies = [
 
 [[package]]
 name = "orca-contract"
-version = "0.2.1-rc.35"
+version = "0.2.1-rc.39"
 source = "sparse+https://gitea.scottkey.me/api/packages/argyle-labs/cargo/"
-checksum = "1643048e548fe63d5b19899ee28de92b63afdc96e19f3e258c8ee5fc386b90af"
+checksum = "3c569b26fb1d8d7c1d8049efeeb52cdf4b4b8f23e76b642882c53fc13768b256"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1101,15 +1101,14 @@ dependencies = [
  "schemars 1.2.2",
  "serde",
  "serde_json",
- "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "orca-deploy-target"
-version = "0.2.1-rc.35"
+version = "0.2.1-rc.39"
 source = "sparse+https://gitea.scottkey.me/api/packages/argyle-labs/cargo/"
-checksum = "9e9246de5fb1e63b7e5011a42d65a312aa31c5e54608039dd1d65c765ab1c3ef"
+checksum = "86fe20a82f15c236d7552017c49254bcf8f66995a21131290c9c65aca1eb0886"
 dependencies = [
  "async-trait",
  "orca-plugin-abi",
@@ -1123,9 +1122,9 @@ dependencies = [
 
 [[package]]
 name = "orca-derive"
-version = "0.2.1-rc.35"
+version = "0.2.1-rc.39"
 source = "sparse+https://gitea.scottkey.me/api/packages/argyle-labs/cargo/"
-checksum = "0342bcfbacb6772ec936c30c8c1183822d2e0699c2f8f1318329814bb1590b3b"
+checksum = "4d74d5edc7587a5e634bb2637cc10712672bea0b0074f3feea37e4e5398d8db2"
 dependencies = [
  "orca-verb-shape",
  "proc-macro2",
@@ -1135,9 +1134,9 @@ dependencies = [
 
 [[package]]
 name = "orca-dispatch"
-version = "0.2.1-rc.35"
+version = "0.2.1-rc.39"
 source = "sparse+https://gitea.scottkey.me/api/packages/argyle-labs/cargo/"
-checksum = "44ab4d5247f96485648995cf2721e41328b7bbc30f7875baec010136b92443e5"
+checksum = "7d5c585b7248655986d29d7eccc9f27ee129e1b2bfddc8d13d0727a89b744591"
 dependencies = [
  "anyhow",
  "clap",
@@ -1149,16 +1148,15 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_path_to_error",
- "tokio",
  "tracing",
  "uuid",
 ]
 
 [[package]]
 name = "orca-macro-runtime"
-version = "0.2.1-rc.35"
+version = "0.2.1-rc.39"
 source = "sparse+https://gitea.scottkey.me/api/packages/argyle-labs/cargo/"
-checksum = "ed12263329f6b06d093bbe7bfdabac6ff9cd250f794e3d3aff877661e864e13c"
+checksum = "b8e716bc1da8753330460dee8101552c94a63a3e3774e335affc209f077803a9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1176,9 +1174,9 @@ dependencies = [
 
 [[package]]
 name = "orca-media"
-version = "0.2.1-rc.35"
+version = "0.2.1-rc.39"
 source = "sparse+https://gitea.scottkey.me/api/packages/argyle-labs/cargo/"
-checksum = "44acc371fe6f5fc497560521566614b4a5a90b8fceccb4b57efc1f535f4cbb6e"
+checksum = "2f93f4fab8501d1dbdacbc1e8b564ce0eaffd216be9e0c47e9a81931b4571417"
 dependencies = [
  "orca-derive",
  "orca-utils",
@@ -1190,9 +1188,9 @@ dependencies = [
 
 [[package]]
 name = "orca-openapi"
-version = "0.2.1-rc.35"
+version = "0.2.1-rc.39"
 source = "sparse+https://gitea.scottkey.me/api/packages/argyle-labs/cargo/"
-checksum = "5938c361f61d38b4064a387f28aed6521b0a484711b1c67d94797954a009db2b"
+checksum = "b52c6c3007e29fd88c44a7f78e6a68503b83c47f5b3a040c6b8af18266874ddd"
 dependencies = [
  "anyhow",
  "indexmap",
@@ -1207,9 +1205,9 @@ dependencies = [
 
 [[package]]
 name = "orca-plugin-abi"
-version = "0.2.1-rc.35"
+version = "0.2.1-rc.39"
 source = "sparse+https://gitea.scottkey.me/api/packages/argyle-labs/cargo/"
-checksum = "b3029d4949fca88e9387150a365d504091dba4a00d2b997028ba791ce586c675"
+checksum = "bb0019b73f65e2a9b203207dd827e2dca120c582c1329503d9eb8f90ed6c5914"
 dependencies = [
  "schemars 1.2.2",
  "serde",
@@ -1217,9 +1215,9 @@ dependencies = [
 
 [[package]]
 name = "orca-plugin-proto"
-version = "0.2.1-rc.35"
+version = "0.2.1-rc.39"
 source = "sparse+https://gitea.scottkey.me/api/packages/argyle-labs/cargo/"
-checksum = "bf6b75884d995d4a6f09dc73d981d08f5bee1ef8dfc99cffb1b1f64ca3124280"
+checksum = "692ff37789fb8165009695f53fa1c7b4bc1c547a1bbf51fb03edeba42d68adc8"
 dependencies = [
  "serde",
  "serde_json",
@@ -1228,9 +1226,9 @@ dependencies = [
 
 [[package]]
 name = "orca-plugin-toolkit"
-version = "0.2.1-rc.35"
+version = "0.2.1-rc.39"
 source = "sparse+https://gitea.scottkey.me/api/packages/argyle-labs/cargo/"
-checksum = "f18b42d597fc999b2c590688bb82c36e88b4ba412a1ec74d6fab019fa9e2946e"
+checksum = "a3883f7851862d94c0bb56dc801103383b4a9baf8a3c5c8ea3377df34ba5048c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1262,9 +1260,9 @@ dependencies = [
 
 [[package]]
 name = "orca-plugin-toolkit-build"
-version = "0.2.1-rc.35"
+version = "0.2.1-rc.39"
 source = "sparse+https://gitea.scottkey.me/api/packages/argyle-labs/cargo/"
-checksum = "ca18e95ecfbced158251b242b3a252c756b21ab5321b149dbb4adc076880d5c3"
+checksum = "c8a06cf40e6681d7eb84e63770be31a275eeb02e2da77c95946d41828db55d43"
 dependencies = [
  "anyhow",
  "graphql-parser",
@@ -1290,9 +1288,9 @@ dependencies = [
 
 [[package]]
 name = "orca-service"
-version = "0.2.1-rc.35"
+version = "0.2.1-rc.39"
 source = "sparse+https://gitea.scottkey.me/api/packages/argyle-labs/cargo/"
-checksum = "9dbbec1391a083ec3a3c2fef613c000758af3507bfda12a545507f0a47c6cbaf"
+checksum = "59e8710836946ad524170b326e29f081240c45dbde804045e4bf87e7e57c8d00"
 dependencies = [
  "orca-contract",
  "orca-deploy-target",
@@ -1306,9 +1304,9 @@ dependencies = [
 
 [[package]]
 name = "orca-storage"
-version = "0.2.1-rc.35"
+version = "0.2.1-rc.39"
 source = "sparse+https://gitea.scottkey.me/api/packages/argyle-labs/cargo/"
-checksum = "623dc0350bfb5abd8f3b6c2f623553ef2ddf83aca214ae6cb0a7b43426d764b0"
+checksum = "043c7eb82532454adbc5d116038d0da979cb5bda704dd2cd5557f46cac50f370"
 dependencies = [
  "orca-derive",
  "orca-utils",
@@ -1320,9 +1318,9 @@ dependencies = [
 
 [[package]]
 name = "orca-utils"
-version = "0.2.1-rc.35"
+version = "0.2.1-rc.39"
 source = "sparse+https://gitea.scottkey.me/api/packages/argyle-labs/cargo/"
-checksum = "0a788125acc17291b88728970bb9620cf8c4bd60d95a60466cecf33d9a8dcca7"
+checksum = "168b2834c429056c4cbc7107203445ac35925caf4305a557969864f13df96bb4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1346,9 +1344,9 @@ dependencies = [
 
 [[package]]
 name = "orca-verb-shape"
-version = "0.2.1-rc.35"
+version = "0.2.1-rc.39"
 source = "sparse+https://gitea.scottkey.me/api/packages/argyle-labs/cargo/"
-checksum = "9075065830ea4e4f5869ddf7e06460b3905b85843b7668b6d2a6d29a648148e2"
+checksum = "9f7c75efb5c7226aa1477039e2fe01b1cd932eaf862ad82fb4b300d5fdabfcef"
 
 [[package]]
 name = "parking_lot"
