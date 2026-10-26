@@ -239,7 +239,6 @@ const SELF_GATED: &[&str] = &[
     "proxmox.backup_job.delete",
     "proxmox.guest.pxarexclude",
     "proxmox.guest.standard.apply",
-    "proxmox.guest.update",
 ];
 
 #[test]
@@ -426,10 +425,6 @@ fn in_guest_verbs_are_unsupported_before_any_capability() {
             "proxmox.guest.standard.apply",
             serde_json::json!({"endpoint": "pve", "ctid": 116}),
         ),
-        (
-            "proxmox.guest.update",
-            serde_json::json!({"endpoint": "pve", "ctid": 116}),
-        ),
     ] {
         let ctx = test_ctx().with_auth(admin.clone());
         let err = plugin_toolkit::capsink::with_cap_sink(
@@ -448,4 +443,34 @@ fn in_guest_verbs_are_unsupported_before_any_capability() {
             "{name}: {err:#}"
         );
     }
+}
+
+#[test]
+fn guest_update_is_execute_gated_and_plans_without_touching_the_guest() {
+    assert!(is_execute_gated("proxmox.guest.update"));
+    let admin = plugin_toolkit::contract::CallerIdentity {
+        user_id: "u".into(),
+        username: "op".into(),
+        role: "admin".into(),
+        can_mutate: true,
+    };
+    let ctx = test_ctx().with_auth(admin);
+    let plan = plugin_toolkit::capsink::with_cap_sink(
+        Box::new(|cap: &str, raw: &str| panic!("plan reached capability {cap}: {raw}")),
+        || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(plugin_toolkit::dispatch::dispatch(
+                    "proxmox.guest.update",
+                    serde_json::json!({"endpoint": "pve", "ctid": 116, "updater": "apk"}),
+                    &ctx,
+                ))
+        },
+    )
+    .unwrap();
+    let text = plan.to_string();
+    assert!(text.contains("lxc/116"), "{text}");
+    assert!(text.contains("orca-update-backup.json"), "{text}");
 }

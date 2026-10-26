@@ -1,9 +1,10 @@
 # Guest standard: root console autologin and a backup-gated `update`
 
-> **Unsupported today.** Every in-container read, write and command below needs
-> exec or file I/O inside the LXC, which the PVE REST API does not offer. The
-> plugin has no root path, so audit, apply, update and pxarexclude refuse with
-> `unsupported: needs in-guest orca member` until such a member exists.
+> `proxmox.guest.update` runs its in-container steps through core's
+> `guest.exec` / `guest.write_file`, which core routes to the orca member on the
+> CT's PVE node (`pct exec` / `pct push` behind its allowlisted seam). Audit,
+> apply, pxarexclude and the unit `update` action refuse with
+> `unsupported: needs in-guest orca member`.
 
 Every LXC is held to two things beyond its resource floor:
 
@@ -29,13 +30,13 @@ unsupported.
 | --- | --- | --- |
 | `proxmox.guest.standard.audit` | read | unsupported |
 | `proxmox.guest.standard.apply` | admin | unsupported |
-| `proxmox.guest.update` | admin | unsupported |
+| `proxmox.guest.update` | admin | plan; with `execute`, back up then update |
 | `unit.update action=update` (lxc) | admin | returns a plan; unsupported with `"execute": true` in the payload |
 
 The unit action's dry run touches nothing, not even a read in the container, so
 it names how the updater is chosen rather than the exact commands.
 
-The rest of this document describes the steps an in-guest orca member would run.
+The rest of this document describes the in-container steps.
 
 ## Probe (read-only)
 
