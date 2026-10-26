@@ -75,7 +75,7 @@ Every VM and LXC across every enabled endpoint is a **unit** (`kind = vm` or `lx
 | `proxmox.guest.pxarexclude` | replace an LXC's `/.pxarexclude`. Unsupported: needs in-guest orca member *(role: admin)* |
 | `proxmox.guest.standard.audit` | an LXC's guest standard: OS, root console autologin, the orca `update` gate, the app's own updater, and a leftover forced-command backup key. Unsupported: needs in-guest orca member ([docs/guest-standard.md](docs/guest-standard.md)) |
 | `proxmox.guest.standard.apply` | install root console autologin and the `update` gate in an LXC. Unsupported: needs in-guest orca member *(role: admin)* |
-| `proxmox.guest.update` | back an LXC up through the PVE API, then run its updater. Unsupported: needs in-guest orca member *(role: admin)* |
+| `proxmox.guest.update` | back an LXC up through the PVE API, then run its updater through core's `guest.exec` on the CT's node *(role: admin, execute-gated)* |
 | `proxmox.guest.label.audit` | every VM and LXC missing tags or a description, or with a default or unclear name, with its current tags, name, description, orca unit id and suggested tags |
 | `proxmox.guest.label.apply` | set the default tags (`lxc`/`vm`, role, `orca-managed`, `stack-<stack>`, extras) and an orca-managed description block on one or many guests, keeping existing tags and operator text *(role: admin)* |
 | `proxmox.guest.file_pull` | copy a file out of a guest. Unsupported for LXC (needs in-guest orca member); refused for VMs *(role: admin)* |
@@ -109,7 +109,7 @@ The `pve-node-state` kind has one slot per node (node-scoped API reads; root-onl
 - `src/thin_discard.rs` — `proxmox.thin.{audit,enable_discard}`: LVM-thin discard drift + allocation divergence.
 - `src/unit_provider.rs` — the five-verb `vm` + `lxc` surface.
 - `src/guest_standard.rs` — `proxmox.guest.standard.{audit,apply}` + `proxmox.guest.update`: console autologin and the backup-gated `update`.
-- `src/lxc_guest.rs` — in-container I/O trait; the PVE REST API has none, so the real implementation refuses as unsupported.
+- `src/lxc_guest.rs` — in-container I/O trait; `SeamIo` calls core's `guest.exec` / `guest.write_file` (`tool.call`), routed to the orca member on the CT's PVE node.
 - `src/registration.rs`, `src/cluster_roster_impl.rs`, `src/topology.rs` — the three domain-backend registrations + impls.
 - `specs/`, `spec-tools/`, `examples/pve_to_openapi.rs` — convert Proxmox's `apidoc.js` into the vendored OpenAPI spec (`build.rs` codegens the typed client).
 - `docs/` — [setup.md](docs/setup.md) (install Proxmox), [tokens.md](docs/tokens.md) (API tokens), [guest-standard.md](docs/guest-standard.md) (console autologin + `update` gate).

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use plugin_toolkit::contract::plan::{ExecutionPlan, PlannedChange};
-use plugin_toolkit::contract::{BackupRef, CallerIdentity, UnitFacts, UnitGuard};
+use plugin_toolkit::contract::{BackupRef, BoxFuture, CallerIdentity, UnitFacts, UnitGuard};
 use plugin_toolkit::prelude::*;
 
 use crate::execute::{self, Change};
@@ -994,6 +994,103 @@ pub fn updater_steps(commands: Vec<Step>, os: &Os) -> Vec<Step> {
     ]
 }
 
+pub trait PreUpdateBackup: Sync {
+    fn backup<'a>(
+        &'a self,
+        ctid: u64,
+        storage: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<BackupRef>>;
+}
+
+fn restore_hint(ctid: u64, backup: &BackupRef) -> String {
+    let payload = serde_json::json!({ "from": backup }).to_string();
+    format!(
+        "Restore point: {}. Restore with unit.update on lxc {ctid} (manager {}), \
+         action=restore, payload {payload}",
+        backup.locator, backup.manager
+    )
+}
+
+static UPDATING: std::sync::Mutex<std::collections::BTreeSet<u64>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+struct UpdateLock(u64);
+
+impl UpdateLock {
+    fn take(ctid: u64) -> Result<Self> {
+        let mut held = UPDATING.lock().unwrap_or_else(|e| e.into_inner());
+        if !held.insert(ctid) {
+            bail!("an update of CT {ctid} is already in progress; nothing was changed");
+        }
+        Ok(Self(ctid))
+    }
+}
+
+impl Drop for UpdateLock {
+    fn drop(&mut self) {
+        UPDATING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
+pub async fn run_update(
+    io: &dyn GuestIo,
+    backup: &dyn PreUpdateBackup,
+    ctid: u64,
+    payload: &GuestUpdatePayload,
+) -> Result<GuestApplied> {
+    const TOOL: &str = "proxmox.guest.update";
+    let vmid = ctid as u32;
+    let _lock = UpdateLock::take(ctid)?;
+    let facts = probe(io, vmid).await?;
+    let commands = updater_commands(payload.updater, &facts)?;
+    refuse_blocked(TOOL, &commands)?;
+    if facts.os == Os::Debian {
+        let st = unit_state(io, vmid).await?;
+        if unit_running(&st) {
+            bail!("{TOOL}: {UPDATE_UNIT} is already running in CT {ctid}; nothing was changed");
+        }
+        require_own_unit(&st, false).map_err(|e| anyhow!("{TOOL}: {e}; nothing was changed"))?;
+    }
+    let backup_ref = backup.backup(ctid, payload.storage.as_deref()).await?;
+    let marker = Step::Write {
+        path: BACKUP_MARKER.to_string(),
+        contents: serde_json::to_string(&backup_ref)?,
+        mode: "0644",
+        before: None,
+    };
+    let mut all = vec![marker];
+    all.extend(updater_steps(commands, &facts.os));
+    let outcomes = run_steps(io, ctid, &all)
+        .await
+        .map_err(|e| anyhow!("{e:#}. {}", restore_hint(ctid, &backup_ref)))?;
+    Ok(GuestApplied {
+        ctid,
+        steps: outcomes,
+        backup: Some(backup_ref),
+    })
+}
+
+pub struct UnitBackup {
+    pub endpoint: String,
+}
+
+impl PreUpdateBackup for UnitBackup {
+    fn backup<'a>(
+        &'a self,
+        ctid: u64,
+        storage: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<BackupRef>> {
+        Box::pin(async move {
+            crate::unit_provider::ProxmoxUnitProvider::new()
+                .backup_lxc(&self.endpoint, ctid, storage)
+                .await
+        })
+    }
+}
+
 pub fn plan_update<A: Serialize>(
     tool: &str,
     inputs: &A,
@@ -1175,13 +1272,14 @@ pub struct GuestUpdateArgs {
 
 /// [MUTATES STATE] Back an LXC up through the PVE API (vzdump, waited on),
 /// record the backup in the container so its `update` gate opens for an hour,
-/// then run the updater. Unsupported: needs in-guest orca member.
+/// then run the updater through `guest.exec` on the CT's node.
 #[orca_tool(
     domain = "proxmox",
     verb = "guest.update",
     role = "admin",
-    execute_gated = false,
-    reaches = ["lxc.exec", "lxc.push"]
+    execute_gated = true,
+    reaches = ["proxmox.post_vzdump_nodes_node_vzdump"],
+    tool_calls = ["guest.exec", "guest.write_file"]
 )]
 async fn proxmox_guest_update(
     args: GuestUpdateArgs,
@@ -1189,7 +1287,24 @@ async fn proxmox_guest_update(
 ) -> Result<Change<GuestApplied>> {
     const TOOL: &str = "proxmox.guest.update";
     execute::require_admin(TOOL, ctx.caller().as_ref())?;
-    Err(lxc_guest::unsupported(args.ctid))
+    let payload = GuestUpdatePayload {
+        updater: args.updater,
+        storage: args.storage.clone(),
+        execute: args.execute,
+    };
+    if !args.execute {
+        return Ok(Change::Plan(plan_update(
+            TOOL, &args, args.ctid, &payload, None,
+        )?));
+    }
+    execute::authorize_execute(TOOL, ctx.caller().as_ref())?;
+    let io = lxc_guest::SeamIo::for_ct(&args.endpoint, args.ctid)?;
+    let backup = UnitBackup {
+        endpoint: args.endpoint.clone(),
+    };
+    Ok(Change::Applied(
+        run_update(&io, &backup, args.ctid, &payload).await?,
+    ))
 }
 
 #[cfg(test)]
@@ -1663,6 +1778,399 @@ ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,3840
         assert!(s.contains("apt-get update || exit 1"));
         assert!(gate_script("pve\"; rm -rf /", 116).is_err());
         assert!(gate_script("$(id)", 116).is_err());
+    }
+
+    struct FakeBackup(std::sync::Mutex<u32>);
+
+    impl PreUpdateBackup for FakeBackup {
+        fn backup<'a>(
+            &'a self,
+            ctid: u64,
+            _s: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<BackupRef>> {
+            Box::pin(async move {
+                *self.0.lock().unwrap() += 1;
+                Ok(BackupRef {
+                    locator: format!("/mnt/pve/backup/dump/vzdump-lxc-{ctid}.tar.zst"),
+                    manager: "proxmox@pve".into(),
+                    timestamp: 1,
+                    checksum: None,
+                })
+            })
+        }
+    }
+
+    fn start_key() -> String {
+        format!("systemctl start --no-block --job-mode=fail {UPDATE_UNIT}")
+    }
+
+    fn unit_key() -> String {
+        format!(
+            "systemctl show -p ActiveState -p Result -p InvocationID -p FragmentPath -p DropInPaths {UPDATE_UNIT}"
+        )
+    }
+
+    fn unit(
+        active: &str,
+        result: &str,
+        id: &str,
+        fragment: &str,
+        dropins: &str,
+    ) -> lxc_guest::ExecResult {
+        fake::ok(&format!(
+            "ActiveState={active}\nResult={result}\nInvocationID={id}\nFragmentPath={fragment}\nDropInPaths={dropins}"
+        ))
+    }
+
+    fn apt_update_replies(result: &str) -> Vec<(String, lxc_guest::ExecResult)> {
+        let mut r = debian(GETTY_UNIT, None, false);
+        let fresh = unit("inactive", "success", "", UPDATE_UNIT_PATH, "");
+        r.push((unit_key(), unit("inactive", "success", "", "", "")));
+        r.push((unit_key(), fresh.clone()));
+        r.push((unit_key(), fresh));
+        r.push((
+            unit_key(),
+            unit("activating", "success", "a1", UPDATE_UNIT_PATH, ""),
+        ));
+        let end = if result == "success" {
+            "active"
+        } else {
+            "failed"
+        };
+        r.push((unit_key(), unit(end, result, "a1", UPDATE_UNIT_PATH, "")));
+        r.push(("systemctl daemon-reload".into(), fake::ok("")));
+        r.push((start_key(), fake::ok("")));
+        r.push((
+            format!("systemctl status --no-pager --lines=40 {UPDATE_UNIT}"),
+            fake::ok("0 upgraded"),
+        ));
+        r
+    }
+
+    #[test]
+    fn update_backs_up_marks_then_runs_apt_as_a_unit() {
+        let io = io_of(apt_update_replies("success"));
+        let backup = FakeBackup(Default::default());
+        let out = rt()
+            .block_on(run_update(
+                &io,
+                &backup,
+                201,
+                &GuestUpdatePayload::default(),
+            ))
+            .unwrap();
+        assert_eq!(*backup.0.lock().unwrap(), 1);
+        assert_eq!(
+            out.steps.last().unwrap().output.as_deref(),
+            Some("0 upgraded")
+        );
+        let writes = io.writes.lock().unwrap();
+        assert_eq!(writes[0].0, BACKUP_MARKER);
+        assert!(writes[0].1.contains("vzdump-lxc-201"));
+        assert_eq!(writes[1].0, UPDATE_UNIT_PATH);
+        assert!(writes[1].1.contains("RemainAfterExit=yes\nEnvironment"));
+        assert!(writes[1].1.contains("StandardOutput=journal"));
+        assert!(
+            writes[1]
+                .1
+                .contains("Environment=DEBIAN_FRONTEND=noninteractive")
+        );
+        assert!(writes[1].1.contains("ExecStart=/usr/bin/apt-get update\n"));
+        assert!(writes[1].1.contains("--force-confold dist-upgrade\n"));
+    }
+
+    #[test]
+    fn a_failed_update_names_the_restore_point() {
+        let io = io_of(apt_update_replies("exit-code"));
+        let err = rt()
+            .block_on(run_update(
+                &io,
+                &FakeBackup(Default::default()),
+                202,
+                &GuestUpdatePayload::default(),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Result=exit-code"), "{err}");
+        assert!(
+            err.contains("action=restore") && err.contains("vzdump-lxc-202.tar.zst"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_running_update_is_refused_before_the_backup() {
+        let refused = |state: lxc_guest::ExecResult, ctid: u64| {
+            let mut replies = debian(GETTY_UNIT, None, false);
+            replies.push((unit_key(), state));
+            let backup = FakeBackup(Default::default());
+            let err = rt()
+                .block_on(run_update(
+                    &io_of(replies),
+                    &backup,
+                    ctid,
+                    &GuestUpdatePayload::default(),
+                ))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(*backup.0.lock().unwrap(), 0, "{err}");
+            err
+        };
+        let running = unit("activating", "success", "a1", UPDATE_UNIT_PATH, "");
+        assert!(refused(running, 203).contains("already running"));
+        let etc = unit(
+            "inactive",
+            "success",
+            "",
+            "/etc/systemd/system/orca-guest-update.service",
+            "",
+        );
+        assert!(refused(etc, 204).contains("loads from"));
+        let dropin = unit(
+            "inactive",
+            "success",
+            "",
+            UPDATE_UNIT_PATH,
+            "/etc/systemd/system/orca-guest-update.service.d/x.conf",
+        );
+        assert!(refused(dropin, 205).contains("has drop-ins"));
+    }
+
+    #[test]
+    fn a_unit_that_never_starts_is_an_error_not_a_stale_result() {
+        let mut replies = debian(GETTY_UNIT, None, false);
+        let held = unit("active", "success", "old", UPDATE_UNIT_PATH, "");
+        for _ in 0..3 {
+            replies.push((unit_key(), held.clone()));
+        }
+        replies.push((
+            unit_key(),
+            unit("inactive", "success", "old", UPDATE_UNIT_PATH, ""),
+        ));
+        replies.push(("systemctl daemon-reload".into(), fake::ok("")));
+        replies.push((
+            format!("systemctl stop --job-mode=fail {UPDATE_UNIT}"),
+            fake::ok(""),
+        ));
+        replies.push((start_key(), fake::ok("")));
+        replies.push((late_key(), late("inactive", "old", "42")));
+        replies.push((jobs_key(), jobs("42", "start")));
+        replies.push(("systemctl cancel 42".into(), fake::ok("")));
+        replies.push((late_key(), late("inactive", "old", "")));
+        let io = io_of(replies);
+        let err = rt()
+            .block_on(run_update(
+                &io,
+                &FakeBackup(Default::default()),
+                206,
+                &GuestUpdatePayload::default(),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("did not start"), "{err}");
+        assert!(err.contains("start job 42 was cancelled"), "{err}");
+        assert!(err.contains("action=restore"), "{err}");
+        let execs = io.execs.lock().unwrap();
+        assert!(
+            !execs
+                .iter()
+                .any(|e| e.contains("restart") || e.contains("stop --no-block")),
+            "{execs:?}"
+        );
+    }
+
+    fn late_key() -> String {
+        format!("systemctl show -p ActiveState -p Result -p InvocationID -p Job {UPDATE_UNIT}")
+    }
+
+    fn late(active: &str, id: &str, job: &str) -> lxc_guest::ExecResult {
+        let result = if active == "active" { "success" } else { "" };
+        fake::ok(&format!(
+            "ActiveState={active}\nResult={result}\nInvocationID={id}\nJob={job}"
+        ))
+    }
+
+    fn jobs_key() -> String {
+        format!("systemctl list-jobs --no-legend --no-pager {UPDATE_UNIT}")
+    }
+
+    fn jobs(id: &str, kind: &str) -> lxc_guest::ExecResult {
+        fake::ok(&format!("{id} {UPDATE_UNIT} {kind} waiting\n"))
+    }
+
+    fn slow_start_replies() -> Vec<(String, lxc_guest::ExecResult)> {
+        let mut r = debian(GETTY_UNIT, None, false);
+        let fresh = unit("inactive", "success", "old", UPDATE_UNIT_PATH, "");
+        r.push((unit_key(), unit("inactive", "success", "old", "", "")));
+        r.push((unit_key(), fresh));
+        r.push(("systemctl daemon-reload".into(), fake::ok("")));
+        r.push((start_key(), fake::ok("")));
+        r.push((
+            format!("systemctl status --no-pager --lines=40 {UPDATE_UNIT}"),
+            fake::ok("0 upgraded"),
+        ));
+        r
+    }
+
+    fn update(io: &FakeIo, ctid: u64) -> Result<GuestApplied> {
+        rt().block_on(run_update(
+            io,
+            &FakeBackup(Default::default()),
+            ctid,
+            &GuestUpdatePayload::default(),
+        ))
+    }
+
+    #[test]
+    fn a_run_seen_at_the_start_timeout_is_followed_not_cancelled() {
+        let mut replies = slow_start_replies();
+        replies.push((late_key(), late("active", "new", "")));
+        let io = io_of(replies);
+        let out = update(&io, 210).unwrap();
+        assert_eq!(
+            out.steps.last().unwrap().output.as_deref(),
+            Some("0 upgraded")
+        );
+        let execs = io.execs.lock().unwrap();
+        assert!(
+            !execs
+                .iter()
+                .any(|e| e.contains("cancel") || e.contains("stop")),
+            "{execs:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_that_began_before_the_cancel_is_still_reported() {
+        let mut replies = slow_start_replies();
+        replies.push((late_key(), late("inactive", "old", "42")));
+        replies.push((jobs_key(), jobs("42", "start")));
+        replies.push(("systemctl cancel 42".into(), fake::ok("")));
+        replies.push((late_key(), late("active", "new", "")));
+        let out = update(&io_of(replies), 211).unwrap();
+        assert_eq!(
+            out.steps.last().unwrap().output.as_deref(),
+            Some("0 upgraded")
+        );
+    }
+
+    #[test]
+    fn job_zero_is_never_cancelled() {
+        let mut replies = slow_start_replies();
+        replies.push((late_key(), late("inactive", "old", "0")));
+        let io = io_of(replies);
+        let err = update(&io, 213).unwrap_err().to_string();
+        assert!(err.contains("no start job is queued"), "{err}");
+        assert!(err.contains("action=restore"), "{err}");
+        let execs = io.execs.lock().unwrap();
+        assert!(!execs.iter().any(|e| e.contains("cancel")), "{execs:?}");
+    }
+
+    #[test]
+    fn a_queued_job_that_is_not_a_start_is_left_alone() {
+        let mut replies = slow_start_replies();
+        replies.push((late_key(), late("inactive", "old", "42")));
+        replies.push((jobs_key(), jobs("42", "stop")));
+        let io = io_of(replies);
+        let err = update(&io, 214).unwrap_err().to_string();
+        assert!(err.contains("is a stop job, not a start"), "{err}");
+        assert!(err.contains("action=restore"), "{err}");
+        let execs = io.execs.lock().unwrap();
+        assert!(!execs.iter().any(|e| e.contains("cancel")), "{execs:?}");
+    }
+
+    #[test]
+    fn a_job_gone_from_the_queue_is_not_cancelled() {
+        let mut replies = slow_start_replies();
+        replies.push((late_key(), late("inactive", "old", "42")));
+        replies.push((jobs_key(), fake::ok("")));
+        let io = io_of(replies);
+        let err = update(&io, 215).unwrap_err().to_string();
+        assert!(err.contains("job 42 is no longer queued"), "{err}");
+        let execs = io.execs.lock().unwrap();
+        assert!(!execs.iter().any(|e| e.contains("cancel")), "{execs:?}");
+    }
+
+    #[test]
+    fn an_unreadable_job_type_is_not_cancelled() {
+        let mut replies = slow_start_replies();
+        replies.push((late_key(), late("inactive", "old", "42")));
+        replies.push((
+            jobs_key(),
+            lxc_guest::ExecResult {
+                success: false,
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: "Failed to connect to bus".into(),
+            },
+        ));
+        let io = io_of(replies);
+        let err = update(&io, 216).unwrap_err().to_string();
+        assert!(err.contains("type could not be read"), "{err}");
+        let execs = io.execs.lock().unwrap();
+        assert!(!execs.iter().any(|e| e.contains("cancel")), "{execs:?}");
+    }
+
+    #[test]
+    fn a_failed_cancel_leaves_the_start_queued_and_names_the_restore_point() {
+        let mut replies = slow_start_replies();
+        replies.push((late_key(), late("inactive", "old", "42")));
+        replies.push((jobs_key(), jobs("42", "start")));
+        replies.push((
+            "systemctl cancel 42".into(),
+            lxc_guest::ExecResult {
+                success: false,
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: "Job 42 not found".into(),
+            },
+        ));
+        let io = io_of(replies);
+        let err = update(&io, 212).unwrap_err().to_string();
+        assert!(err.contains("queued, not started"), "{err}");
+        assert!(err.contains("action=restore"), "{err}");
+        let execs = io.execs.lock().unwrap();
+        assert!(!execs.iter().any(|e| e.contains("stop")), "{execs:?}");
+    }
+
+    #[test]
+    fn a_run_started_after_the_backup_is_never_restarted_or_joined() {
+        let mut replies = debian(GETTY_UNIT, None, false);
+        let fresh = unit("inactive", "success", "", UPDATE_UNIT_PATH, "");
+        replies.push((unit_key(), fresh.clone()));
+        replies.push((unit_key(), fresh));
+        replies.push((
+            unit_key(),
+            unit("activating", "success", "theirs", UPDATE_UNIT_PATH, ""),
+        ));
+        replies.push(("systemctl daemon-reload".into(), fake::ok("")));
+        let io = io_of(replies);
+        let err = rt()
+            .block_on(run_update(
+                &io,
+                &FakeBackup(Default::default()),
+                209,
+                &GuestUpdatePayload::default(),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("started by someone else"), "{err}");
+        let execs = io.execs.lock().unwrap();
+        assert!(
+            !execs
+                .iter()
+                .any(|e| e.starts_with("systemctl start") || e.starts_with("systemctl stop")),
+            "{execs:?}"
+        );
+    }
+
+    #[test]
+    fn one_update_per_ct_at_a_time() {
+        let held = UpdateLock::take(207).unwrap();
+        let err = UpdateLock::take(207).err().unwrap().to_string();
+        assert!(err.contains("already in progress"), "{err}");
+        drop(held);
+        UpdateLock::take(207).unwrap();
     }
 
     #[test]

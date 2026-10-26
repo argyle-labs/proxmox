@@ -22,7 +22,16 @@ pub trait GuestIo: Sync {
     ) -> BoxFuture<'a, Result<()>>;
 }
 
-pub struct SeamIo;
+pub type ToolCall = fn(&str, serde_json::Value) -> Result<serde_json::Value>;
+
+pub const EXEC_TIMEOUT_MS: u64 = 300_000;
+pub const UPDATE_TIMEOUT_MS: u64 = 3_600_000;
+const LONG_RUNNING: &[&str] = &["/sbin/apk", "apk", "/usr/bin/update"];
+
+pub struct SeamIo {
+    pub node: String,
+    pub call: ToolCall,
+}
 
 pub fn unsupported(vmid: u64) -> anyhow::Error {
     anyhow!("CT {vmid}: {UNSUPPORTED}")
@@ -30,19 +39,85 @@ pub fn unsupported(vmid: u64) -> anyhow::Error {
 
 pub const UNSUPPORTED: &str = "unsupported: needs in-guest orca member (the PVE REST API cannot exec in or write files into an LXC)";
 
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct ExecOutput {
+    exit_code: Option<i64>,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+}
+
+fn timeout_ms(argv: &[&str]) -> u64 {
+    match argv.first() {
+        Some(p) if LONG_RUNNING.contains(p) => UPDATE_TIMEOUT_MS,
+        _ => EXEC_TIMEOUT_MS,
+    }
+}
+
+impl SeamIo {
+    pub fn for_ct(endpoint: &str, ctid: u64) -> Result<Self> {
+        Ok(Self {
+            node: find_ct(endpoint, ctid)?.node,
+            call: plugin_toolkit::tool_call::call_json,
+        })
+    }
+}
+
 impl GuestIo for SeamIo {
-    fn exec<'a>(&'a self, vmid: u32, _argv: &'a [&'a str]) -> BoxFuture<'a, Result<ExecResult>> {
-        Box::pin(async move { bail!("CT {vmid}: {UNSUPPORTED}") })
+    fn exec<'a>(&'a self, vmid: u32, argv: &'a [&'a str]) -> BoxFuture<'a, Result<ExecResult>> {
+        Box::pin(async move {
+            let out = (self.call)(
+                "guest.exec",
+                json!({
+                    "id": vmid.to_string(),
+                    "argv": argv,
+                    "node": self.node,
+                    "timeoutMs": timeout_ms(argv),
+                }),
+            )
+            .with_context(|| format!("guest.exec in CT {vmid} on {}", self.node))?;
+            let out: ExecOutput = serde_json::from_value(out)
+                .map_err(|e| anyhow!("guest.exec in CT {vmid}: unexpected reply: {e}"))?;
+            if out.timed_out {
+                bail!(
+                    "CT {vmid}: `{}` did not finish within {}s",
+                    argv.join(" "),
+                    timeout_ms(argv) / 1000
+                );
+            }
+            Ok(ExecResult {
+                success: out.exit_code == Some(0),
+                exit_code: out.exit_code.and_then(|c| i32::try_from(c).ok()),
+                stdout: out.stdout,
+                stderr: out.stderr,
+            })
+        })
     }
 
     fn write<'a>(
         &'a self,
         vmid: u32,
-        _path: &'a str,
-        _contents: &'a [u8],
-        _mode: Option<&'a str>,
+        path: &'a str,
+        contents: &'a [u8],
+        mode: Option<&'a str>,
     ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move { bail!("CT {vmid}: {UNSUPPORTED}") })
+        Box::pin(async move {
+            let contents = std::str::from_utf8(contents)
+                .map_err(|_| anyhow!("write {path} in CT {vmid}: contents are not UTF-8"))?;
+            (self.call)(
+                "guest.write_file",
+                json!({
+                    "id": vmid.to_string(),
+                    "path": path,
+                    "contents": contents,
+                    "mode": mode,
+                    "node": self.node,
+                }),
+            )
+            .with_context(|| format!("guest.write_file {path} in CT {vmid} on {}", self.node))?;
+            Ok(())
+        })
     }
 }
 
@@ -362,6 +437,133 @@ pub mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    thread_local! {
+        static SENT: std::cell::RefCell<Vec<(String, serde_json::Value)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn record(tool: &str, args: serde_json::Value) -> Result<serde_json::Value> {
+        SENT.with(|s| s.borrow_mut().push((tool.to_string(), args)));
+        Ok(json!({ "exitCode": 0, "stdout": "ok\n", "stderr": "" }))
+    }
+
+    fn sent() -> Vec<(String, serde_json::Value)> {
+        SENT.with(|s| s.borrow_mut().drain(..).collect())
+    }
+
+    fn seam(call: ToolCall) -> SeamIo {
+        SeamIo {
+            node: "thor".into(),
+            call,
+        }
+    }
+
+    #[test]
+    fn exec_routes_through_guest_exec_on_the_cts_node() {
+        let r = rt()
+            .block_on(seam(record).exec(120, &["/sbin/apk", "upgrade"]))
+            .unwrap();
+        assert!(r.success);
+        assert_eq!(r.exit_code, Some(0));
+        assert_eq!(r.stdout, "ok\n");
+        assert_eq!(
+            sent(),
+            vec![(
+                "guest.exec".to_string(),
+                json!({
+                    "id": "120",
+                    "argv": ["/sbin/apk", "upgrade"],
+                    "node": "thor",
+                    "timeoutMs": UPDATE_TIMEOUT_MS,
+                })
+            )]
+        );
+    }
+
+    #[test]
+    fn short_commands_keep_the_default_timeout() {
+        rt().block_on(seam(record).exec(7, &["stat", "/etc/os-release"]))
+            .unwrap();
+        assert_eq!(sent()[0].1["timeoutMs"], json!(EXEC_TIMEOUT_MS));
+        rt().block_on(seam(record).exec(7, &["/usr/bin/update"]))
+            .unwrap();
+        assert_eq!(sent()[0].1["timeoutMs"], json!(UPDATE_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn a_nonzero_exit_is_a_failed_result() {
+        fn failed(_: &str, _: serde_json::Value) -> Result<serde_json::Value> {
+            Ok(json!({ "exitCode": 1, "stdout": "", "stderr": "No such file" }))
+        }
+        let r = rt()
+            .block_on(seam(failed).exec(7, &["ls", "-d", "/x"]))
+            .unwrap();
+        assert!(!r.success);
+        assert_eq!(r.exit_code, Some(1));
+        assert_eq!(r.stderr, "No such file");
+    }
+
+    #[test]
+    fn a_timeout_is_an_error() {
+        fn timed_out(_: &str, _: serde_json::Value) -> Result<serde_json::Value> {
+            Ok(json!({ "stdout": "", "stderr": "", "timedOut": true }))
+        }
+        let err = rt()
+            .block_on(seam(timed_out).exec(7, &["/sbin/apk", "upgrade"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("did not finish within 3600s"), "{err}");
+    }
+
+    #[test]
+    fn a_refused_call_names_the_ct_and_node() {
+        fn refused(_: &str, _: serde_json::Value) -> Result<serde_json::Value> {
+            Err(anyhow!("refused command 'curl'"))
+        }
+        let err = format!(
+            "{:#}",
+            rt().block_on(seam(refused).exec(7, &["curl"])).unwrap_err()
+        );
+        assert!(err.contains("CT 7 on thor"), "{err}");
+        assert!(err.contains("refused command"), "{err}");
+    }
+
+    #[test]
+    fn write_routes_through_guest_write_file() {
+        rt().block_on(seam(record).write(120, "/run/orca-update-backup.json", b"{}", Some("0644")))
+            .unwrap();
+        assert_eq!(
+            sent(),
+            vec![(
+                "guest.write_file".to_string(),
+                json!({
+                    "id": "120",
+                    "path": "/run/orca-update-backup.json",
+                    "contents": "{}",
+                    "mode": "0644",
+                    "node": "thor",
+                })
+            )]
+        );
+    }
+
+    #[test]
+    fn write_refuses_non_utf8_contents() {
+        let err = rt()
+            .block_on(seam(record).write(7, "/etc/x", &[0xff], None))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not UTF-8"), "{err}");
+        assert!(sent().is_empty());
+    }
 
     #[test]
     fn an_unlisted_guest_is_absent_only_when_its_id_is_free() {

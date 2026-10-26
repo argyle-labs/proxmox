@@ -822,6 +822,32 @@ impl ProxmoxUnitProvider {
         )))
     }
 
+    pub(crate) async fn backup_lxc(
+        &self,
+        endpoint: &str,
+        ctid: u64,
+        storage: Option<&str>,
+    ) -> Result<BackupRef> {
+        let id = UnitId {
+            manager: manager_for(endpoint),
+            kind: KIND_LXC.to_string(),
+            id: ctid.to_string(),
+            name: String::new(),
+        };
+        let payload = BackupPayload {
+            storage: storage.map(str::to_string),
+            ..Default::default()
+        };
+        match self
+            .do_backup(&id, Some(serde_json::to_string(&payload)?))
+            .await?
+        {
+            VerbOutcome::Item(item) => serde_json::from_str(&item.payload)
+                .map_err(|e| anyhow!("backup ref from vzdump: {e}")),
+            _ => Err(anyhow!("backup of lxc {ctid} returned no backup ref")),
+        }
+    }
+
     /// `update` on an LXC: a plan unless the payload sets `execute`; then, for
     /// an admin caller, back up and run the in-container updater. Node-local.
     async fn do_guest_update(&self, args: &UpdateArgs) -> Result<VerbOutcome> {
