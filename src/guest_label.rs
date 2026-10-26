@@ -441,9 +441,9 @@ fn read_guest(
     })
 }
 
-type Located = (String, GuestKind, u64, Option<String>);
+pub(crate) type Located = (String, GuestKind, u64, Option<String>);
 
-fn guests(endpoint: &str, node: Option<&str>) -> Result<Vec<Located>> {
+pub(crate) fn guests(endpoint: &str, node: Option<&str>) -> Result<Vec<Located>> {
     Ok(cluster_resources(endpoint, Some("vm"))?
         .into_iter()
         .filter(|r| r.template != Some(true))

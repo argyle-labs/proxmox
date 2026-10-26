@@ -9,6 +9,7 @@ pub mod deploy;
 pub mod diagnostics;
 pub mod disk_grow;
 pub mod execute;
+pub mod guest_config;
 pub mod guest_exec;
 pub mod guest_file;
 pub mod guest_label;
