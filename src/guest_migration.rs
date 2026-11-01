@@ -94,7 +94,7 @@ pub fn carry_over(old: &BTreeMap<String, String>) -> CarryPlan {
     plan
 }
 
-const GATEWAY_NAMES: &[&str] = &["loki", "opnsense", "pfsense", "gateway"];
+const GATEWAY_NAMES: &[&str] = &["opnsense", "pfsense", "gateway"];
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -509,7 +509,7 @@ pub fn plan(endpoint: &str, source_vmid: u64, target_vmid: u64) -> Result<GuestM
 /// Plan moving a guest's identity and config onto a replacement guest:
 /// hostname, each `netN` MAC and IP, tags, the orca system id, the config
 /// keys and mounts that carry over, the vzdump jobs and firewall rules to
-/// follow it, and every conflict. Gateway guests (loki, OPNsense) are
+/// follow it, and every conflict. Gateway guests (OPNsense, pfSense) are
 /// refused. Reads only; nothing changes. Admin only: the plan carries MACs,
 /// IPs and host paths.
 #[orca_tool(
@@ -546,7 +546,7 @@ mod tests {
     #[test]
     fn copies_purpose_skips_identity_and_routes_volumes_to_a_move() {
         let old: BTreeMap<String, String> = [
-            ("hostname", "freyr"),
+            ("hostname", "guest-c"),
             ("cores", "4"),
             ("memory", "8192"),
             (
@@ -588,40 +588,40 @@ mod tests {
     fn routes(method: &str, path: &str) -> String {
         match (method, path) {
             (_, "/cluster/resources") => r#"[
-                {"type":"qemu","node":"thor","vmid":112,"name":"baldur"},
-                {"type":"lxc","node":"thor","vmid":106,"name":"baldur-new"},
-                {"type":"lxc","node":"odin","vmid":107,"name":"elsewhere"},
-                {"type":"qemu","node":"thor","vmid":100,"name":"loki"}
+                {"type":"qemu","node":"node-a","vmid":9001,"name":"guest-a"},
+                {"type":"lxc","node":"node-a","vmid":9002,"name":"guest-b"},
+                {"type":"lxc","node":"node-b","vmid":9003,"name":"elsewhere"},
+                {"type":"qemu","node":"node-a","vmid":9004,"name":"gw-test"}
             ]"#
             .into(),
             (_, "/cluster/status") => r#"[{"type":"cluster","name":"lab","id":"cluster"}]"#.into(),
-            ("GET", "/nodes/thor/qemu/112/config") => format!(
-                r#"{{"name":"baldur","cores":4,"memory":8192,"onboot":1,"startup":"order=2",
+            ("GET", "/nodes/node-a/qemu/9001/config") => format!(
+                r#"{{"name":"guest-a","cores":4,"memory":8192,"onboot":1,"startup":"order=2",
                 "tags":"media;orca-managed",
                 "description":"<!-- orca-managed -->\nSystem id: `{SYS}`\n<!-- /orca-managed -->",
                 "net0":"virtio=BC:24:11:AA:BB:CC,bridge=vmbr0",
                 "ipconfig0":"ip=10.0.0.5/24,gw=10.0.0.1",
-                "scsi0":"local-lvm:vm-112-disk-0,size=64G",
+                "scsi0":"local-lvm:vm-9001-disk-0,size=64G",
                 "smbios1":"uuid=1234","digest":"d1"}}"#
             ),
-            ("GET", "/nodes/thor/lxc/106/config") => r#"{"hostname":"baldur-new","cores":2,
-                "tags":"lxc","rootfs":"local-lvm:vm-106-disk-0,size=8G",
+            ("GET", "/nodes/node-a/lxc/9002/config") => r#"{"hostname":"guest-b","cores":2,
+                "tags":"lxc","rootfs":"local-lvm:vm-9002-disk-0,size=8G",
                 "net0":"name=eth0,bridge=vmbr0,hwaddr=BC:24:11:00:00:01,ip=dhcp,type=veth",
                 "mp0":"/mnt/old,mp=/old"}"#
                 .into(),
-            ("GET", "/nodes/odin/lxc/107/config") => r#"{"hostname":"elsewhere"}"#.into(),
-            ("GET", "/nodes/thor/qemu/100/config") => r#"{"name":"loki","net0":"virtio=BC:24:11:FF:FF:FF,bridge=vmbr0"}"#.into(),
+            ("GET", "/nodes/node-b/lxc/9003/config") => r#"{"hostname":"elsewhere"}"#.into(),
+            ("GET", "/nodes/node-a/qemu/9004/config") => r#"{"name":"gw-test","tags":"gateway","net0":"virtio=BC:24:11:FF:FF:FF,bridge=vmbr0"}"#.into(),
             ("GET", "/cluster/backup") => r#"[
-                {"id":"nightly","type":"vzdump","enabled":1,"schedule":"03:00","storage":"pbs","vmid":"112"},
+                {"id":"nightly","type":"vzdump","enabled":1,"schedule":"03:00","storage":"pbs","vmid":"9001"},
                 {"id":"weekly","type":"vzdump","enabled":1,"schedule":"sun 01:00","storage":"pbs","all":1},
                 {"id":"other","type":"vzdump","enabled":1,"schedule":"02:00","storage":"pbs","vmid":"200"}
             ]"#
             .into(),
-            ("GET", "/nodes/thor/qemu/112/firewall/rules") => r#"[{"pos":0,"type":"in","action":"ACCEPT"},{"pos":1,"type":"in","action":"DROP"}]"#.into(),
-            ("GET", "/nodes/thor/qemu/112/firewall/options") => r#"{"enable":1,"policy_in":"DROP"}"#.into(),
-            ("GET", "/nodes/thor/qemu/112/firewall/ipset") => r#"[{"name":"trusted"}]"#.into(),
-            ("GET", "/nodes/thor/lxc/106/firewall/rules") => r#"[{"pos":0,"type":"in","action":"ACCEPT"}]"#.into(),
-            ("GET", "/nodes/thor/lxc/106/firewall/ipset") => r#"[{"name":"trusted"}]"#.into(),
+            ("GET", "/nodes/node-a/qemu/9001/firewall/rules") => r#"[{"pos":0,"type":"in","action":"ACCEPT"},{"pos":1,"type":"in","action":"DROP"}]"#.into(),
+            ("GET", "/nodes/node-a/qemu/9001/firewall/options") => r#"{"enable":1,"policy_in":"DROP"}"#.into(),
+            ("GET", "/nodes/node-a/qemu/9001/firewall/ipset") => r#"[{"name":"trusted"}]"#.into(),
+            ("GET", "/nodes/node-a/lxc/9002/firewall/rules") => r#"[{"pos":0,"type":"in","action":"ACCEPT"}]"#.into(),
+            ("GET", "/nodes/node-a/lxc/9002/firewall/ipset") => r#"[{"name":"trusted"}]"#.into(),
             (_, p) if p.contains("/firewall/") => "[]".into(),
             _ => "null".into(),
         }
@@ -629,16 +629,16 @@ mod tests {
 
     #[test]
     fn plans_identity_tags_jobs_and_firewall_and_only_reads() {
-        let (out, calls) = record_api_calls(routes, || plan("pve", 112, 106));
+        let (out, calls) = record_api_calls(routes, || plan("pve", 9001, 9002));
         let p = out.unwrap();
         assert!(calls.iter().all(|(m, ..)| m == "GET"), "{calls:?}");
         assert!(p.dry_run);
         assert_eq!(p.source.system_id.as_deref(), Some(SYS));
-        assert_eq!(p.source.unit_id, "cluster:lab/vm/112");
+        assert_eq!(p.source.unit_id, "cluster:lab/vm/9001");
         assert_eq!(p.target.kind, "lxc");
         let field = |f: &str| p.identity.iter().find(|m| m.field == f).cloned().unwrap();
-        assert_eq!(field("hostname").to.as_deref(), Some("baldur"));
-        assert_eq!(field("hostname").from.as_deref(), Some("baldur-new"));
+        assert_eq!(field("hostname").to.as_deref(), Some("guest-a"));
+        assert_eq!(field("hostname").from.as_deref(), Some("guest-b"));
         assert_eq!(field("net0.mac").to.as_deref(), Some("BC:24:11:AA:BB:CC"));
         assert_eq!(field("net0.mac").from.as_deref(), Some("BC:24:11:00:00:01"));
         assert_eq!(field("net0.ip").to.as_deref(), Some("10.0.0.5/24"));
@@ -659,28 +659,28 @@ mod tests {
         assert!(c.contains("1 firewall rules"), "{c}");
         assert!(c.contains("ipset 'trusted'"), "{c}");
         assert!(
-            c.contains("target 106 has no orca system id; identity takeover can't be verified"),
+            c.contains("target 9002 has no orca system id; identity takeover can't be verified"),
             "{c}"
         );
-        assert!(!c.contains("source 112 has no orca system id"), "{c}");
+        assert!(!c.contains("source 9001 has no orca system id"), "{c}");
     }
 
     #[test]
     fn a_missing_system_id_on_either_side_is_a_conflict() {
-        let (out, _) = record_api_calls(routes, || plan("pve", 106, 107));
+        let (out, _) = record_api_calls(routes, || plan("pve", 9002, 9003));
         let c = out.unwrap().conflicts.join("\n");
-        assert!(c.contains("source 106 has no orca system id"), "{c}");
-        assert!(c.contains("target 107 has no orca system id"), "{c}");
+        assert!(c.contains("source 9002 has no orca system id"), "{c}");
+        assert!(c.contains("target 9003 has no orca system id"), "{c}");
     }
 
     #[test]
     fn a_gateway_on_either_side_is_refused() {
-        let (out, _) = record_api_calls(routes, || plan("pve", 106, 100));
+        let (out, _) = record_api_calls(routes, || plan("pve", 9002, 9004));
         let e = out.unwrap_err().to_string();
-        assert!(e.contains("target 100 ('loki') is a gateway"), "{e}");
+        assert!(e.contains("target 9004 ('gw-test') is a gateway"), "{e}");
         assert!(is_gateway("edge", &["opnsense".into()]));
         assert!(is_gateway("OPNsense-fw", &[]));
-        assert!(!is_gateway("lokinet-docs", &[]));
+        assert!(!is_gateway("gatewayless-docs", &[]));
     }
 
     #[test]
@@ -688,15 +688,15 @@ mod tests {
         let (out, _) = record_api_calls(
             |m, p| {
                 match p {
-                "/nodes/thor/lxc/106/config" => r#"{"hostname":"a","mp0":"/mnt/media,mp=/media","net1":"name=eth1,bridge=vmbr1"}"#.into(),
+                "/nodes/node-a/lxc/9002/config" => r#"{"hostname":"a","mp0":"/mnt/media,mp=/media","net1":"name=eth1,bridge=vmbr1"}"#.into(),
                 _ => routes(m, p),
             }
             },
-            || plan("pve", 106, 107),
+            || plan("pve", 9002, 9003),
         );
         let c = out.unwrap().conflicts.join("\n");
         assert!(
-            c.contains("mp0 binds host path /mnt/media on thor; the target is on odin"),
+            c.contains("mp0 binds host path /mnt/media on node-a; the target is on node-b"),
             "{c}"
         );
         assert!(c.contains("target has no net1"), "{c}");
@@ -710,7 +710,7 @@ mod tests {
                 .to_string()
                 .contains("same guest")
         );
-        let (out, _) = record_api_calls(routes, || plan("pve", 112, 999));
+        let (out, _) = record_api_calls(routes, || plan("pve", 9001, 999));
         assert!(out.unwrap_err().to_string().contains("guest 999 not found"));
     }
 
