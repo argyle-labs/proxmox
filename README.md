@@ -80,6 +80,7 @@ Every VM and LXC across every enabled endpoint is a **unit** (`kind = vm` or `lx
 | `proxmox.guest.label.apply` | set the default tags (`lxc`/`vm`, role, `orca-managed`, `stack-<stack>`, extras) and an orca-managed description block on one or many guests, keeping existing tags and operator text *(role: admin)* |
 | `proxmox.guest.config` | one VM or LXC's PVE config by `endpoint` and `vmid` (node resolved from cluster resources), allowlisted for every caller: only `cores`, `memory`, `sockets`, `ostype`, `onboot`, `unprivileged`, `features`, `hostname`/`name`, each `net*` as `{model, bridge}` (no MAC) and each disk as `{size}`; `cipassword`, `sshkeys`, `cicustom`, `description`, `args`, `hookscript`, `smbios1` and `lxc.*` are never in it. An LXC also gets `lxcIsolation`: `unprivileged`, `privileged`, `capDrop`, `capKeep`, `seccompProfile`, `mountAuto`, `idmapCount`, `fuse`, `mount`, `apparmorProfile`, `nesting`, `keyctl`, its device allow/deny rules in order, and raw `lxc.mount.entry` and mount-point entries (host path reduced to a basename plus `sensitive`/`ordinary`, and per mount point `readOnly`) *(role: read; tool_callable)* |
 | `proxmox.guest.config_raw` | the same config unfiltered. Not callable through `tool.call` *(role: admin)* |
+| `proxmox.guest.migration.plan` | what moves from `sourceVmid` to its replacement `targetVmid`: hostname, each `netN` MAC and IP, merged tags, the orca system id, the config keys and mounts that carry over, the vzdump jobs and firewall rules/ipsets that follow, and every conflict. Gateway guests (OPNsense, pfSense, or tagged `gateway`) are refused. Reads only *(role: admin)* |
 | `proxmox.guest.file_pull` | copy a file out of a guest. Unsupported for LXC (needs in-guest orca member); refused for VMs *(role: admin)* |
 | `proxmox.lxc_data.plan` | per LXC on this node: its mounts, the app's data paths (per-app table), where each lives (rootfs / volume / bind) and how it is backed up (vzdump / `lxc-bind` host capture / uncovered) |
 
@@ -112,6 +113,7 @@ The `pve-node-state` kind has one slot per node (node-scoped API reads; root-onl
 - `src/unit_provider.rs` — the five-verb `vm` + `lxc` surface.
 - `src/guest_standard.rs` — `proxmox.guest.standard.{audit,apply}` + `proxmox.guest.update`: console autologin and the backup-gated `update`.
 - `src/guest_config.rs` — a guest's PVE config: `proxmox.guest.config` (allowlisted) and `proxmox.guest.config_raw` (admin, unfiltered).
+- `src/guest_migration.rs` — `proxmox.guest.migration.plan`: the read-only plan for handing a guest's identity and config to a replacement.
 - `src/lxc_guest.rs` — in-container I/O trait; `SeamIo` calls core's `guest.exec` / `guest.write_file` (`tool.call`), routed to the orca member on the CT's PVE node.
 - `src/registration.rs`, `src/cluster_roster_impl.rs`, `src/topology.rs` — the three domain-backend registrations + impls.
 - `specs/`, `spec-tools/`, `examples/pve_to_openapi.rs` — convert Proxmox's `apidoc.js` into the vendored OpenAPI spec (`build.rs` codegens the typed client).

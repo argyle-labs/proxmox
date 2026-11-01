@@ -13,6 +13,7 @@ pub mod guest_config;
 pub mod guest_exec;
 pub mod guest_file;
 pub mod guest_label;
+pub mod guest_migration;
 pub mod guest_mount;
 pub mod guest_standard;
 pub mod host_workloads;
