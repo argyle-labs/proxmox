@@ -118,6 +118,7 @@ pub struct MigrationGuest {
     pub name: String,
     pub unit_id: String,
     /// The orca system id (a UUID) found in the guest's description.
+    /// Will come from the core system registry once it exposes a plugin-callable lookup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_id: Option<String>,
     pub tags: Vec<String>,
@@ -415,6 +416,14 @@ pub fn plan(endpoint: &str, source_vmid: u64, target_vmid: u64) -> Result<GuestM
             src.guest.kind, dst.guest.kind
         ));
     }
+    for (side, g) in [("source", &src.guest), ("target", &dst.guest)] {
+        if g.system_id.is_none() {
+            conflicts.push(format!(
+                "{side} {} has no orca system id; identity takeover can't be verified",
+                g.vmid
+            ));
+        }
+    }
     if let (Some(s), Some(t)) = (&src.guest.system_id, &dst.guest.system_id)
         && s != t
     {
@@ -649,6 +658,19 @@ mod tests {
         assert!(c.contains("kind changes vm -> lxc"), "{c}");
         assert!(c.contains("1 firewall rules"), "{c}");
         assert!(c.contains("ipset 'trusted'"), "{c}");
+        assert!(
+            c.contains("target 106 has no orca system id; identity takeover can't be verified"),
+            "{c}"
+        );
+        assert!(!c.contains("source 112 has no orca system id"), "{c}");
+    }
+
+    #[test]
+    fn a_missing_system_id_on_either_side_is_a_conflict() {
+        let (out, _) = record_api_calls(routes, || plan("pve", 106, 107));
+        let c = out.unwrap().conflicts.join("\n");
+        assert!(c.contains("source 106 has no orca system id"), "{c}");
+        assert!(c.contains("target 107 has no orca system id"), "{c}");
     }
 
     #[test]
