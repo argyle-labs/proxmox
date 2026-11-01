@@ -160,8 +160,6 @@ pub struct GuestMigrationPlan {
     pub endpoint: String,
     pub source: MigrationGuest,
     pub target: MigrationGuest,
-    /// Non-empty means the migration is refused outright.
-    pub refusals: Vec<String>,
     /// Hostname, MAC and IP the target takes from the source.
     pub identity: Vec<FieldMove>,
     /// The target's tags after the move: its own plus the source's.
@@ -191,6 +189,7 @@ pub fn system_id(description: &str) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
+/// Name/tag match is a stopgap until orca core exposes a gateway/router role in the system registry.
 pub fn is_gateway(name: &str, tags: &[String]) -> bool {
     let lower = name.to_ascii_lowercase();
     lower
@@ -398,13 +397,13 @@ pub fn plan(endpoint: &str, source_vmid: u64, target_vmid: u64) -> Result<GuestM
     let src = read(endpoint, cluster.as_deref(), &located, source_vmid)?;
     let dst = read(endpoint, cluster.as_deref(), &located, target_vmid)?;
 
-    let mut refusals = Vec::new();
     for (side, r) in [("source", &src), ("target", &dst)] {
         if is_gateway(&r.guest.name, &r.guest.tags) {
-            refusals.push(format!(
+            bail!(
                 "{side} {} ('{}') is a gateway; a migration would take the network down",
-                r.guest.vmid, r.guest.name
-            ));
+                r.guest.vmid,
+                r.guest.name
+            );
         }
     }
 
@@ -490,7 +489,6 @@ pub fn plan(endpoint: &str, source_vmid: u64, target_vmid: u64) -> Result<GuestM
         tags: merge_tags(&dst.guest.tags, &src.guest.tags),
         source: src.guest,
         target: dst.guest,
-        refusals,
         identity,
         carry,
         backup_jobs,
@@ -625,7 +623,7 @@ mod tests {
         let (out, calls) = record_api_calls(routes, || plan("pve", 112, 106));
         let p = out.unwrap();
         assert!(calls.iter().all(|(m, ..)| m == "GET"), "{calls:?}");
-        assert!(p.dry_run && p.refusals.is_empty());
+        assert!(p.dry_run);
         assert_eq!(p.source.system_id.as_deref(), Some(SYS));
         assert_eq!(p.source.unit_id, "cluster:lab/vm/112");
         assert_eq!(p.target.kind, "lxc");
@@ -656,9 +654,8 @@ mod tests {
     #[test]
     fn a_gateway_on_either_side_is_refused() {
         let (out, _) = record_api_calls(routes, || plan("pve", 106, 100));
-        let p = out.unwrap();
-        assert_eq!(p.refusals.len(), 1);
-        assert!(p.refusals[0].contains("target 100 ('loki') is a gateway"));
+        let e = out.unwrap_err().to_string();
+        assert!(e.contains("target 100 ('loki') is a gateway"), "{e}");
         assert!(is_gateway("edge", &["opnsense".into()]));
         assert!(is_gateway("OPNsense-fw", &[]));
         assert!(!is_gateway("lokinet-docs", &[]));
