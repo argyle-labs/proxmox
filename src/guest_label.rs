@@ -565,6 +565,7 @@ pub struct GuestLabelAudit {
     verb = "guest.label.audit",
     execute_gated = false,
     role = "read",
+    tool_callable = true,
     reaches = [
         "proxmox.get_resources_cluster_resources",
         "proxmox.get_vm_config_nodes_node_qemu_vmid_config",

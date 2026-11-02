@@ -815,5 +815,17 @@ mod tests {
         assert_eq!(find("proxmox.guest.config")["role"], "read");
         assert_eq!(find("proxmox.guest.config_raw")["tool_callable"], false);
         assert_eq!(find("proxmox.guest.config_raw")["role"], "admin");
+        assert_eq!(find("proxmox.guest.label.audit")["tool_callable"], true);
+        assert_eq!(find("proxmox.guest.label.audit")["role"], "read");
+        let allowlist = ["proxmox.guest.config", "proxmox.guest.label.audit"];
+        for t in &manifest {
+            let name = t["name"].as_str().unwrap();
+            if !allowlist.contains(&name) {
+                assert_eq!(
+                    t["tool_callable"], false,
+                    "{name} must not be tool_callable"
+                );
+            }
+        }
     }
 }
