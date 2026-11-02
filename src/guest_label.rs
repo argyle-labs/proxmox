@@ -465,8 +465,8 @@ pub struct GuestLabelRow {
     pub vmid: u64,
     pub name: String,
     pub tags: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    pub has_description: bool,
+    pub has_orca_block: bool,
     pub unit_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
@@ -498,7 +498,8 @@ fn audit_row(endpoint: &str, cluster: Option<&str>, g: &Guest) -> GuestLabelRow 
         vmid: g.vmid,
         name: g.name.clone(),
         tags: g.tags.clone(),
-        description: g.description.clone(),
+        has_description: g.description.is_some(),
+        has_orca_block: g.description.as_deref().is_some_and(has_orca_block),
         unit_id: unit_id(cluster, endpoint, g.kind, g.vmid),
         role: derived.map(|(r, _)| r.to_string()),
         suggested_tags: merge_tags(
@@ -558,8 +559,8 @@ pub struct GuestLabelAudit {
 }
 
 /// List every VM and LXC missing tags or a description, or with a default or
-/// unclear name, with its current tags, name, description, orca unit id and
-/// the tags `proxmox.guest.label.apply` would add.
+/// unclear name, with its current tags, name, whether it has a description
+/// and an orca block, orca unit id and the tags `proxmox.guest.label.apply` would add.
 #[orca_tool(
     domain = "proxmox",
     verb = "guest.label.audit",
@@ -877,6 +878,19 @@ mod tests {
         let second = merge_description(Some(&format!("{first}\nfooter")), &newer);
         assert_eq!(second, format!("Operator notes.\n\n{newer}\nfooter"));
         assert!(!second.contains("plex (media)"));
+    }
+
+    #[test]
+    fn audit_row_never_carries_description_text() {
+        let row = audit_row(
+            "pve",
+            None,
+            &guest("plex", &["x"], Some("root pw is hunter2")),
+        );
+        assert!(row.has_description);
+        assert!(!row.has_orca_block);
+        let out = serde_json::to_string(&row).unwrap();
+        assert!(!out.contains("hunter2"), "{out}");
     }
 
     #[test]
